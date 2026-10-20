@@ -319,7 +319,7 @@ Make sure the `output/` directory exists and has write permissions: `chmod -R 75
 Your API token might be invalid or revoked. Click the Settings (⚙️) button and update your token, or generate a new one at [discogs.com/settings/developers](https://www.discogs.com/settings/developers)
 
 **Tracks not splitting correctly?**
-Try adjusting silence detection in Settings (⚙️), or use duration-based splitting after selecting a Discogs release.
+Try adjusting silence detection in Settings (⚙️), or pick a Discogs release and use Snap to Discogs to place boundaries from its track lengths.
 
 ---
 

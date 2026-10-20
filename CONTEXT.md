@@ -27,9 +27,9 @@ The WAV/AIFF recording the user uploads. Contains some-or-all of a Release's tra
 
 ## Track Boundary
 
-A timestamp range `(start, end)` within a Source Audio file, identifying one Track. Produced by silence detection (primary) or fallback duration-based analysis. Editable by the user via the waveform UI before processing.
+A timestamp range `(start, end)` within a Source Audio file, identifying one Track. Produced by silence detection, guided by Discogs track lengths when a release is chosen. Editable by the user via the waveform UI before processing.
 
-The calculation that turns audio analysis into Track Boundaries lives in `track_boundaries.py` and is independent of ffmpeg: the silence path computes boundaries from the **Gaps** between audio, the fallback path computes them from Discogs durations. Both are pure functions over plain data — the ffmpeg subprocess sits outside them, in `AudioProcessor.detect_silence`.
+The calculation that turns audio analysis into Track Boundaries lives in `track_boundaries.py` and is independent of ffmpeg: the silence path computes boundaries from the **Gaps** between audio, guided detection snaps boundaries derived from Discogs durations to nearby Gaps. Both are pure functions over plain data — the ffmpeg subprocess sits outside them, in `AudioProcessor.detect_silence`.
 
 ## Gap
 

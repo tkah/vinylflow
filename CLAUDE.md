@@ -25,10 +25,12 @@ Desktop app to digitize vinyl records: upload a WAV/AIFF recording of a vinyl si
 vinylflow/
 ├── backend/
 │   ├── api.py              # FastAPI app — all REST endpoints + WebSocket
+│   ├── sessions/           # Session store/state + Pipeline (export job) + progress events
 │   └── static/
 │       ├── index.html      # Single-page UI (Alpine.js)
-│       ├── app.js          # Main frontend logic (~1000+ lines)
+│       ├── app.js          # Main frontend logic (~3000 lines, one Alpine object)
 │       └── fonts/          # Mirano Extended font family
+├── tests/                  # pytest (backend) + frontend/ (Node logic tests, run.js)
 ├── rthooks/
 │   └── rthook_vinylflow.py # PyInstaller runtime hook (runs before app code)
 ├── .github/workflows/
@@ -36,7 +38,11 @@ vinylflow/
 │   ├── privacy-guard.yml   # Scans commits for secrets
 │   └── release-artifact-scan.yml
 ├── config.py               # Config management (settings.json > .env > env vars)
-├── audio_processor.py      # Silence detection, track splitting, ffmpeg wrappers
+├── audio_processor.py      # Envelope, export filter chain, loudness, ffmpeg wrappers
+├── track_matching.py       # Pure title normalization + tracklist matching (borrowed lengths)
+├── track_boundaries.py     # Pure track-boundary math (gaps, envelope, guided/snap, refine_cuts)
+├── click_detection.py      # Click scan: residual (original - declicked) in ffmpeg, chunk planning, thresholds, cache
+├── silence_analysis.py     # Hum detector (50/60 Hz + harmonics) + surface-noise profile, from the silent stretches only
 ├── metadata_handler.py     # Discogs fetch, cover art download, audio tagging
 ├── desktop_launcher.py     # Entry point — sets up dirs/env vars, starts FastAPI, opens window
 ├── VinylFlow.spec          # PyInstaller spec (macOS .app + Windows .exe)
@@ -60,13 +66,23 @@ audio_processor.py  metadata_handler.py  config.py    Discogs API
 (ffmpeg subprocess) (Mutagen + Pillow)  (settings)   (discogs-client)
 ```
 
-**Processing pipeline** (`POST /api/process` → `process_file_background`):
-1. Fetch release from Discogs
-2. Apply user's track→position mapping (A1, B2, etc.)
-3. Create output folder: `{Artist} - {Album}/`
-4. Download + embed cover art
-5. For each track: ffmpeg extract → convert to format → tag → rename
-6. Broadcast completion via WebSocket
+**User flow (Discogs-first):**
+1. Upload WAV/AIFF -> a background scan computes the energy envelope and the music span (lead-in/run-out trimmed); selecting the file auto-searches Discogs from the cleaned filename.
+2. Pick a release; the app suggests which side(s) the recording covers (by length, else full album). Side chips and presets ("Full album", one per disc) change that scope.
+3. Guided detection (`/api/analyze-guided`) places exactly as many tracks as the chosen sides have, snapping Discogs-length boundaries to nearby silence. Expected boundaries use a gap model (Discogs lengths exclude the silent gaps: leftover span is split evenly into n-1 gaps, each boundary at a gap centre; `MAX_GAP_S` = 8 s per gap) and fall back to proportional scaling (clamped 0.9-1.1) when the residual is negative or too large. If lengths are missing it falls back to count-based detection (Smart Rescan ladder). "Snap to Discogs" re-runs it after hand edits; hand edits ask first (banner) and snapping is undoable.
+3b. If the chosen sides lack lengths, the Release & Export card offers "Find lengths from other pressings": durations are copied (missing ones only, marked "Lengths borrowed from ...", with Undo) onto the selected release and detection re-runs; tags still come from the selected release.
+4. Merged track table: detected tracks, Discogs mapping, ignore/inline-edit times, delete. The waveform (WaveSurfer, draggable regions, dashed ghost markers = Discogs-expected breaks) has a Play/Pause toggle (Space), cut-point audition and zoom.
+5. "Audio processing" panel in the Release & Export card (rumble filter, hum removal + 50/60 Hz, click & pop removal Off/Light/Medium/Strong, hiss reduction + Light/Medium/Strong, album gain, ReplayGain tags; each saves as the default immediately and mirrors the Settings modal; hum/hiss are off by default, and a detected hum shows a muted "Hum detected at 60 Hz (−48 dBFS) — Turn on" hint), with an optional A/B test on one track (`POST /api/restoration-test` `{rumble, declick, hum_filter, hum_freq, hiss_reduction, album_gain, album_ranges?}`; legacy `restore` bool = rumble + light), then export. `POST /api/process` takes `rumble_filter`, `declick`, `hum_filter`, `hum_freq` (50|60; the old `hum_freq` field alone is ignored), `hiss_reduction` (legacy `restoration_level` 1 = rumble + light).
+6. There is no `alert()`/`confirm()`: `notify()` toasts (info/success auto-dismiss, warning/error sticky, hover pauses) and inline notices. Destructive actions run immediately with an Undo toast (file removal defers `DELETE /api/queue/{id}` ~8 s; delete track and re-analyze restore a snapshot).
+
+**Processing pipeline** (`POST /api/process` -> `backend/sessions/pipeline.py`, run in a worker thread):
+1. Fetch release from Discogs (server-side cached)
+2. Apply the user's track->position mapping (A1, B2, etc.)
+3. Create output folder: `{Artist} - {Album}/`; download + embed cover art
+4. If album gain is on: measure all active ranges once (after the clean-up filters) and derive one gain
+5. For each track: ffmpeg extract through the shared filter chain (rumble, hum notch, declick, hiss reduction, gain, dither) -> encode -> tag -> rename
+6. If ReplayGain is on: measure the final files and write track + album tags
+7. Broadcast completion via WebSocket
 
 **Upload session storage:**
 - Source file: `VINYLFLOW_UPLOAD_DIR/{file_id}/source.{ext}`
@@ -79,16 +95,25 @@ audio_processor.py  metadata_handler.py  config.py    Discogs API
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/api/upload` | Upload WAV/AIFF, create session UUID, queue MP3 preview |
-| POST | `/api/analyze` | Silence detection → track boundaries |
-| POST | `/api/analyze-duration-based` | Fallback: tracks from Discogs durations |
+| POST | `/api/analyze` | Silence detection -> track boundaries (from the cached envelope) |
+| POST | `/api/rescan` | Smart Rescan: sweep detection settings to hit an expected track count |
+| POST | `/api/analyze-guided` | Guided detection: expected count + Discogs lengths -> snapped boundaries |
+| GET | `/api/scan/{file_id}` | Background scan status (music span) |
 | GET | `/api/preview/{file_id}/{track_number}` | Generate 30s MP3 preview |
+| POST | `/api/clicks/{file_id}` | Start/join a click scan `{declick}` ("off" scans at medium); cached result returns at once |
+| GET | `/api/clicks/{file_id}?declick=` | `{status: none/running/done/error, progress, strength, requested, times?}` (WebSocket `click_scan_progress` / `click_scan_complete`) |
+| GET | `/api/hum/{file_id}` | `{detected: 50\|60\|null, level_dbfs, prominence_db, harmonics, analyzed_s, noise}` — hum detector + noise profile over the silent stretches (lead-in / gaps / run-out, ≤30 s decoded); cached as `silence_analysis.json`; the frontend calls it when the scan completes |
+| POST | `/api/restoration-test` | Render one track original / processed / removed (A/B test); `album_ranges` entries are `[start, end]` or `[start, end, declick]` |
+| GET | `/api/restoration-test/{file_id}/{name}` | Serve an A/B render (`rt(orig\|proc\|diff)_<12hex>.flac`) |
 | GET | `/api/waveform-peaks/{file_id}` | Waveform data for WaveSurfer |
-| GET | `/api/audio/{file_id}` | Serve audio for playback |
+| GET | `/api/audio/{file_id}` | Serve audio for playback (MP3 stream, range requests) |
 | POST | `/api/search` | Discogs search |
+| GET | `/api/release/{release_id}` | Full release + tracklist (cached) |
+| GET | `/api/release/{release_id}/length-donors` | Other pressings of the same master with matching track lengths (rate-limited, <=12 fetches, cached; progress via WS `donor_progress`) |
 | POST | `/api/process` | Start background processing job |
 | GET | `/api/process/{job_id}` | Poll job status |
 | GET/DELETE | `/api/queue`, `/api/queue/{file_id}` | Manage upload queue |
-| GET/PUT | `/api/config` | Read/write audio settings |
+| GET/PUT | `/api/config` | Read/write settings |
 | POST | `/api/setup/discogs-token` | Save Discogs token |
 | WS | `/ws` | Real-time progress updates |
 
@@ -195,8 +220,65 @@ Also: guard `@click.away` with `!$event.ctrlKey` so Ctrl+click (which triggers `
 ## Audio Formats
 
 - **Input:** `.wav`, `.aiff`, `.aif` — minimum 60 seconds
-- **Output:** FLAC (configurable compression 0–8), MP3 (320 kbps), AIFF (PCM 16-bit big-endian)
+- **Output:** FLAC (compression 0–8), MP3 (320 kbps), AIFF (PCM, 16- or 24-bit big-endian per `bit_depth`)
+- **Filter edges:** filtered cuts (rumble/hum/declick/hiss/gain) are decoded with ~1 s of pre- and post-roll and trimmed sample-exactly afterwards (`padded_window`); unfiltered cuts are untouched (bit-exact).
 - **Tagging:** Mutagen handles all three formats; cover art embedded as bytes
+
+---
+
+## Settings (`/api/config`, `settings.json`)
+
+Besides silence detection and `track_numbering`/`output_dir`:
+
+| Setting | Values | Notes |
+|---------|--------|-------|
+| `output_format` | `flac` / `mp3` / `aiff` | Remembered default |
+| `rumble_filter` | bool, default off | `highpass=f=15` |
+| `declick` | `off` (default) / `light` / `medium` / `strong` | `adeclick` strength (`DECLICK_PRESETS`). Settings keys `RUMBLE_FILTER` / `DECLICK`; if absent, migrated from legacy `RESTORATION_LEVEL` (1 -> rumble on + light, else off). `PUT /api/config` still accepts `restoration_level` (same mapping); `GET` returns it derived |
+| `hum_filter` / `hum_freq` | bool default off / `50`\|`60` default 60 | Mains-hum notch (`HUM_FREQS`); keys `HUM_FILTER` / `HUM_FREQ` |
+| `hiss_reduction` / `hiss_strength` | `off` (default) / `light` / `medium` / `strong`; remembered strength default `light` | `afftdn` (`HISS_PRESETS` nr 6/12/20 dB). The UI toggle is off ↔ `hiss_strength`; choosing a strength sets both; `PUT` with `hiss_reduction` wins over `hiss_strength` in the same request. Keys `HISS_REDUCTION` / `HISS_STRENGTH` |
+| `album_gain` | bool, default off | One gain for the whole album |
+| `replaygain` | bool, default on | ReplayGain 2.0 tags |
+| `bit_depth` | `"source"` (default) / `"24"` | FLAC/AIFF depth. Source depth is probed at upload; unknown -> 24 (never truncates). 16-bit targets get triangular dither only when processing runs (rumble / hum / declick / hiss / gain); unprocessed 16->16 stays bit-exact. MP3 unaffected |
+
+## Detection internals
+
+- **Envelope cache:** the upload decodes the file once (mono, 8 kHz, 10 ms RMS frames) and caches it as `envelope.npy` in the session dir. Gaps at any threshold, the music span and Smart Rescan are answered in memory from it.
+- **`refine_cuts`:** detection may use a permissive threshold; cuts are then widened over audio still above the user's configured threshold so quiet fades aren't clipped.
+- **Music span:** lead-in/run-out trimmed; used for side suggestions and guided placement.
+
+## Click detection & per-track strength
+
+- **Detection** (`click_detection.py`): scan = what the remover would change. Music span (from the envelope) decoded in ~60 s chunks with 0.5 s margin each side (`plan_chunks`; events kept only in the chunk's owned span, so overlaps never duplicate), mono 44.1 kHz. One ffmpeg graph outputs `original - declicked(strength)` (residual) plus the original; impulses above `max(-50 dBFS, local RMS -20 dB, 3x local roughness)` merge within 20 ms into click times. Roughness (median |2nd difference|) is what keeps surface hiss / busy music from flooding results. Known limit: hard drum attacks that adeclick also treats as clicks are reported.
+- **Cache/jobs:** `clicks_<strength>.json` in the session dir (atomic; invalidated if the preset string or `DETECTOR_VERSION` changes). One asyncio task per (file, strength) like the envelope; cancelled with the session. Frontend derives per-track counts from the file-wide times, draws the density strip canvas on the waveform wrapper, and re-scans when the panel strength changes.
+- **Per-track override:** `track_boundaries[].declick` (optional; absent = panel setting). `extract_track` uses it per track; `measure_ranges` takes `(start, end[, declick])` and, when strengths differ, measures a seeked-input-per-range `concat` (uniform strength keeps the single `aselect` pass). The A/B test and `abSignature` use the chosen track's effective strength.
+
+## Loudness
+
+- **Rumble filter** (`highpass=f=15`), **hum removal**, **click & pop removal** (`adeclick`, strength presets chosen by measurement in `tests/test_declick_strength.py`) and **hiss reduction** are independent. No per-track loudnorm.
+- **Hum removal:** cascade of 6 `bandreject` notches (Q=20) at f0..6·f0 (60 -> 360 Hz, 50 -> 300 Hz) after `aformat=dblp` (16-bit sources would otherwise round per stage). Q/harmonics chosen by `tests/test_hum_filter.py` (≥20 dB cut at ±0.2 % mains drift, bounded bass damage). A notch's phase leaks a ghost of the music into `original − processed`, so the A/B "Removed" render uses the zero-phase form (`hum_filter(f, zero_phase=True)`: forward + `areverse` pass; buffers what it filters, hence `AudioProcessor.render_removed_flac` renders it in 40 s chunks with 3 s context, memory bounded). The rumble high-pass has the same ghost, so Removed also uses `RUMBLE_FILTER_ZERO_PHASE` (2-pole `highpass=f=7.5:w=0.515` forward + reverse, whose squared response is within ~0.9 dB of `highpass=f=15` over 5-200 Hz; `tests/test_rumble_zero_phase.py`); export and the Processed render keep the normal filters. A rumble or hum cleanup is rendered chunked. The Audio processing panel and Settings show a caution note under Hum removal (`humNoteFreqs`).
+- **Hiss reduction:** `afftdn` with the file's own noise profile (`silence_analysis.noise_profile`: white-equivalent level per afftdn custom band from the silent stretches; `nt=c:bn=…`, `nf` = noise + 6 dB), so `nr` (6/12/20 dB) means what it says on any record; without usable silence it falls back to `nr<=12 + tn=1` (noise tracking, erratic). `tests/test_hiss_reduction.py` has the measurements.
+- **Hum/noise analysis** (`silence_analysis.py`): `silent_ranges` (envelope; floor-relative so loud hum still finds its gaps) -> bounded decode (native channels, ≤30 s) -> Welch spectrum -> `detect_hum` (lines at f0·k vs the neighbouring floor, ≥2 harmonics or one ≥12 dB; 300 Hz ignored) + `noise_profile`. Bass played in the music never enters the analysis.
+- **Album gain** (optional): one gain for the album targeting -14 LUFS, capped so true peak stays <= -1 dBTP (pure gain, no limiter).
+- **ReplayGain 2.0** tags (default on): -18 LUFS reference; track and album gain/peak measured on the final files. A measurement failure skips the tags with a warning rather than failing the job.
+- **A/B test renders (3 FLACs):** `rtorig_` (source), `rtproc_` (full chain incl. album gain), `rtdiff_` ("Removed" = original − (rumble + hum + declick + hiss; no gain/dither), via `audio_processor.removed_graph`: asplit/amerge/pan difference per channel, no gain/dither, 24-bit, cached under the clean-up chain only). Response adds `removed_url` (null when no clean-up filter is on), `removed_lufs`, `removed_peak_dbfs`. Frontend: Original | Processed | Removed switch (third hidden `<audio>`); Removed plays at unity with an optional +12 dB WebAudio GainNode (`_abBoostNodes` WeakMap, one MediaElementSource per element, created lazily in the play click; no WebAudio = checkbox hidden).
+- One shared filter-chain builder (`build_export_filters(rumble, declick, gain_db, dither_to_16, hum, hiss, noise)`, order rumble -> hum notch -> declick -> hiss reduction -> volume -> dither; declick before denoise so the denoiser never smears clicks) feeds export, album-gain measurement and the A/B test. Cache keys include the full chain string, so a changed noise profile re-renders.
+
+---
+
+## Testing
+
+**No Discogs API calls during development — ever.** Tests and verification run offline with Discogs faked/seeded; never read `config/settings.json` or copy a token.
+
+```bash
+# Backend (build the image once: see .claude/skills/verify/SKILL.md)
+docker run --rm --network none -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/src:ro" \
+  --tmpfs /src/config --tmpfs /tmp -w /src vinylflow-test python -m pytest -q -p no:cacheprovider -n auto
+# Frontend logic (Node only, no deps)
+node --check backend/static/app.js && node tests/frontend/run.js
+```
+
+`--network none` plus the tmpfs over `config/` guarantees no network and hides the real token. Never touch the user's own `vinylflow` container. Frontend tests load `app.js` with fake waveform/`fetch`; visual layout still needs a manual look in the app.
 
 ---
 
