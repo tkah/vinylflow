@@ -2,6 +2,10 @@
 
 **Digitize vinyl 10x faster. Open source.**
 
+> **This is a fork** of [VinylFlow](https://github.com/olimic1000/vinylflow) by olimic1000, focused on a
+> Discogs-first workflow and audio clean-up. See [What's different in this fork](#whats-different-in-this-fork).
+> Desktop installers linked below are the original app's builds; this fork runs via Docker or Python.
+
 Turn your vinyl recordings into perfectly tagged, organized digital files in minutes — not hours. VinylFlow automates track splitting, Discogs metadata tagging, cover art embedding, and vinyl-style numbering (A1, A2, B1, B2).
 
 ![VinylFlow Demo](docs/demo.gif)
@@ -10,9 +14,27 @@ Turn your vinyl recordings into perfectly tagged, organized digital files in min
 
 ## Use VinylFlow
 
-- 🖥️ **Desktop apps:** install builds from [vinylflow.app/install](https://vinylflow.app/install)
+- 🖥️ **Desktop apps (original VinylFlow):** install builds from [vinylflow.app/install](https://vinylflow.app/install)
 - 🐳 **Docker (self-hosted):** run locally via [Quick Start (Docker)](#quick-start-docker)
 - ⚙️ **Python local mode:** see [Manual Setup (Non-Docker)](#manual-setup-non-docker)
+
+---
+
+## What's different in this fork
+
+- **Discogs first:** search starts as soon as a file is added; results show whether they have track
+  lengths and how well they fit your recording (lead-in/run-out silence excluded).
+- **Whole albums or single sides:** side picker with Full album / Disc presets, auto-suggested from the
+  recording length; multi-disc sets recorded one file per disc share a release.
+- **Guided track detection:** Discogs lengths place the splits (snapped to real silences), shown as
+  dashed guides on the waveform; borrow lengths from another pressing when yours has none.
+- **One track table and one player:** mapping, lengths and differences in one place; Play/Pause in the
+  waveform, cut-point auditions, manual edits protected with Snap to Discogs + Undo.
+- **Audio processing panel:** rumble filter, click & pop removal (with detection and per-track
+  strength), hum removal, hiss reduction, optional album gain, ReplayGain tags, and a one-track A/B
+  test including "hear what was removed".
+- **Bit depth:** exports match the source (24-bit stays 24-bit, including AIFF) or 24-bit on request.
+- **No pop-ups:** notices with Undo instead of `alert()`/`confirm()`.
 
 ---
 
@@ -56,7 +78,7 @@ That's it! Git is optional (see Step 1 below). No need to mess with configuratio
 
 ### Option A: Download ZIP (easiest — no Git required)
 
-1. Go to [github.com/olimic1000/vinylflow](https://github.com/olimic1000/vinylflow)
+1. Go to [github.com/tkah/vinylflow](https://github.com/tkah/vinylflow) (branch `discogs-first-flow`)
 2. Click the green **Code** button, then **Download ZIP**
 3. Unzip the folder to a location you can find (like your Downloads or Desktop)
 4. Open the unzipped `vinylflow` folder
@@ -64,7 +86,7 @@ That's it! Git is optional (see Step 1 below). No need to mess with configuratio
 ### Option B: Clone with Git (for terminal users)
 
 ```bash
-git clone https://github.com/olimic1000/vinylflow.git
+git clone -b discogs-first-flow https://github.com/tkah/vinylflow.git
 cd vinylflow
 ```
 
@@ -106,7 +128,7 @@ When you open VinylFlow for the first time, you'll see a welcome screen that gui
 
 VinylFlow desktop apps are available for macOS and Windows (beta track).
 
-- Installer downloads: [vinylflow.app/install](https://vinylflow.app/install)
+- Installer downloads (original VinylFlow, without this fork's changes): [vinylflow.app/install](https://vinylflow.app/install)
 
 - Desktop beta work is published from `desktop-beta`
 - `main` remains the stable Docker-first channel
@@ -160,7 +182,7 @@ sudo apt-get install python3.11 python3.11-venv ffmpeg flac libsndfile1-dev
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/olimic1000/vinylflow.git
+git clone -b discogs-first-flow https://github.com/tkah/vinylflow.git
 cd vinylflow
 
 # 2. Create and activate a Python virtual environment
@@ -363,7 +385,8 @@ Try adjusting silence detection in Settings (⚙️), or pick a Discogs release 
 
 ## Contributing
 
-Found a bug? Have a feature idea? [Open an issue](https://github.com/olimic1000/vinylflow/issues) — contributions welcome.
+Found a bug in this fork? [Open an issue here](https://github.com/tkah/vinylflow/issues). Issues with the
+original app belong at [olimic1000/vinylflow](https://github.com/olimic1000/vinylflow/issues).
 
 ---
 
