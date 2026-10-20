@@ -201,8 +201,8 @@ audio_processor.py  metadata_handler.py  config.py    Discogs API
 | GET | `/api/hum/{file_id}` | `{detected: 50\|60\|null, level_dbfs, prominence_db, harmonics, analyzed_s, noise}` — hum detector + noise profile over the silent stretches (lead-in / gaps / run-out, ≤30 s decoded); cached as `silence_analysis.json`; the frontend calls it when the scan completes |
 | POST | `/api/restoration-test` | Render one track original / processed / removed (A/B test); `album_ranges` entries are `[start, end]` or `[start, end, declick]` |
 | GET | `/api/restoration-test/{file_id}/{name}` | Serve an A/B render (`rt(orig\|proc\|diff)_<12hex>.flac`) |
-| GET | `/api/waveform-peaks/{file_id}` | Waveform data for WaveSurfer |
-| GET | `/api/audio/{file_id}` | Serve audio for playback (MP3 stream, range requests) |
+| GET | `/api/waveform-peaks/{file_id}` | Equal-width peaks at ≤10 ms per bin, reduced from a temporary PCM file in bounded blocks; `peaks_v2.json` replaces coarse caches |
+| GET | `/api/audio/{file_id}` | Range playback; waveform uses `?precise=true` for source WAV, AIFF keeps the pinned preview fallback |
 | POST | `/api/search` | Discogs search |
 | GET | `/api/release/{release_id}` | Full release + tracklist (cached) |
 | GET | `/api/release/{release_id}/length-donors` | Other pressings of the same master with matching track lengths (rate-limited, <=12 fetches, cached; progress via WS `donor_progress`) |
@@ -346,6 +346,7 @@ Besides silence detection and `track_numbering`/`output_dir`:
 
 ## Detection internals
 
+- **Side flips:** guided requests include `side_breaks`, the track counts before lettered Discogs side changes. A ≥10 s silence near the expected change anchors independent spans for the sides; ordinary gap/scale placement then runs within each span. No hint or no nearby long silence preserves the existing model. Numeric-only positions do not imply a flip.
 - **Envelope cache:** the upload decodes the file once (mono, 8 kHz, 10 ms RMS frames) and caches it as `envelope.npy` in the session dir. Gaps at any threshold, the music span and Smart Rescan are answered in memory from it.
 - **`refine_cuts`:** detection may use a permissive threshold; cuts are then widened over audio still above the user's configured threshold so quiet fades aren't clipped.
 - **Music span:** lead-in/run-out trimmed; used for side suggestions and guided placement.

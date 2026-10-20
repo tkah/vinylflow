@@ -334,8 +334,8 @@ class GuidedBoundaries:
     scale: float  # scale actually applied to the Discogs durations
     scale_clamped: bool  # True when span/total was outside the clamp (scale=1.0)
     raw_scale: float
-    model: str = "scale"  # 'gap' (lengths exclude gaps) or 'scale' (proportional)
-    gap_s: float = 0.0  # per-gap silence assumed by the gap model; 0.0 in 'scale'
+    model: str = "scale"  # 'gap', 'scale' (proportional), or 'sides' (anchored flip)
+    gap_s: float = 0.0  # per-gap silence assumed by 'gap'; 0.0 for the other models
 
 
 # Snap scoring: a Gap's length (capped) minus a penalty per second of
@@ -349,6 +349,8 @@ SNAP_MIN_SEPARATION_S = 1.0
 # Largest per-gap residual (seconds) still read as "Discogs lengths exclude the
 # silent gaps between tracks"; beyond it the lengths are assumed wrong/partial.
 MAX_GAP_S = 8.0
+# A side hint alone must not turn an ordinary inter-song gap into an anchor.
+SIDE_FLIP_MIN_GAP_S = 10.0
 
 
 def boundaries_from_expected_durations(
@@ -358,6 +360,7 @@ def boundaries_from_expected_durations(
     durations: List[float],
     tolerance_s: float = 10.0,
     scale_clamp: Tuple[float, float] = (0.9, 1.1),
+    side_breaks: Optional[List[int]] = None,
 ) -> GuidedBoundaries:
     """Place Track Boundaries from Discogs durations, snapped to Gaps.
 
@@ -378,6 +381,11 @@ def boundaries_from_expected_durations(
     on the expected time.
 
     Always returns exactly ``len(durations)`` Tracks.
+
+    ``side_breaks`` are the track counts before known Discogs side changes.
+    A long silence near such a boundary anchors the two sides independently,
+    so flip time is not distributed over the other expected markers. Without
+    both pieces of evidence the ordinary gap/scale model is preserved.
     """
     if not durations:
         raise ValueError("durations must not be empty")
@@ -450,6 +458,43 @@ def boundaries_from_expected_durations(
     tracks = [
         Track(n, s, max(s, e)) for n, (s, e) in enumerate(zip(track_starts, track_ends), start=1)
     ]
+    for split in side_breaks or []:
+        if not 1 <= split < n:
+            raise ValueError("side breaks must be internal track indices")
+        expected = infos[split - 1].expected
+        tolerance = min(tolerance_s, 0.4 * min(durations[split - 1:split + 1]) * scale)
+        candidates = [
+            g for g in closed
+            if music_start < g.start < g.end < music_end
+            and g.end - g.start >= SIDE_FLIP_MIN_GAP_S
+            and max(g.start - expected, expected - g.end, 0) <= tolerance
+            # A long quiet passage can contain the expected time yet leave
+            # too little room for the advertised songs on one side.
+            and g.start - music_start >= lo * sum(durations[:split])
+            and music_end - g.end >= lo * sum(durations[split:])
+        ]
+        if not candidates:
+            continue
+        anchor = min(candidates, key=lambda g: abs((g.start + g.end) / 2 - expected))
+        # Re-use the established placement model within each anchored span;
+        # recurse so recordings containing several sides handle every flip.
+        left = boundaries_from_expected_durations(
+            gaps, music_start, anchor.start, durations[:split], tolerance_s, scale_clamp,
+            [b for b in side_breaks if b < split],
+        )
+        right = boundaries_from_expected_durations(
+            gaps, anchor.end, music_end, durations[split:], tolerance_s, scale_clamp,
+            [b - split for b in side_breaks if b > split],
+        )
+        joined_tracks = [Track(i, t.start, t.end) for i, t in
+                         enumerate(left.tracks + right.tracks, start=1)]
+        midpoint = (anchor.start + anchor.end) / 2
+        joined_infos = left.boundaries + [BoundaryInfo(split, midpoint, True, anchor, midpoint)] + [
+            BoundaryInfo(b.index + split, b.expected, b.snapped, b.gap, b.position)
+            for b in right.boundaries
+        ]
+        return GuidedBoundaries(joined_tracks, joined_infos, 1.0,
+                                left.scale_clamped or right.scale_clamped, raw_scale, "sides", 0.0)
     return GuidedBoundaries(
         tracks, infos, scale, clamped and model == "scale", raw_scale, model, gap_s
     )

@@ -294,6 +294,8 @@ class GuidedAnalyzeRequest(BaseModel):
     expected_tracks: int
     # One entry per expected track; null for tracks Discogs has no length for.
     durations: Optional[List[Optional[float]]] = None
+    # Internal track counts before Discogs side transitions (A -> B, B -> C, ...).
+    side_breaks: Optional[List[int]] = None
 
 
 class SearchRequest(BaseModel):
@@ -1121,6 +1123,12 @@ async def analyze_guided(request: GuidedAnalyzeRequest):
     if not 1 <= request.expected_tracks <= 99:
         raise HTTPException(status_code=422, detail="expected_tracks must be between 1 and 99")
 
+    side_breaks = request.side_breaks or []
+    if side_breaks != sorted(set(side_breaks)) or any(
+        not 1 <= index < request.expected_tracks for index in side_breaks
+    ):
+        raise HTTPException(status_code=422, detail="side_breaks must be sorted unique internal track indices")
+
     session = session_store.get(request.file_id)
     if session is None:
         raise HTTPException(status_code=404, detail="File not found")
@@ -1148,7 +1156,8 @@ async def analyze_guided(request: GuidedAnalyzeRequest):
                     audio_processor.SMART_RESCAN_LADDER[0][1],
                 )
                 result = boundaries_from_expected_durations(
-                    gaps, music_start, music_end, [float(d) for d in durations]
+                    gaps, music_start, music_end, [float(d) for d in durations],
+                    side_breaks=side_breaks,
                 )
                 refined = audio_processor.refine_tracks(db, result.tracks)
                 return refined, True, result, music_start, music_end
@@ -1618,7 +1627,6 @@ async def get_restoration_test_audio(file_id: str, name: str):
 @app.get("/api/waveform-peaks/{file_id}")
 async def get_waveform_peaks(file_id: str):
     """Generate waveform peaks for visualization."""
-    import numpy as np
 
     session = session_store.get(file_id)
     if session is None:
@@ -1627,58 +1635,16 @@ async def get_waveform_peaks(file_id: str):
 
     file_path = session.source_audio
 
-    peaks_cache_path = get_session_path(file_id, "peaks.json")
+    # Old peaks.json has only 3,000 bins per recording, losing sub-second
+    # timing on albums. Existing sessions must regenerate the detailed waveform.
+    peaks_cache_path = get_session_path(file_id, "peaks_v2.json")
     if peaks_cache_path.exists():
         with open(peaks_cache_path, "r") as f:
             cached_data = json.load(f)
             return JSONResponse(content=cached_data)
 
     try:
-        # text=False — we want raw PCM bytes on stdout, not utf-8 text.
-        # Full-file decode, so run it off the event loop.
-        result = await asyncio.to_thread(
-            run_ffmpeg,
-            [
-                "-i",
-                str(file_path),
-                "-f",
-                "s16le",
-                "-acodec",
-                "pcm_s16le",
-                "-ac",
-                "1",
-                "-ar",
-                "8000",
-                "-",
-            ],
-            text=False,
-            capture_output=True,
-            check=True,
-        )
-        # int32 before abs: abs(-32768) overflows back to -32768 in int16.
-        audio_data = np.frombuffer(result.stdout, dtype=np.int16).astype(np.int32)
-
-        target_peaks = 3000
-        samples_per_peak = max(1, len(audio_data) // target_peaks)
-
-        full = (len(audio_data) // samples_per_peak) * samples_per_peak
-        peaks = []
-        if full:
-            peaks = (
-                np.abs(audio_data[:full]).reshape(-1, samples_per_peak).max(axis=1)
-                / 32768.0
-            ).tolist()
-        if full < len(audio_data):
-            peaks.append(float(np.abs(audio_data[full:]).max() / 32768.0))
-
-        if len(peaks) == 0:
-            peaks = [0.0]
-
-        response_data = {
-            "peaks": peaks,
-            "length": len(peaks),
-            "duration": session.source_duration,
-        }
+        response_data = await asyncio.to_thread(audio_processor.compute_waveform_peaks, file_path)
 
         with open(peaks_cache_path, "w") as f:
             json.dump(response_data, f)
@@ -1693,8 +1659,8 @@ async def get_waveform_peaks(file_id: str):
 
 
 @app.get("/api/audio/{file_id}")
-async def get_audio_file(file_id: str):
-    """Serve audio file for waveform playback."""
+async def get_audio_file(file_id: str, precise: bool = False):
+    """Stream source WAV for precise editing, or the pinned preview otherwise."""
     from fastapi.responses import FileResponse
 
     session = session_store.get(file_id)
@@ -1702,13 +1668,18 @@ async def get_audio_file(file_id: str):
         raise HTTPException(status_code=404, detail="File not found")
     _require_source(session)
 
-    # Prefer the background-preconverted MP3: ~25MB streamed instead of a
-    # multi-hundred-MB WAV. The choice is pinned on the first request so the
-    # same URL never flips from WAV to MP3 bytes mid-playback.
-    if session.playback_audio is None or not session.playback_audio.exists():
-        mp3_path = get_session_path(file_id, "full.mp3")
-        session.playback_audio = mp3_path if mp3_path.exists() else session.source_audio
-    file_path = session.playback_audio
+    if precise and session.source_audio.suffix.lower() == ".wav":
+        # Cut-point playback uses the same source as the waveform, removing
+        # MP3 seeking/decoder behavior from this path. FileResponse streams
+        # byte ranges; the album is not decoded into browser JS memory.
+        file_path = session.source_audio
+    else:
+        # AIFF needs the browser-compatible preview. Pin this URL's choice so
+        # an in-progress range request never switches from source to MP3 bytes.
+        if session.playback_audio is None or not session.playback_audio.exists():
+            mp3_path = get_session_path(file_id, "full.mp3")
+            session.playback_audio = mp3_path if mp3_path.exists() else session.source_audio
+        file_path = session.playback_audio
 
     if file_path.suffix.lower() == ".mp3":
         media_type = "audio/mpeg"

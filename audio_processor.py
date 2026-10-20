@@ -9,6 +9,7 @@ Supports FLAC, MP3, and AIFF output formats.
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple, Optional
@@ -822,6 +823,39 @@ class AudioProcessor:
         )
         samples = np.frombuffer(result.stdout, dtype=np.int16)
         return envelope_from_pcm(samples, int(ENVELOPE_SAMPLE_RATE * ENVELOPE_FRAME_S))
+
+    def compute_waveform_peaks(self, file_path: Path) -> dict:
+        """Keep 10 ms transient timing at any album length, with bounded PCM memory.
+
+        Spool the low-rate decode to a temporary file and reduce it in blocks.
+        A fixed number of peaks per album smears cut-point timing as recordings grow.
+        Equal-width bins cover the entire decoded duration, including its tail.
+        """
+        import numpy as np
+
+        frame_samples = int(ENVELOPE_SAMPLE_RATE * ENVELOPE_FRAME_S)
+        peaks = []
+        with tempfile.TemporaryFile() as pcm:
+            run_ffmpeg(
+                ["-v", "error", "-i", str(file_path), "-f", "s16le", "-acodec", "pcm_s16le",
+                 "-ac", "1", "-ar", str(ENVELOPE_SAMPLE_RATE), "-"],
+                text=False, stdout=pcm, stderr=subprocess.PIPE, check=True,
+            )
+            sample_count = pcm.tell() // 2
+            peak_count = (sample_count + frame_samples - 1) // frame_samples
+            for first in range(0, peak_count, 1000):
+                last = min(first + 1000, peak_count)
+                # WaveSurfer spreads peaks evenly over duration. Distribute the
+                # partial tail across bins too, rather than shifting late peaks.
+                edges = np.arange(first, last + 1, dtype=np.int64) * sample_count // peak_count
+                pcm.seek(int(edges[0]) * 2)
+                block = pcm.read(int(edges[-1] - edges[0]) * 2)
+                # Promote before abs: abs(-32768) overflows in int16.
+                samples = np.frombuffer(block, dtype="<i2").astype(np.int32)
+                values = np.maximum.reduceat(np.abs(samples), edges[:-1] - edges[0]) / 32768.0
+                peaks.extend(np.round(values, 6).tolist())
+        return {"peaks": peaks or [0.0], "length": len(peaks) or 1,
+                "duration": sample_count / ENVELOPE_SAMPLE_RATE}
 
     def refine_tracks(self, db, tracks):
         """Widen envelope-derived tracks over audio still above the user's

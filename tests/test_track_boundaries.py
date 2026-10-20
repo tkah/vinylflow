@@ -16,6 +16,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from audio_processor import AudioProcessor
 from track_boundaries import (
     Gap,
@@ -533,6 +535,64 @@ def test_refine_empty():
 
 
 # --- gap-aware expected boundaries ------------------------------------------
+
+def test_side_flip_pause_does_not_shift_guides_inside_either_side():
+    gaps = [Gap(100, 103), Gap(203, 263), Gap(363, 366)]
+    result = boundaries_from_expected_durations(
+        gaps, 0, 466, [100] * 4, side_breaks=[2]
+    )
+    assert [b.expected for b in result.boundaries] == pytest.approx([101.5, 233, 364.5])
+    assert [(t.start, t.end) for t in result.tracks] == [
+        (0, 100), (103, 203), (263, 363), (366, 466)
+    ]
+
+
+def test_multiple_side_flips_keep_later_guides_aligned():
+    gaps = [Gap(100, 103), Gap(203, 263), Gap(363, 366),
+            Gap(466, 546), Gap(646, 649)]
+    result = boundaries_from_expected_durations(
+        gaps, 0, 749, [100] * 6, side_breaks=[2, 4]
+    )
+    assert [b.expected for b in result.boundaries] == pytest.approx(
+        [101.5, 233, 364.5, 506, 647.5]
+    )
+    assert len(result.tracks) == 6
+    assert all(t.duration == pytest.approx(100) for t in result.tracks)
+
+
+def test_side_flip_with_single_track_side_and_lead_in():
+    result = boundaries_from_expected_durations(
+        [Gap(45, 85), Gap(135, 138)], 5, 198, [40, 50, 60], side_breaks=[1]
+    )
+    assert [b.expected for b in result.boundaries] == pytest.approx([65, 136.5])
+    assert [(t.start, t.end) for t in result.tracks] == [(5, 45), (85, 135), (138, 198)]
+
+
+def test_long_silence_cannot_anchor_a_side_too_short_for_its_tracks():
+    # This very long quiet passage contains the predicted side boundary, but
+    # leaves just 100 seconds for two 100-second songs: insufficient evidence.
+    result = boundaries_from_expected_durations(
+        [Gap(100, 220)], 0, 420, [100] * 4, side_breaks=[2]
+    )
+    assert result.model != 'sides'
+
+
+def test_side_flip_needs_a_known_transition_and_a_nearby_long_gap():
+    gaps = [Gap(100, 103), Gap(203, 263), Gap(363, 366)]
+    legacy = boundaries_from_expected_durations(gaps, 0, 466, [100] * 4)
+    assert legacy.model != 'sides'
+    # A side change after track 1 does not license treating a distant pause as a flip.
+    wrong_position = boundaries_from_expected_durations(
+        gaps, 0, 466, [100] * 4, side_breaks=[1]
+    )
+    assert wrong_position.boundaries == legacy.boundaries
+    assert [(t.start, t.end) for t in wrong_position.tracks] == [(t.start, t.end) for t in legacy.tracks]
+    short_gaps = [Gap(100, 103), Gap(203, 206), Gap(306, 309)]
+    hinted = boundaries_from_expected_durations(short_gaps, 0, 409, [100] * 4, side_breaks=[2])
+    ordinary = boundaries_from_expected_durations(short_gaps, 0, 409, [100] * 4)
+    assert hinted.boundaries == ordinary.boundaries
+    assert [(t.start, t.end) for t in hinted.tracks] == [(t.start, t.end) for t in ordinary.tracks]
+
 
 def _old_expected(durs, music_start, music_end):
     """The previous proportional formula, for drift comparison."""

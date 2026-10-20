@@ -630,7 +630,9 @@
                                                            :disabled="file.stable === false" :aria-label="`Select ${file.name}`">
                                                     <span class="flex-1 min-w-0 truncate font-medium text-primary" :title="file.name" x-text="file.name"></span>
                                                     <span class="text-muted whitespace-nowrap" x-text="formatSize(file.size)"></span>
-                                                    <span class="text-secondary whitespace-nowrap" x-text="importFileLabel(file)"></span>
+                                                    <span class="text-secondary whitespace-nowrap"
+                                                          :style="importFileLabel(file) === 'Complete' ? 'color: #166534; font-weight: 600;' : ''"
+                                                          x-text="importFileLabel(file)"></span>
                                                 </div>
                                             </template>
                                         </div>
@@ -718,7 +720,9 @@
                                             <p class="font-medium text-xs truncate text-primary"><span x-text="file.filename"></span>
                                                 <span x-show="file.in_place" class="ml-1 px-1 rounded text-muted align-middle" style="background-color: rgba(138, 138, 134, 0.2); font-size: 0.65rem;" title="Read from the import folder — the original is never modified or deleted">in place</span></p>
                                             <p class="text-xs text-muted" x-text="formatSize(file.size) + ' • ' + formatDuration(file.duration)"></p>
-                                            <p class="text-xs mt-1 font-semibold text-primary" x-text="queueLabel(file)"></p>
+                                            <p class="text-xs mt-1 font-semibold text-primary"
+                                               :style="queueLabel(file) === 'Complete' ? 'color: #166534;' : ''"
+                                               x-text="queueLabel(file)"></p>
                                             <p x-show="queueReason(file)" class="text-xs text-secondary" x-text="queueReason(file)"></p>
                                         </div>
                                         <button @click.stop="removeFile(file.id)" :disabled="batchProcessing || ['processing', 'uncertain'].includes(file.status) || (file.album_job_status && file.album_job_status !== 'complete') || (file.id === currentFileId && analyzing)" aria-label="Remove recording from queue" class="ml-2 btn-danger hover:opacity-80 px-2 py-1 rounded text-xs">✕</button>

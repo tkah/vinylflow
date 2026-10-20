@@ -2592,7 +2592,13 @@ function vinylApp() {
                     body: JSON.stringify({
                         file_id: this.currentFileId,
                         expected_tracks: count,
-                        durations: targets.map(t => this.parseTrackDuration(t.duration))
+                        durations: targets.map(t => this.parseTrackDuration(t.duration)),
+                        side_breaks: targets.flatMap((track, index) => {
+                            if (!index) return [];
+                            const side = t => /^([A-Za-z]+)/.exec(String(t.position || '').trim())?.[1]?.toUpperCase();
+                            const before = side(targets[index - 1]), after = side(track);
+                            return before && after && before !== after ? [index] : [];
+                        })
                     })
                 });
                 const data = await response.json();
@@ -3188,7 +3194,7 @@ function vinylApp() {
                 // If duration is missing or 0 (probe failed at upload), omit it
                 // so WaveSurfer falls back to fetching the file (slower but safe).
                 const knownDuration = peaksData.duration > 0 ? peaksData.duration : undefined;
-                await this.waveform.load(`/api/audio/${this.currentFileId}`, [peaksData.peaks], knownDuration);
+                await this.waveform.load(`/api/audio/${this.currentFileId}?precise=true`, [peaksData.peaks], knownDuration);
 
             } catch (error) {
                 console.error('Waveform initialization failed:', error);

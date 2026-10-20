@@ -128,8 +128,9 @@ Manual steps:
 - Discogs search runs automatically on file select (needs a stubbed `search_basic`); picking a
   release runs guided detection. Without Discogs, click "Skip Discogs — detect tracks by silence
   only", expect "Detecting tracks…", then 3 tracks + waveform regions render from peaks.
-- `$B network` should show `/api/audio` as **206** range requests of the ~2MB MP3,
-  not the 22MB WAV.
+- `$B network` should show `/api/audio/{id}?precise=true` using **206** range requests.
+  WAV editing streams the original source for cut-point timing; AIFF uses the pinned preview
+  fallback. Default `/api/audio/{id}` still prefers and pins the MP3 when ready.
 - WaveSurfer canvas lives in shadow DOM — `#waveform *` counts only 1 light-DOM child;
   screenshot to confirm rendering instead.
 
