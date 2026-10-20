@@ -198,6 +198,9 @@ function vinylApp() {
         _batchFileId: null,
         _batchResolve: null,
         _restoreZoom: null,
+        currentAlbumJobId: null,
+        albumWarnings: [],
+        _albumResolve: null,
 
         // Output format
         outputFormat: 'flac',
@@ -448,6 +451,9 @@ function vinylApp() {
             state.completedExportSignature = file?.completedExportSignature || null;
             state.pendingExportSignature = file?.pendingExportSignature || null;
             state.pendingExportAccepted = file?.pendingExportAccepted !== false;
+            state.pendingAlbumJobId = file?.pendingAlbumJobId || null;
+            state.pendingAlbumContext = file?.pendingAlbumContext || null;
+            state.completedAlbumContext = file?.completedAlbumContext || null;
             return state;
         },
 
@@ -497,6 +503,7 @@ function vinylApp() {
                 if (!response.ok) throw new Error('Queue unavailable');
                 const data = await response.json();
                 this.uploadedFiles = (data.uploaded || []).map(file => ({ ...file, musicStart: null, musicDuration: null }));
+                this.albumWarnings = [...new Set(this.uploadedFiles.flatMap(file => file.album_warnings || []))];
                 let saved = null;
                 try { saved = JSON.parse(window.localStorage.getItem(WORKSPACE_STORAGE_KEY) || 'null'); }
                 catch (error) { /* A corrupt save must not block the server queue. */ }
@@ -512,10 +519,23 @@ function vinylApp() {
                         file.completedExportSignature = state.completedExportSignature;
                         file.pendingExportSignature = state.pendingExportSignature;
                         file.pendingExportAccepted = state.pendingExportAccepted !== false;
+                        file.pendingAlbumJobId = state.pendingAlbumJobId;
+                        file.pendingAlbumContext = state.pendingAlbumContext;
+                        file.completedAlbumContext = state.completedAlbumContext;
+                        if (state.pendingAlbumJobId && state.pendingAlbumJobId === file.album_job_id) {
+                            // The server's matching UUID confirms acceptance even when its POST response was lost.
+                            state.pendingExportAccepted = file.pendingExportAccepted = true;
+                        }
                         // Export may have finished while the browser was refreshing/disconnected.
-                        if (file.status === 'completed' && file.pendingExportSignature && state.pendingExportAccepted !== false) {
+                        if (file.status === 'completed' && file.pendingExportSignature && state.pendingExportAccepted !== false &&
+                            (!state.pendingAlbumJobId || state.pendingAlbumJobId === file.album_job_id)) {
                             state.completedExportSignature = file.completedExportSignature = file.pendingExportSignature;
                             state.pendingExportSignature = null;
+                            if (state.pendingAlbumContext) {
+                                state.completedAlbumContext = file.completedAlbumContext = state.pendingAlbumContext;
+                                state.pendingAlbumContext = null;
+                                delete file.pendingAlbumContext;
+                            }
                             delete file.pendingExportSignature;
                         } else if (file.status !== 'processing' && state.pendingExportAccepted === false) {
                             // A lost POST response is not evidence that newly edited inputs were exported.
@@ -604,28 +624,62 @@ function vinylApp() {
         },
 
         /** Eligibility before checking another ready recording's claimed output positions. */
-        baseReadiness(fileId) {
+        baseReadiness(fileId, shared = true) {
             const file = this.uploadedFiles.find(entry => entry.id === fileId);
             if (!file || this.pendingRemovals[fileId]) return { ready: false, reason: 'Recording removed.' };
             if (['processing', 'queued', 'uncertain'].includes(file.status)) return { ready: false, reason: file.error || 'Export in progress.' };
             const state = this.workspaceFor(fileId);
             const reason = this.exportProblem(file, state);
             if (reason) return { ready: false, reason };
-            if (file.status === 'completed' && file.completedExportSignature === this.exportSignature(state)) {
+            if (file.status === 'completed' && file.completedExportSignature === this.exportSignature(state) && (!shared || this.albumContextMatches(fileId))) {
                 return { ready: false, completed: true, reason: '' };
             }
             return { ready: true, reason: '' };
         },
 
+        /** Prepared recordings that could contribute to the same album/encoding. */
+        albumCohort(fileId) {
+            const state = this.workspaceFor(fileId);
+            if (!state?.selectedRelease) return [];
+            return this.uploadedFiles.filter(file => {
+                const other = this.workspaceFor(file.id);
+                return !this.pendingRemovals[file.id] && other?.selectedRelease?.id === state.selectedRelease.id &&
+                    other.outputFormat === state.outputFormat && !this.exportProblem(file, other);
+            });
+        },
+
+        /** Any changed/added/re-exported member invalidates the old shared measurement for all. */
+        albumContextMatches(fileId) {
+            const file = this.uploadedFiles.find(entry => entry.id === fileId);
+            const context = file?.completedAlbumContext;
+            const cohort = this.albumCohort(fileId);
+            const state = this.workspaceFor(fileId);
+            const shared = cohort.length > 1 && (state.albumGain || state.replaygain !== false);
+            if (!context) return !shared;
+            const ids = Object.keys(context.signatures);
+            if (cohort.length !== ids.length) return false;
+            return cohort.every(member => ids.includes(member.id) &&
+                member.completedAlbumContext?.job_id === context.job_id && member.album_job_id === context.job_id &&
+                this.exportSignature(this.workspaceFor(member.id)) === context.signatures[member.id]);
+        },
+
         /** Detect duplicate positions before two recordings can overwrite the same release's tracks. */
-        fileReadiness(fileId) {
-            const readiness = this.baseReadiness(fileId);
+        fileReadiness(fileId, shared = true) {
+            if (shared) {
+                const state = this.workspaceFor(fileId);
+                const mismatch = this.albumCohort(fileId).find(file => {
+                    const other = this.workspaceFor(file.id);
+                    return other.albumGain !== state.albumGain || (other.replaygain !== false) !== (state.replaygain !== false);
+                });
+                if (mismatch) return { ready: false, reason: 'Use matching album gain and ReplayGain choices for recordings of this release and format.' };
+            }
+            const readiness = this.baseReadiness(fileId, shared);
             if (!readiness.ready) return readiness;
             const state = this.workspaceFor(fileId);
             const request = this.buildExportRequest(fileId, state);
             const positions = new Set(request.track_mapping.map(mapping => mapping.discogs));
             for (const other of this.uploadedFiles) {
-                if (other.id === fileId || !this.baseReadiness(other.id).ready) continue;
+                if (other.id === fileId || !this.baseReadiness(other.id, shared).ready) continue;
                 const otherState = this.workspaceFor(other.id);
                 if (otherState.selectedRelease.id !== state.selectedRelease.id || otherState.outputFormat !== state.outputFormat) continue;
                 const collision = this.buildExportRequest(other.id, otherState).track_mapping.find(mapping => positions.has(mapping.discogs));
@@ -707,10 +761,15 @@ function vinylApp() {
             file.completedExportSignature = file.pendingExportSignature || file.completedExportSignature;
             delete file.pendingExportSignature;
             delete file.pendingExportAccepted;
+            delete file.pendingAlbumJobId;
+            delete file.pendingAlbumContext;
             const state = this.workspaces[fileId];
             if (state) {
                 state.completedExportSignature = file.completedExportSignature;
                 state.pendingExportSignature = null;
+                state.pendingAlbumJobId = null;
+                state.pendingAlbumContext = null;
+                state.completedAlbumContext = file.completedAlbumContext || null;
             }
             if (fileId === this.currentFileId) {
                 this.processingProgress = 1;
@@ -1490,10 +1549,12 @@ function vinylApp() {
             this.destroyWaveform();
 
             const restored = this.restoreWorkspace(fileId);
-            if (this.currentFile?.status === 'processing') {
+            if (this.currentFile?.status === 'processing' ||
+                (this.currentFile?.album_job_status && this.currentFile.album_job_status !== 'complete')) {
                 this.isProcessing = true;
                 this.currentJobId = fileId;
-                this.startProcessPolling(fileId);
+                if (this.currentFile.album_job_id) this.startAlbumPolling(this.currentFile.album_job_id);
+                else this.startProcessPolling(fileId);
             }
             if (restored) return;
             if (this.currentFile) {
@@ -1517,7 +1578,9 @@ function vinylApp() {
             if (index === -1 || this.pendingRemovals[fileId]) return;
 
             const file = this.uploadedFiles[index];
-            if (this.batchProcessing || ['processing', 'uncertain'].includes(file.status) || (fileId === this.currentFileId && this.analyzing)) return;
+            if (this.batchProcessing || ['processing', 'uncertain'].includes(file.status) ||
+                (file.album_job_status && file.album_job_status !== 'complete') ||
+                (fileId === this.currentFileId && this.analyzing)) return;
             this.saveWorkspace();
             const entry = {
                 file, index,
@@ -4268,7 +4331,7 @@ function vinylApp() {
         /** Validate and export just the recording currently in the editor. */
         async processFile() {
             if (!this.currentFileId || this.exportBusy || this.analyzing) return;
-            const readiness = this.fileReadiness(this.currentFileId);
+            const readiness = this.fileReadiness(this.currentFileId, false);
             if (!readiness.ready) {
                 if (!readiness.completed) this.notify(readiness.reason, { type: 'warning', timeout: 6000 });
                 return;
@@ -4282,6 +4345,7 @@ function vinylApp() {
             if (this.exportBusy || this.analyzing) return;
             this.batchProcessing = true;
             this.batchSummary = null;
+            this.albumWarnings = [];
             const results = [];
             let items = [];
             try {
@@ -4294,7 +4358,19 @@ function vinylApp() {
                 items = JSON.parse(JSON.stringify(items));
                 this.batchItems = items;
                 for (const item of items) this.uploadedFiles.find(file => file.id === item.fileId).status = 'queued';
+                const dispatched = new Set();
                 for (const item of items) {
+                    if (dispatched.has(item.fileId)) continue;
+                    const peers = items.filter(other => other.request.release_id === item.request.release_id &&
+                        other.request.output_format === item.request.output_format);
+                    if (peers.length > 1 && (item.request.album_gain || item.request.replaygain)) {
+                        peers.forEach(peer => dispatched.add(peer.fileId));
+                        const outcomes = await this.submitAlbumExport(peers);
+                        results.push(...outcomes);
+                        if (outcomes.some(result => result.status === 'uncertain')) break;
+                        continue;
+                    }
+                    dispatched.add(item.fileId);
                     this._batchFileId = item.fileId;
                     const terminal = new Promise(resolve => { this._batchResolve = resolve; });
                     await this.submitExport(item.fileId, item.request, item.signature);
@@ -4316,6 +4392,125 @@ function vinylApp() {
             }
         },
 
+        /** Start one server-owned group; its UUID identifies acceptance even across refresh. */
+        async submitAlbumExport(items) {
+            const random = globalThis.crypto;
+            const jobId = random.randomUUID ? random.randomUUID() : Array.from(random.getRandomValues(new Uint8Array(16)), value => value.toString(16).padStart(2, '0')).join('');
+            const context = { job_id: jobId, signatures: Object.fromEntries(items.map(item => [item.fileId, item.signature])) };
+            this.isProcessing = true;
+            for (const item of items) {
+                const file = this.uploadedFiles.find(entry => entry.id === item.fileId);
+                Object.assign(file, { status: 'processing', pendingExportSignature: item.signature,
+                    pendingExportAccepted: false, pendingAlbumJobId: jobId, pendingAlbumContext: context, progress: 0, error: '' });
+                if (file.id === this.currentFileId) this.saveWorkspace();
+                else if (this.workspaces[file.id]) Object.assign(this.workspaces[file.id], {
+                    pendingExportSignature: item.signature, pendingExportAccepted: false,
+                    pendingAlbumJobId: jobId, pendingAlbumContext: context });
+            }
+            this.persistWorkspaces();
+            try {
+                const response = await fetch('/api/process-album', { method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ job_id: jobId, files: items.map(item => item.request) }) });
+                if (!response.ok) {
+                    const data = await response.json().catch(() => ({}));
+                    const error = data.detail || `Album export rejected (HTTP ${response.status}).`;
+                    for (const item of items) this.failExport(item.fileId, error);
+                    this.isProcessing = false;
+                    return items.map(item => ({ fileId: item.fileId, filename: item.filename, status: 'error', error }));
+                }
+                const data = await response.json();
+                if (data.job_id.replaceAll('-', '') !== jobId.replaceAll('-', '')) throw new Error('Album acceptance could not be confirmed.');
+                for (const item of items) {
+                    const file = this.uploadedFiles.find(entry => entry.id === item.fileId);
+                    file.album_job_id = data.job_id;
+                    file.pendingAlbumJobId = context.job_id = data.job_id;
+                    file.pendingExportAccepted = true;
+                    if (this.workspaces[file.id]) Object.assign(this.workspaces[file.id], {
+                        pendingAlbumJobId: data.job_id, pendingExportAccepted: true });
+                }
+                if (items.some(item => item.fileId === this.currentFileId)) this.saveWorkspace();
+                this.persistWorkspaces();
+                const terminal = new Promise(resolve => { this._albumResolve = resolve; });
+                this.startAlbumPolling(data.job_id);
+                this.applyAlbumJob(data);
+                return await terminal;
+            } catch (error) {
+                // A lost acceptance response is not permission to start another export.
+                const message = 'Album export status unknown. Reload to check the server before continuing.';
+                for (const item of items) {
+                    const file = this.uploadedFiles.find(entry => entry.id === item.fileId);
+                    file.status = 'uncertain'; file.error = message;
+                }
+                return items.map(item => ({ fileId: item.fileId, filename: item.filename, status: 'uncertain', error: message }));
+            }
+        },
+
+        /** Group outcomes become Complete only after shared tagging, never after audio alone. */
+        applyAlbumJob(job) {
+            if (job.job_id !== this.currentAlbumJobId) return;
+            this.albumWarnings = [...new Set([...this.albumWarnings, ...(job.warnings || [])])];
+            for (const item of job.files || []) {
+                const file = this.uploadedFiles.find(entry => entry.id === item.file_id);
+                if (!file) continue;
+                file.album_job_id = job.job_id;
+                file.album_job_status = job.status;
+                this.exportProgress(file.id, item.progress, item.message);
+                if (job.status !== 'complete') {
+                    file.status = item.status === 'error' ? 'error' : 'processing';
+                    if (item.error) file.error = item.error;
+                }
+            }
+            if (job.status !== 'complete') return;
+            // Assign every context first so peers validate consistently during Alpine updates.
+            for (const item of job.files || []) {
+                const file = this.uploadedFiles.find(entry => entry.id === item.file_id);
+                if (file && item.status === 'complete') file.completedAlbumContext = file.pendingAlbumContext || file.completedAlbumContext;
+            }
+            const outcomes = [];
+            for (const item of job.files || []) {
+                const file = this.uploadedFiles.find(entry => entry.id === item.file_id);
+                if (!file) continue;
+                if (item.status === 'complete') {
+                    this.completeExport(file.id, item.tracks || []);
+                    if (item.message) file.processingMessage = item.message;
+                } else this.failExport(file.id, item.error || 'Album export failed.');
+                outcomes.push({ fileId: file.id, filename: file.filename, status: item.status === 'complete' ? 'complete' : 'error', error: item.error });
+            }
+            this.isProcessing = false;
+            this.stopProcessPolling();
+            if (this._albumResolve) {
+                const resolve = this._albumResolve;
+                this._albumResolve = null;
+                resolve(outcomes);
+            }
+        },
+
+        /** Resume observing the accepted server job; this never submits any exports. */
+        startAlbumPolling(jobId) {
+            this.stopProcessPolling();
+            this._activeExportFileId = null;
+            this.currentAlbumJobId = jobId;
+            this.isProcessing = true;
+            const token = this._processPollToken;
+            let inFlight = false;
+            this.processPollTimer = setInterval(async () => {
+                if (inFlight || token !== this._processPollToken) return;
+                inFlight = true;
+                try {
+                    const response = await fetch(`/api/process-album/${jobId}`);
+                    if (token !== this._processPollToken) return;
+                    if (response.status === 404) {
+                        const files = this.uploadedFiles.filter(file => file.album_job_id === jobId || file.pendingAlbumJobId === jobId);
+                        this.applyAlbumJob({ job_id: jobId, status: 'complete', files: files.map(file => ({ file_id: file.id, status: 'error', error: 'The album job is no longer available.' })) });
+                        return;
+                    }
+                    if (response.ok) this.applyAlbumJob(await response.json());
+                } catch (error) { console.warn('Waiting for album status:', error); }
+                finally { inFlight = false; }
+            }, PROCESS_POLL_INTERVAL_MS);
+        },
+
         /** Submit one immutable request; a fast terminal event may precede its HTTP response. */
         async submitExport(fileId, request, signature) {
             const file = this.uploadedFiles.find(entry => entry.id === fileId);
@@ -4323,6 +4518,10 @@ function vinylApp() {
             this._activeExportFileId = fileId;
             file.pendingExportSignature = signature;
             file.pendingExportAccepted = false;
+            file.pendingAlbumJobId = null;
+            file.pendingAlbumContext = null;
+            file.completedAlbumContext = null;
+            file.album_job_id = null;
             file.status = 'processing'; file.progress = 0; file.error = '';
             this.isProcessing = true;
             this.successMessage = '';
@@ -4406,6 +4605,7 @@ function vinylApp() {
                 this.processPollTimer = null;
             }
             this.currentJobId = null;
+            this.currentAlbumJobId = null;
         },
 
         /**

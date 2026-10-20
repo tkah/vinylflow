@@ -33,6 +33,7 @@ from audio_processor import (
     OUTPUT_FORMATS,
     target_bit_depth,
     AudioProcessor,
+    Loudness,
     Track,
     album_gain_db,
     format_replaygain_gain,
@@ -103,7 +104,7 @@ def run(
 
         gain_db = None
         if spec.album_gain:
-            gain_db = _measure_album_gain(session, spec, tracks, audio_processor, on_progress)
+            gain_db = spec.shared_gain_db if spec.shared_album else _measure_album_gain(session, spec, tracks, audio_processor, on_progress)
 
         for i, track in enumerate(tracks):
             fraction = 0.4 + (i / total) * 0.5
@@ -142,7 +143,7 @@ def run(
                 track, release, spec.output_format
             )
             final_path = album_folder / final_filename
-            temp_output.rename(final_path)
+            temp_output.replace(final_path)
 
             output_files.append(final_filename)
 
@@ -151,6 +152,12 @@ def run(
                 album_folder, output_files, spec, audio_processor, metadata_handler, on_progress
             )
 
+        if spec.defer_completion:
+            run_record.output_folder = album_folder
+            run_record.output_files = output_files
+            on_progress(ProgressEvent(phase="exported", fraction=0.9,
+                                      message="Audio saved; waiting for shared album tags..."))
+            return
         session.mark_complete(album_folder, output_files)
 
         on_progress(
@@ -238,7 +245,13 @@ def _write_replaygain_tags(
     Measurement or tagging failures log a warning and skip RG for that file
     (or the album values); they never fail the job.
     """
-    paths = [album_folder / name for name in output_files]
+    return write_replaygain_paths([album_folder / name for name in output_files], spec.output_format,
+                                 audio_processor, metadata_handler, on_progress)
+
+
+def write_replaygain_paths(paths, output_format, audio_processor, metadata_handler, on_progress,
+                          include_album=True):
+    """Tag only the explicit successful outputs, measuring their combined programme once."""
     total = len(paths)
     per_file = []
     for i, path in enumerate(paths):
@@ -265,7 +278,10 @@ def _write_replaygain_tags(
         )
     )
     try:
-        album = audio_processor.measure_files(paths)
+        album = audio_processor.measure_files(paths) if include_album else None
+        if album is not None:
+            # Layout conversion in the combined pass must never hide a native output's peak.
+            album = Loudness(album.integrated, max([album.true_peak] + [loud.true_peak for loud in per_file if loud]))
     except Exception:
         traceback.print_exc()
         album = None
@@ -280,7 +296,7 @@ def _write_replaygain_tags(
         try:
             ok = metadata_handler.write_replaygain(
                 path,
-                spec.output_format,
+                output_format,
                 format_replaygain_gain(replaygain_gain_db(loud)) if loud else None,
                 format_replaygain_peak(loud.true_peak) if loud else None,
                 album_gain,
@@ -291,8 +307,11 @@ def _write_replaygain_tags(
             ok = False
         written += 1 if ok else 0
 
-    if written == total and album is not None:
+    if written == total and not include_album:
+        message = "Track ReplayGain tags written; shared album tags skipped"
+    elif written == total and album is not None:
         message = f"ReplayGain tags written (album {album_gain})"
     else:
         message = f"Warning: ReplayGain tags written for {written}/{total} files"
     on_progress(ProgressEvent(phase="replaygain", fraction=0.98, message=message))
+    return written == total and (album is not None or not include_album)

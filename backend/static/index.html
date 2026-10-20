@@ -695,12 +695,15 @@
                                     class="px-3 py-2 btn-primary rounded-lg text-sm font-semibold"
                                     x-text="batchProcessing ? 'Batch processing…' : `Process all ready (${readyFiles.length})`"></button>
                         </div>
-                        <p class="text-xs text-secondary mb-2">Exports run one at a time. Keep this page open while queued recordings are being started.</p>
+                        <p class="text-xs text-secondary mb-2">Recordings of the same release and output format share album gain and ReplayGain. Album groups finish on the server; keep this page open to start the remaining groups.</p>
                         <div x-show="batchSummary && !batchProcessing" role="status" class="mb-3 p-2 rounded-lg text-sm text-primary" style="background-color: #F0EFEB;">
                             <p x-text="batchSummary ? `${batchSummary.completed} complete · ${batchSummary.failed} failed${batchSummary.uncertain ? ' · export status unknown' : ''}${batchSummary.notStarted ? ` · ${batchSummary.notStarted} not started` : ''}` : ''"></p>
                             <template x-for="result in (batchSummary?.results || []).filter(item => item.error)" :key="result.fileId">
                                 <p class="text-xs mt-1"><span class="font-semibold" x-text="result.filename"></span>: <span x-text="result.error"></span></p>
                             </template>
+                        </div>
+                        <div x-show="albumWarnings.length" role="status" class="mb-3 text-sm text-secondary">
+                            <template x-for="warning in albumWarnings" :key="warning"><p x-text="warning"></p></template>
                         </div>
                         <div class="space-y-2 max-h-40 overflow-y-auto">
                             <template x-for="file in uploadedFiles" :key="file.id">
@@ -718,7 +721,7 @@
                                             <p class="text-xs mt-1 font-semibold text-primary" x-text="queueLabel(file)"></p>
                                             <p x-show="queueReason(file)" class="text-xs text-secondary" x-text="queueReason(file)"></p>
                                         </div>
-                                        <button @click.stop="removeFile(file.id)" :disabled="batchProcessing || ['processing', 'uncertain'].includes(file.status) || (file.id === currentFileId && analyzing)" aria-label="Remove recording from queue" class="ml-2 btn-danger hover:opacity-80 px-2 py-1 rounded text-xs">✕</button>
+                                        <button @click.stop="removeFile(file.id)" :disabled="batchProcessing || ['processing', 'uncertain'].includes(file.status) || (file.album_job_status && file.album_job_status !== 'complete') || (file.id === currentFileId && analyzing)" aria-label="Remove recording from queue" class="ml-2 btn-danger hover:opacity-80 px-2 py-1 rounded text-xs">✕</button>
                                     </div>
                                     <template x-if="file.progress > 0">
                                         <div class="mt-1">
@@ -1236,6 +1239,8 @@
                                 <p class="mt-2 text-xs text-muted">Raises or lowers the whole album by one amount to a standard loudness (&minus;14 LUFS), keeping the differences between songs. Never pushes peaks above &minus;1 dBTP.</p>
                             </div>
 
+                            <p class="mt-1 text-xs text-secondary">Process all ready shares album measurements with matching recordings. Single-file export and Test on one track use this recording only.</p>
+
                             <!-- ReplayGain tags -->
                             <div class="mt-4">
                                 <button type="button" role="switch" :aria-checked="config.replaygain !== false" @click="toggleReplayGain()"
@@ -1306,7 +1311,7 @@
                         </div>
 
                         <!-- Process Button -->
-                        <button @click="processFile()" :disabled="exportBusy || analyzing || !fileReadiness(currentFileId).ready" class="w-full px-6 py-3 btn-primary rounded-lg font-bold text-lg">
+                        <button @click="processFile()" :disabled="exportBusy || analyzing || !fileReadiness(currentFileId, false).ready" class="w-full px-6 py-3 btn-primary rounded-lg font-bold text-lg">
                             <span x-show="!isProcessing" x-text="processingComplete ? '✓ Complete' : '✓ Process & Save'"></span>
                             <span x-show="isProcessing" class="flex items-center justify-center gap-2">
                                 <div class="spinner"></div>

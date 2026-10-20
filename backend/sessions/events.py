@@ -22,6 +22,9 @@ class OutputSpec:
     hiss_reduction: str = "off"  # off | light | medium | strong
     noise_profile: Optional[Any] = None  # audio_processor.NoiseProfile for the hiss filter
     album_gain: bool = False
+    shared_album: bool = False  # suppress local gain measurement when a group already measured it
+    shared_gain_db: Optional[float] = None
+    defer_completion: bool = False  # group finalization writes shared tags before Session completion
     replaygain: bool = True
     track_numbering: str = "vinyl"
     bit_depth: str = "source"  # "source" | "24"

@@ -52,6 +52,8 @@ class Session:
     boundaries: list[Any] = field(default_factory=list)
     mappings: dict[int, str] = field(default_factory=dict)
     last_run: Optional[ProcessingRun] = None
+    album_job_id: Optional[str] = None  # most recent group, retained for status/recovery
+    export_reserved: bool = False       # protects source/mappings through measurement and final tags
 
     # Pinned on the first /api/audio request so the same URL never switches
     # from WAV to MP3 bytes mid-playback (the preconverted MP3 may finish

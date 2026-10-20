@@ -241,7 +241,8 @@ def captured(monkeypatch):
     async def fake(request):
         seen.append(request)
 
-    monkeypatch.setattr(api, "process_file_background", fake)
+    # Keep the reservation-release wrapper real; stub only the expensive audio worker.
+    monkeypatch.setattr(api, "_process_file_background", fake)
     return seen
 
 

@@ -477,6 +477,19 @@ class Loudness:
     true_peak: float
 
 
+@dataclass(frozen=True)
+class LoudnessSource:
+    """A recording's active ranges and the cleanup chain used for their export."""
+
+    path: Path
+    ranges: list[tuple]
+    rumble: bool = False
+    declick: str = "off"
+    hum: int = 0
+    hiss: str = "off"
+    noise: Optional[NoiseProfile] = None
+
+
 def parse_ebur128_summary(ffmpeg_stderr: str) -> Optional[Loudness]:
     """Parse the ``Summary:`` block printed by ``ebur128=peak=true``.
 
@@ -921,6 +934,49 @@ class AudioProcessor:
         )
         return self._measure(args + ["-filter_complex", graph])
 
+    def measure_sources(self, sources: List[LoudnessSource]) -> Optional[Loudness]:
+        """Measure concatenated, separately cleaned cuts, retaining the native peak ceiling.
+
+        A single integrated pass applies the loudness gate to the entire programme. Native
+        per-source measurements supply a conservative peak when layouts/sample rates differ.
+        FFmpeg streams the cuts; no album-sized PCM array is returned to Python.
+        """
+        if not sources or any(not source.ranges for source in sources):
+            return None
+        peaks = []
+        rates = []
+        for source in sources:
+            native = self.measure_ranges(source.path, source.ranges, source.rumble, source.declick,
+                                         hum=source.hum, hiss=source.hiss, noise=source.noise)
+            _, rate = self.probe_info(source.path)
+            if native is None or not rate:
+                return None
+            peaks.append(native.true_peak)
+            rates.append(rate)
+        common_rate = max(rates)
+        args = ["-hide_banner", "-nostats"]
+        parts = []
+        for source in sources:
+            for bounds in source.ranges:
+                start, end = bounds[:2]
+                declick = bounds[2] if len(bounds) > 2 and bounds[2] else source.declick
+                chain = build_export_filters(source.rumble, declick, None, hum=source.hum,
+                                             hiss=source.hiss, noise=source.noise)
+                if chain:
+                    seek, duration, first, last = self.padded_cut(source.path, start, end)
+                    args += seek_args(seek, duration) + ["-i", str(source.path)]
+                    chain += f",{trim_filter(first, last)}"
+                else:
+                    args += ["-ss", f"{start:.6f}", "-t", f"{end-start:.6f}", "-i", str(source.path)]
+                    chain = "asetpts=PTS-STARTPTS"
+                index = len(parts)
+                parts.append(f"[{index}:a]{chain},aresample={common_rate},"
+                             f"aformat=sample_fmts=dbl:channel_layouts=stereo[s{index}]")
+        inputs = "".join(f"[s{index}]" for index in range(len(parts)))
+        graph = ";".join(parts) + f";{inputs}concat=n={len(parts)}:v=0:a=1,ebur128=peak=true:framelog=quiet"
+        album = self._measure(args + ["-filter_complex", graph])
+        return Loudness(album.integrated, max(album.true_peak, *peaks)) if album else None
+
     def measure_file(self, file_path: Path) -> Optional[Loudness]:
         """Loudness of one finished file."""
         return self._measure(
@@ -937,8 +993,14 @@ class AudioProcessor:
         args = ["-hide_banner", "-nostats"]
         for p in file_paths:
             args += ["-i", str(p)]
-        inputs = "".join(f"[{i}:a]" for i in range(len(file_paths)))
-        graph = f"{inputs}concat=n={len(file_paths)}:v=0:a=1,ebur128=peak=true:framelog=quiet"
+        rates = [self.probe_info(path)[1] for path in file_paths]
+        if not all(rates):
+            return None
+        common_rate = max(rates)
+        parts = [f"[{index}:a]aresample={common_rate},aformat=sample_fmts=dbl:channel_layouts=stereo,"
+                 f"asetpts=PTS-STARTPTS[s{index}]" for index in range(len(file_paths))]
+        inputs = "".join(f"[s{index}]" for index in range(len(file_paths)))
+        graph = ";".join(parts) + f";{inputs}concat=n={len(file_paths)}:v=0:a=1,ebur128=peak=true:framelog=quiet"
         return self._measure(args + ["-filter_complex", graph])
 
     def render_removed_flac(

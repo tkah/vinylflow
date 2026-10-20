@@ -73,6 +73,8 @@ from backend.sessions import (
     pipeline,
 )
 
+from backend.sessions.album import AlbumJob, AlbumMember
+
 # Initialize FastAPI app
 app = FastAPI(title="VinylFlow API", version="1.0.0")
 
@@ -85,6 +87,8 @@ app.add_middleware(SameOriginMiddleware)
 # broadcasts (orthogonal to per-Session state).  See CONTEXT.md for the
 # Session lifecycle.
 session_store = SessionStore()
+album_jobs: dict[str, AlbumJob] = {}
+MAX_ALBUM_RECORDINGS = 500
 websocket_connections: List[WebSocket] = []
 
 
@@ -95,7 +99,13 @@ def _session_status(session: Session) -> str:
     "analyzed" (READY with boundaries detected) — derive that here so
     the wire format stays unchanged after the dict-level state went away.
     """
-    if session.state == SessionState.PROCESSING:
+    job = album_jobs.get(session.album_job_id)
+    if job and session.id in job.files:
+        status = job.files[session.id]['status']
+        if status == 'error': return 'error'
+        if status == 'complete': return 'completed'
+        return 'processing'
+    if session.state == SessionState.PROCESSING or session.export_reserved:
         return "processing"
     if session.state == SessionState.COMPLETE:
         return "completed"
@@ -107,6 +117,13 @@ def _session_status(session: Session) -> str:
 def _serialize_uploaded(session: Session) -> dict:
     """Wire shape returned by /api/queue and friends — matches the dict
     shape the frontend used to consume from ``uploaded_files``."""
+    album = album_jobs.get(session.album_job_id)
+    album_info = {}
+    if album and session.id in album.files:
+        item = album.files[session.id]
+        album_info = {"album_job_id": album.id, "album_job_status": album.status,
+                      "album_warnings": list(album.warnings), "error": item.get("error", ""),
+                      "progress": item.get("progress", 0), "processingMessage": item.get("message", "")}
     return {
         "id": session.id,
         "filename": session.source_filename,
@@ -115,6 +132,7 @@ def _serialize_uploaded(session: Session) -> dict:
         "size": session.source_size,
         "duration": session.source_duration,
         "status": _session_status(session),
+        **album_info,
     }
 
 
@@ -125,6 +143,11 @@ def _serialize_job(session: Session) -> dict:
     identifier any more.  Re-running a Session overwrites ``last_run``;
     callers polling the same id keep seeing fresh status.
     """
+    album = album_jobs.get(session.album_job_id)
+    if album and session.id in album.files:
+        item = dict(album.files[session.id])
+        item['status'] = item['status'] if item['status'] in ('complete', 'error') else 'processing'
+        return {**item, 'job_id': session.id, 'album_job_id': album.id}
     run = session.last_run
     state = session.state
     if state == SessionState.PROCESSING:
@@ -188,6 +211,9 @@ def get_session_path(file_id: str, filename: str = None) -> Path:
 
 def cleanup_session(file_id: str) -> bool:
     """Drop a Session and its on-disk source folder."""
+    session = session_store.get(file_id)
+    if session and session.export_reserved:
+        return False
     session_dir = get_session_path(file_id)
     try:
         if session_dir.exists():
@@ -941,6 +967,8 @@ async def analyze_file(request: AnalyzeRequest):
     if session is None:
         raise HTTPException(status_code=404, detail="File not found")
     _require_source(session)
+    _require_editable(session)
+    session.album_job_id = None
 
     file_path = session.source_audio
 
@@ -1005,6 +1033,8 @@ async def rescan_file(request: RescanRequest):
     if session is None:
         raise HTTPException(status_code=404, detail="File not found")
     _require_source(session)
+    _require_editable(session)
+    session.album_job_id = None
 
     file_path = session.source_audio
 
@@ -1095,6 +1125,8 @@ async def analyze_guided(request: GuidedAnalyzeRequest):
     if session is None:
         raise HTTPException(status_code=404, detail="File not found")
     _require_source(session)
+    _require_editable(session)
+    session.album_job_id = None
 
     durations = request.durations
     use_durations = (
@@ -1782,17 +1814,14 @@ async def get_length_donors(release_id: int):
     return {"donors": donors}
 
 
-@app.post("/api/process")
-async def process_file(request: ProcessRequest):
-    """
-    Process file: split tracks, tag with metadata, and save.
-    Supports FLAC, MP3, and AIFF output formats.
-    """
-    session = session_store.get(request.file_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="File not found")
-    _require_source(session)
+def _require_editable(session: Session) -> None:
+    """Reserve mappings/sources throughout measurement, metadata fetch, export and tagging."""
+    if session.export_reserved or session.state == SessionState.PROCESSING:
+        raise HTTPException(status_code=409, detail="This recording is being exported.")
 
+
+def _validate_process_options(request: ProcessRequest) -> None:
+    """Normalize and validate the shared single/group export options without mutating Sessions."""
     # Validate output format
     if request.output_format not in OUTPUT_FORMATS:
         raise HTTPException(
@@ -1817,16 +1846,148 @@ async def process_file(request: ProcessRequest):
     if request.hum_filter:
         request.hum_freq = _check_hum_freq(request.hum_freq)
 
+    for boundary in request.track_boundaries or []:
+        if boundary.declick is not None:
+            _check_declick(boundary.declick)
+
+
+def _output_spec(request: ProcessRequest, noise_profile=None) -> OutputSpec:
+    """Capture server defaults and request overrides into an immutable export specification."""
+    return OutputSpec(
+        output_format=request.output_format,
+        output_dir=Path(config.default_output_dir),
+        flac_compression=config.default_flac_compression,
+        rumble_filter=bool(request.rumble_filter),
+        declick=request.declick or "off",
+        hum_filter=request.hum_filter,
+        hum_freq=request.hum_freq if request.hum_filter else 60,
+        hiss_reduction=request.hiss_reduction,
+        noise_profile=noise_profile,
+        album_gain=request.album_gain,
+        replaygain=request.replaygain,
+        track_numbering=config.track_numbering,
+        bit_depth=request.bit_depth or config.bit_depth,
+    )
+
+
+class AlbumProcessRequest(BaseModel):
+    job_id: uuid.UUID
+    files: List[ProcessRequest]
+
+
+@app.post("/api/process-album")
+async def process_album(request: AlbumProcessRequest):
+    """Accept one identifiable, immutable album group; no audio work blocks the HTTP response."""
+    if not 2 <= len(request.files) <= MAX_ALBUM_RECORDINGS:
+        raise HTTPException(status_code=400, detail=f"An album group needs 2 to {MAX_ALBUM_RECORDINGS} recordings.")
+    for item in request.files:
+        _validate_process_options(item)
+    fingerprint = hashlib.sha256(json.dumps(request.model_dump(mode='json'), sort_keys=True).encode()).hexdigest()
+    job_id = str(request.job_id)
+    existing = album_jobs.get(job_id)
+    if existing:
+        if existing.fingerprint != fingerprint:
+            raise HTTPException(status_code=409, detail="This album job id belongs to different export inputs.")
+        return existing.view()
+    reference = request.files[0]
+    members = []
+    positions = set()
+    file_ids = set()
+    for item in request.files:
+        if (item.release_id, item.output_format, item.album_gain, item.replaygain) != (
+                reference.release_id, reference.output_format, reference.album_gain, reference.replaygain):
+            raise HTTPException(status_code=400, detail="Use the same release, format, album gain and ReplayGain choices for an album group.")
+        session = session_store.get(item.file_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Recording not found")
+        _require_source(session)
+        if not session.source_audio.is_file():
+            raise HTTPException(status_code=410, detail="The source recording is no longer available.")
+        _require_editable(session)
+        if item.file_id in file_ids:
+            raise HTTPException(status_code=400, detail="An album group cannot repeat a recording.")
+        file_ids.add(item.file_id)
+        boundaries = item.track_boundaries or []
+        mapping = {entry.detected: entry.discogs for entry in item.track_mapping}
+        numbers = [boundary.number for boundary in boundaries]
+        if not boundaries or len(set(numbers)) != len(numbers) or set(mapping) != set(numbers) or len(mapping) != len(item.track_mapping):
+            raise HTTPException(status_code=400, detail="Every unique active boundary needs one position mapping.")
+        previous_end = 0
+        for boundary in boundaries:
+            if boundary.number < 1 or not math.isfinite(boundary.start) or not math.isfinite(boundary.end) or boundary.start < previous_end or boundary.end <= boundary.start or boundary.end > session.source_duration:
+                raise HTTPException(status_code=400, detail="Invalid album track boundaries.")
+            previous_end = boundary.end
+            position = mapping[boundary.number].strip()
+            if not position or position in positions:
+                raise HTTPException(status_code=400, detail="Album positions must be nonempty and unique across recordings.")
+            positions.add(position)
+        members.append(AlbumMember(session, _output_spec(item), item.release_id))
+    # No await before all validations/reservations: competing requests cannot split the group.
+    for member, item in zip(members, request.files):
+        member.session.set_boundaries(list(item.track_boundaries))
+        member.session.set_mappings({entry.detected: entry.discogs for entry in item.track_mapping})
+        member.session.album_job_id = job_id
+        member.session.export_reserved = True
+    for old_id, old_job in list(album_jobs.items()):
+        if old_job.status == 'complete' and all(session_store.get(member.session.id) is None or
+                session_store.get(member.session.id).album_job_id != old_id for member in old_job.members):
+            del album_jobs[old_id]
+    job = AlbumJob(job_id, members, fingerprint)
+    album_jobs[job_id] = job
+    asyncio.create_task(_run_album_job(job))
+    return job.view()
+
+
+async def _run_album_job(job: AlbumJob):
+    """Prepare each source's noise profile, then run its album worker off the event loop."""
+    try:
+        for index, member in enumerate(job.members):
+            if member.spec.hiss_reduction != 'off':
+                from dataclasses import replace
+                noise = await _noise_profile_for(member.session)
+                job.members[index] = AlbumMember(member.session, replace(member.spec, noise_profile=noise), member.release_id)
+        await asyncio.to_thread(job.run, audio_processor, metadata_handler)
+    except Exception as error:
+        job.status = 'complete'
+        job.warnings.append(f'Album preparation failed: {error}')
+        for item in job.files.values():
+            item.update(status='error', error=str(error), message=str(error))
+    finally:
+        for member in job.members:
+            member.session.export_reserved = False
+
+
+@app.get("/api/process-album/{job_id}")
+async def get_album_job(job_id: str):
+    """Poll group preparation, per-file export progress and final shared-tag results."""
+    job = album_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Album job not found")
+    return job.view()
+
+
+@app.post("/api/process")
+async def process_file(request: ProcessRequest):
+    """
+    Process file: split tracks, tag with metadata, and save.
+    Supports FLAC, MP3, and AIFF output formats.
+    """
+    session = session_store.get(request.file_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    _require_source(session)
+
+    _require_editable(session)
+    _validate_process_options(request)
+    session.album_job_id = None
     if request.track_boundaries:
-        for b in request.track_boundaries:
-            if b.declick is not None:
-                _check_declick(b.declick)
         session.set_boundaries(list(request.track_boundaries))
     session.set_mappings({m.detected: m.discogs for m in request.track_mapping})
 
     # job_id == session_id post-Step-4: re-runs reuse the same id, since
     # ``last_run`` is overwritten on each invocation and there's no
     # per-run tracking surface to preserve across restarts.
+    session.export_reserved = True
     asyncio.create_task(process_file_background(request))
 
     return {"job_id": session.id, "status": "processing"}
@@ -1842,6 +2003,16 @@ _PHASE_TO_UI_STEP = {
 
 
 async def process_file_background(request: ProcessRequest):
+    """Always release a single-export reservation, including failures before pipeline startup."""
+    session = session_store.get(request.file_id)
+    try:
+        await _process_file_background(request)
+    finally:
+        if session:
+            session.export_reserved = False
+
+
+async def _process_file_background(request: ProcessRequest):
     """Run the Pipeline for ``request`` and bridge progress events to the
     WebSocket broadcaster.
 
@@ -1864,21 +2035,7 @@ async def process_file_background(request: ProcessRequest):
     if request.hiss_reduction != "off":
         noise_profile = await _noise_profile_for(session)
 
-    spec = OutputSpec(
-        output_format=request.output_format,
-        output_dir=Path(config.default_output_dir),
-        flac_compression=config.default_flac_compression,
-        rumble_filter=bool(request.rumble_filter),
-        declick=request.declick or "off",
-        hum_filter=request.hum_filter,
-        hum_freq=request.hum_freq if request.hum_filter else 60,
-        hiss_reduction=request.hiss_reduction,
-        noise_profile=noise_profile,
-        album_gain=request.album_gain,
-        replaygain=request.replaygain,
-        track_numbering=config.track_numbering,
-        bit_depth=request.bit_depth or config.bit_depth,
-    )
+    spec = _output_spec(request, noise_profile)
 
     loop = asyncio.get_running_loop()
 
@@ -1962,6 +2119,7 @@ async def remove_from_queue(file_id: str):
     """Remove a Session and its on-disk source folder."""
     if session_store.get(file_id) is None:
         raise HTTPException(status_code=404, detail="File not found")
+    _require_editable(session_store.get(file_id))
     await asyncio.to_thread(cleanup_session, file_id)
     return {"status": "removed"}
 
@@ -1970,7 +2128,7 @@ async def remove_from_queue(file_id: str):
 async def clear_all_temp():
     """Drop every Session and source folder except those mid-Pipeline."""
     cleared = 0
-    keep_ids = {s.id for s in session_store.list() if s.state == SessionState.PROCESSING}
+    keep_ids = {s.id for s in session_store.list() if s.state == SessionState.PROCESSING or s.export_reserved}
 
     for entry in list(UPLOAD_DIR.iterdir()):
         if entry.is_dir() and entry.name not in keep_ids:

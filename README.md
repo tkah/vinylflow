@@ -262,15 +262,29 @@ recordings keeps those edits. The queue shows **Ready** or **Needs attention**, 
 ignored tracks do not need mappings. Conflicting positions for the same release and output format
 need correcting before export.
 
-Click **Process all ready** to export the prepared recordings one at a time using each recording's
-settings. A failed export stays in the queue with its error while later recordings continue. The
-summary reports completed and failed recordings; **Ready to retry** items can be retried explicitly.
+Click **Process all ready** to export the prepared recordings sequentially. Recordings with the
+same Discogs release and output format are exported together, at the first matching entry in the
+queue. Use matching **Album gain** and **ReplayGain** toggles for those recordings; the queue explains
+any mismatch. Their other processing settings can differ.
 
-Keep the page open while queued recordings are being started. Refreshing preserves editing state
-and the server can finish its current export, but remaining recordings need another explicit batch
-start after recovery. If the connection drops before export acceptance is known, further dispatch
-stops until the server status can be checked. Album gain and ReplayGain are calculated separately
-for each recording; shared loudness across multiple recordings of a release is a future addition.
+**Shared album loudness:** when Album gain is on, the group receives one gain measured from all
+selected audio after each recording's cleanup filters. This preserves level differences between
+discs, targets −14 LUFS, and limits gain using the strongest native true peak (−1 dBTP ceiling).
+ReplayGain uses the finished files: album tags match across the group, and each track keeps its own
+track gain/peak. Different output formats form separate groups. Changing one recording makes the
+shared group ready again so its gain and tags can be recalculated together. **Process & Save** on a
+single recording and **Test on one track** continue to use that recording's own measurements.
+
+A failed export stays in the queue while later recordings continue. An incomplete album gets
+track ReplayGain only, with a warning explaining why shared album tags were skipped. A failed shared
+gain measurement skips gain consistently across the group. The summary reports completed/failed
+recordings, and **Ready to retry** items can be retried explicitly.
+
+An accepted album group finishes on the server, including final tags, even if the page refreshes.
+Use **Pick up where you left off** to observe it again. Keep the page open to start additional
+unsubmitted groups; refresh never submits those automatically. If acceptance is uncertain, further
+dispatch stops until the server status is checked. Browser editing state and jobs still depend on
+the running server session; server restart recovery is not implemented.
 
 ---
 

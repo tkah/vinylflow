@@ -76,7 +76,7 @@ class SessionStore:
         reaped: list[str] = []
         with self._lock:
             for sid, session in list(self._sessions.items()):
-                if session.state == SessionState.PROCESSING:
+                if session.state == SessionState.PROCESSING or session.export_reserved:
                     continue
                 if session.updated_at < cutoff:
                     del self._sessions[sid]
