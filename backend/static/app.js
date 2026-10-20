@@ -25,6 +25,9 @@ const REGION_TITLE_MAX = 28;
 const WORKSPACE_STORAGE_KEY = 'vinylflow.workspaces.v1';
 const WORKSPACE_VERSION = 1;
 const WORKSPACE_SAVE_DELAY_MS = 400;
+const PROCESS_POLL_INTERVAL_MS = 1500;
+// Additional workspace fields are optional when reading saves made before Plan 05.
+const WORKSPACE_ADDITIONS = { searchResults: [], onlyWithLengths: false, detailsSettled: false, currentZoom: 50 };
 const REGION_EDGE_HIT_PX = 6;
 const REGION_SHARED_EDGE_PX = 1;
 const WORKSPACE_FIELDS = [
@@ -32,7 +35,7 @@ const WORKSPACE_FIELDS = [
     'sidesMatchedByDuration', 'sidesSuggestionReason', 'customMapping', 'trackMappingReversed',
     'expectedBoundaries', 'boundariesEdited', 'searchQuery', 'expectedTracks',
     'outputFormat', 'rumbleFilter', 'declick', 'humFilter', 'humFreq',
-    'hissReduction', 'hissStrength', 'albumGain', 'playTime'
+    'hissReduction', 'hissStrength', 'albumGain', 'playTime', ...Object.keys(WORKSPACE_ADDITIONS)
 ];
 
 // ---- Click detection helpers (pure; exposed on the app object for tests) ----
@@ -167,7 +170,6 @@ function vinylApp() {
         suggestedSides: [],       // Sides auto-picked when the release was selected
         sidesMatchedByDuration: false,
         sidesSuggestionReason: '',   // 'length' | 'default' | 'single' | '' (how suggestedSides was chosen)
-        releaseChoices: {},          // fileId -> { release, sides } chosen for that queue file
         // Borrow track lengths from another pressing (state for the selected release only)
         donors: { releaseId: null, status: 'idle', checked: 0, budget: 12, list: [], error: '' },
         _donorSeq: 0,             // Guards against stale length-donor responses
@@ -188,6 +190,14 @@ function vinylApp() {
         processPollTimer: null,
         _processPollToken: 0,
         lastProgressAt: null,
+        batchProcessing: false,
+        batchItems: [],
+        batchSummary: null,
+        _activeExportFileId: null,
+        _exportAttempt: 0,
+        _batchFileId: null,
+        _batchResolve: null,
+        _restoreZoom: null,
 
         // Output format
         outputFormat: 'flac',
@@ -425,19 +435,38 @@ function vinylApp() {
             return this.notify(detail ? `${prefix}: ${detail}` : prefix, { type: 'error' });
         },
 
-        /** Save the active editing workspace, excluding transient players, tokens and audio. */
+        /** Read the active editor without cloning large search results on every queue update. */
+        currentWorkspaceState(includePlaybackPosition = true) {
+            const state = {};
+            // Queue/readiness effects must not subscribe to the per-frame playback clock.
+            for (const field of WORKSPACE_FIELDS) {
+                if (includePlaybackPosition || field !== 'playTime') state[field] = this[field];
+            }
+            state.bitDepth = this.config.bit_depth;
+            state.replaygain = this.config.replaygain;
+            const file = this.uploadedFiles.find(entry => entry.id === this.currentFileId) || this.currentFile;
+            state.completedExportSignature = file?.completedExportSignature || null;
+            state.pendingExportSignature = file?.pendingExportSignature || null;
+            state.pendingExportAccepted = file?.pendingExportAccepted !== false;
+            return state;
+        },
+
+        /** Freeze allowlisted editing state for storage; no player instances or credentials. */
+        captureWorkspace() {
+            return JSON.parse(JSON.stringify(this.currentWorkspaceState()));
+        },
+
+        /** The active editor is authoritative, including changes not yet flushed by autosave. */
+        workspaceFor(fileId) {
+            return fileId === this.currentFileId ? this.currentWorkspaceState(false) : this.workspaces[fileId];
+        },
+
+        /** Save the active editor before switching files or freezing a batch. */
         saveWorkspace() {
             clearTimeout(this._workspaceSaveTimer);
             this._workspaceSaveTimer = null;
-            if (this.currentFileId && this.currentFile && !this.pendingRemovals[this.currentFileId]) {
-                const state = {};
-                for (const field of WORKSPACE_FIELDS) state[field] = this[field];
-                state.bitDepth = this.config.bit_depth;
-                state.replaygain = this.config.replaygain;
-                state.completedExportSignature = this.currentFile.completedExportSignature || null;
-                state.pendingExportSignature = this.currentFile.pendingExportSignature || null;
-                this.workspaces = { ...this.workspaces,
-                    [this.currentFileId]: JSON.parse(JSON.stringify(state)) };
+            if (this.currentFileId && !this.pendingRemovals[this.currentFileId]) {
+                this.workspaces = { ...this.workspaces, [this.currentFileId]: this.captureWorkspace() };
             }
             this.persistWorkspaces();
         },
@@ -474,21 +503,24 @@ function vinylApp() {
                 const liveIds = new Set(this.uploadedFiles.map(file => file.id));
                 const entries = saved?.version === WORKSPACE_VERSION && saved.workspaces
                     ? Object.entries(saved.workspaces) : [];
-                this.workspaces = Object.fromEntries(entries.filter(([id, state]) =>
-                    liveIds.has(id) && this.validWorkspace(state)));
+                this.workspaces = Object.fromEntries(entries
+                    .map(([id, state]) => [id, { ...WORKSPACE_ADDITIONS, ...state }])
+                    .filter(([id, state]) => liveIds.has(id) && this.validWorkspace(state)));
                 for (const file of this.uploadedFiles) {
                     const state = this.workspaces[file.id];
                     if (state) {
                         file.completedExportSignature = state.completedExportSignature;
                         file.pendingExportSignature = state.pendingExportSignature;
+                        file.pendingExportAccepted = state.pendingExportAccepted !== false;
                         // Export may have finished while the browser was refreshing/disconnected.
-                        if (file.status === 'completed' && file.pendingExportSignature) {
+                        if (file.status === 'completed' && file.pendingExportSignature && state.pendingExportAccepted !== false) {
                             state.completedExportSignature = file.completedExportSignature = file.pendingExportSignature;
                             state.pendingExportSignature = null;
                             delete file.pendingExportSignature;
-                        }
-                        if (state.selectedRelease) {
-                            this.releaseChoices[file.id] = { release: state.selectedRelease, sides: state.selectedSides };
+                        } else if (file.status !== 'processing' && state.pendingExportAccepted === false) {
+                            // A lost POST response is not evidence that newly edited inputs were exported.
+                            state.pendingExportSignature = null;
+                            delete file.pendingExportSignature;
                         }
                     }
                 }
@@ -525,19 +557,19 @@ function vinylApp() {
             this.config.bit_depth = state.bitDepth;
             this.config.replaygain = state.replaygain;
             this.trackCountMismatch = !!this.selectedRelease && this.activeTrackCount !== this.targetTracks.length;
-            this.rememberChoice();
+            this._restoreZoom = this.currentZoom;
             if (this.detectedTracks.length) this.$nextTick(() => this.initWaveform());
             return true;
         },
 
-        /** Exact inputs that determine whether the current edit matches a successful export. */
-        exportSignature() {
+        /** Exact export inputs; shared by active and background workspaces. */
+        exportSignature(state = this.currentWorkspaceState(false)) {
             return JSON.stringify({
-                tracks: this.detectedTracks.map(track => [track.number, track.start, track.end, !!track.ignored, track.declick || null]),
-                release: this.selectedRelease, mapping: this.customMapping, reversed: this.trackMappingReversed,
-                format: this.outputFormat, rumble: this.rumbleFilter, declick: this.declick,
-                hum: this.humFilter, frequency: this.humFreq, hiss: this.hissReduction,
-                gain: this.albumGain, replaygain: this.config.replaygain, depth: this.config.bit_depth,
+                tracks: state.detectedTracks.map(track => [track.number, track.start, track.end, !!track.ignored, track.declick || null]),
+                release: state.selectedRelease, mapping: state.customMapping, reversed: state.trackMappingReversed,
+                format: state.outputFormat, rumble: state.rumbleFilter, declick: state.declick,
+                hum: state.humFilter, frequency: state.humFreq, hiss: state.hissReduction,
+                gain: state.albumGain, replaygain: state.replaygain, depth: state.bitDepth,
                 outputDir: this.config.output_dir
             });
         },
@@ -547,29 +579,161 @@ function vinylApp() {
                 this.currentFile.completedExportSignature === this.exportSignature();
         },
 
-        /** Record completion by file id, even if the user is viewing another recording. */
+        /** Validate one source's active ranges and mappings without changing the editor. */
+        exportProblem(file, state) {
+            if (!state?.selectedRelease?.id || !Array.isArray(state.selectedRelease.tracks)) return 'Choose a release.';
+            const active = state.detectedTracks?.filter(track => !track.ignored) || [];
+            if (!active.length) return 'Select at least one track.';
+            let previousEnd = 0;
+            const positions = new Set();
+            const trackNumbers = new Set();
+            for (const track of active) {
+                if (!Number.isInteger(track.number) || track.number < 1 || trackNumbers.has(track.number)) return 'Track numbers must be unique positive integers.';
+                trackNumbers.add(track.number);
+                if (!Number.isFinite(track.start) || !Number.isFinite(track.end) || track.start < previousEnd ||
+                    track.end <= track.start || !(file.duration > 0) || track.end > file.duration) return 'Check the track boundaries.';
+                previousEnd = track.end;
+                const rawIndex = state.customMapping?.[state.detectedTracks.indexOf(track)];
+                const index = typeof rawIndex === 'number' || (typeof rawIndex === 'string' && /^\d+$/.test(rawIndex)) ? Number(rawIndex) : -1;
+                const mapped = Number.isInteger(index) && index >= 0 ? state.selectedRelease.tracks[index] : null;
+                if (!mapped?.position?.trim()) return 'Map every active track to a release position.';
+                if (positions.has(mapped.position)) return `Position ${mapped.position} is mapped more than once.`;
+                positions.add(mapped.position);
+            }
+            return '';
+        },
+
+        /** Eligibility before checking another ready recording's claimed output positions. */
+        baseReadiness(fileId) {
+            const file = this.uploadedFiles.find(entry => entry.id === fileId);
+            if (!file || this.pendingRemovals[fileId]) return { ready: false, reason: 'Recording removed.' };
+            if (['processing', 'queued', 'uncertain'].includes(file.status)) return { ready: false, reason: file.error || 'Export in progress.' };
+            const state = this.workspaceFor(fileId);
+            const reason = this.exportProblem(file, state);
+            if (reason) return { ready: false, reason };
+            if (file.status === 'completed' && file.completedExportSignature === this.exportSignature(state)) {
+                return { ready: false, completed: true, reason: '' };
+            }
+            return { ready: true, reason: '' };
+        },
+
+        /** Detect duplicate positions before two recordings can overwrite the same release's tracks. */
+        fileReadiness(fileId) {
+            const readiness = this.baseReadiness(fileId);
+            if (!readiness.ready) return readiness;
+            const state = this.workspaceFor(fileId);
+            const request = this.buildExportRequest(fileId, state);
+            const positions = new Set(request.track_mapping.map(mapping => mapping.discogs));
+            for (const other of this.uploadedFiles) {
+                if (other.id === fileId || !this.baseReadiness(other.id).ready) continue;
+                const otherState = this.workspaceFor(other.id);
+                if (otherState.selectedRelease.id !== state.selectedRelease.id || otherState.outputFormat !== state.outputFormat) continue;
+                const collision = this.buildExportRequest(other.id, otherState).track_mapping.find(mapping => positions.has(mapping.discogs));
+                if (collision) return { ready: false, reason: `Position ${collision.discogs} is also mapped by ${other.filename}.` };
+            }
+            return readiness;
+        },
+
+        get readyFiles() {
+            return this.uploadedFiles.filter(file => this.fileReadiness(file.id).ready);
+        },
+
+        get exportBusy() {
+            return this.batchProcessing || this.isProcessing || this.uploadedFiles.some(file => ['processing', 'uncertain'].includes(file.status));
+        },
+
+        queueLabel(file) {
+            if (file.status === 'processing') return 'Processing';
+            if (file.status === 'queued') return 'Queued';
+            if (file.status === 'uncertain') return 'Status unknown';
+            const readiness = this.fileReadiness(file.id);
+            if (readiness.completed) return 'Complete';
+            return readiness.ready ? (file.error ? 'Ready to retry' : 'Ready') : 'Needs attention';
+        },
+
+        queueReason(file) {
+            return file.error || this.fileReadiness(file.id).reason;
+        },
+
+        /** One payload builder for single and batch export; ignored tracks never consume mappings. */
+        buildExportRequest(fileId, state = this.workspaceFor(fileId)) {
+            const active = state.detectedTracks.filter(track => !track.ignored);
+            return {
+                file_id: fileId, release_id: state.selectedRelease.id,
+                track_mapping: active.map(track => ({ detected: track.number,
+                    discogs: state.selectedRelease.tracks[Number(state.customMapping[state.detectedTracks.indexOf(track)])].position })),
+                reversed: state.trackMappingReversed,
+                track_boundaries: active.map(track => ({ number: track.number, start: track.start, end: track.end,
+                    duration: track.end - track.start, declick: track.declick || undefined })),
+                output_format: state.outputFormat, rumble_filter: state.rumbleFilter, declick: state.declick,
+                hum_filter: state.humFilter, hum_freq: state.humFreq, hiss_reduction: state.hissReduction,
+                album_gain: state.albumGain, replaygain: state.replaygain !== false, bit_depth: state.bitDepth
+            };
+        },
+
+        /** Update the matching queue entry, regardless of which recording is in the editor. */
+        exportProgress(fileId, progress, message) {
+            const file = this.uploadedFiles.find(entry => entry.id === fileId);
+            if (!file) return;
+            file.progress = Math.max(file.progress || 0, Math.max(0, Math.min(1, progress || 0)));
+            file.processingMessage = message || 'Processing…';
+            if (fileId === this.currentFileId) {
+                this.processingProgress = file.progress;
+                this.processingMessage = file.processingMessage;
+            }
+            this.lastProgressAt = Date.now();
+        },
+
+        /** A terminal event settles only the active file, and only once. */
+        settleExport(fileId, result) {
+            if (this._activeExportFileId === fileId) {
+                this.stopProcessPolling();
+                this._activeExportFileId = null;
+                this.isProcessing = false;
+            }
+            if (this._batchFileId === fileId && this._batchResolve) {
+                const resolve = this._batchResolve;
+                this._batchResolve = null;
+                resolve(result);
+            }
+        },
+
+        /** Record completion for the exported snapshot, not edits made while a batch was running. */
         completeExport(fileId, tracks = []) {
             const file = this.uploadedFiles.find(entry => entry.id === fileId);
             if (!file) return;
-            file.status = 'completed';
+            file.status = 'completed'; file.progress = 1; file.processingMessage = 'Complete!';
+            file.error = '';
             file.completedExportSignature = file.pendingExportSignature || file.completedExportSignature;
             delete file.pendingExportSignature;
+            delete file.pendingExportAccepted;
             const state = this.workspaces[fileId];
             if (state) {
                 state.completedExportSignature = file.completedExportSignature;
                 state.pendingExportSignature = null;
             }
             if (fileId === this.currentFileId) {
-                this.stopProcessPolling();
-                this.isProcessing = false;
                 this.processingProgress = 1;
                 this.processingMessage = 'Complete!';
-                this.successMessage = tracks.length
-                    ? `✅ ${tracks.length} tracks saved.\n\nTracks: ${tracks.join(', ')}`
-                    : '✅ Processing complete. Files saved.';
+                this.successMessage = tracks.length ? `✅ ${tracks.length} tracks saved.\n\nTracks: ${tracks.join(', ')}` : '✅ Processing complete. Files saved.';
                 this.saveWorkspace();
             } else this.persistWorkspaces();
+            this.settleExport(fileId, { status: 'complete' });
             this.loadImportList();
+        },
+
+        /** A confirmed failure leaves the recording and error available for an explicit retry. */
+        failExport(fileId, message) {
+            const file = this.uploadedFiles.find(entry => entry.id === fileId);
+            if (!file) return;
+            file.status = 'error'; file.error = message; file.processingMessage = message;
+            delete file.pendingExportSignature;
+            delete file.pendingExportAccepted;
+            if (this.workspaces[fileId]) this.workspaces[fileId].pendingExportSignature = null;
+            if (fileId === this.currentFileId) this.processingMessage = `Error: ${message}`;
+            if (!this.batchProcessing) this.notify(`Processing error: ${message}`, { type: 'error' });
+            this.persistWorkspaces();
+            this.settleExport(fileId, { status: 'error', error: message });
         },
 
         /**
@@ -652,11 +816,7 @@ function vinylApp() {
                     break;
 
                 case 'progress':
-                    if (data.file_id === this.currentFileId) {
-                        this.processingProgress = data.progress;
-                        this.processingMessage = data.message;
-                        this.lastProgressAt = Date.now();
-                    }
+                    if (data.file_id === this._activeExportFileId) this.exportProgress(data.file_id, data.progress, data.message);
                     break;
 
                 case 'scan_complete':
@@ -680,16 +840,10 @@ function vinylApp() {
                     break;
 
                 case 'error':
-                    if (data.file_id === this.currentFileId) {
-                        this.stopProcessPolling();
-                        this.isProcessing = false;
-                        this.processingMessage = `Error: ${data.message}`;
-                        this.notify(`Processing error: ${data.message}`, { type: 'error' });
-
-                        const file = this.uploadedFiles.find(f => f.id === data.file_id);
-                        if (file) {
-                            file.status = 'error';
-                        }
+                    if (data.file_id === this._activeExportFileId && data.recoverable !== true) {
+                        this.failExport(data.file_id, data.message);
+                    } else if (data.file_id === this.currentFileId) {
+                        this.notify(data.message, { type: 'error' });
                     }
                     break;
             }
@@ -773,6 +927,7 @@ function vinylApp() {
          * Save configuration to API
          */
         async saveConfig() {
+            if (this.exportBusy) return;
             try {
                 const response = await fetch('/api/config', {
                     method: 'PUT',
@@ -1300,7 +1455,7 @@ function vinylApp() {
          * Select a file from the queue
          */
         selectFile(fileId) {
-            if (fileId === this.currentFileId || this.analyzing || this.isProcessing ||
+            if (fileId === this.currentFileId || this.analyzing || this.isProcessing || this.batchProcessing ||
                 !this.uploadedFiles.some(file => file.id === fileId)) return;
             this.saveWorkspace();
             this.abReset();
@@ -1362,11 +1517,10 @@ function vinylApp() {
             if (index === -1 || this.pendingRemovals[fileId]) return;
 
             const file = this.uploadedFiles[index];
-            if (file.status === 'processing' || (fileId === this.currentFileId && this.analyzing)) return;
+            if (this.batchProcessing || ['processing', 'uncertain'].includes(file.status) || (fileId === this.currentFileId && this.analyzing)) return;
             this.saveWorkspace();
             const entry = {
                 file, index,
-                choice: this.releaseChoices[fileId] || null,
                 wasCurrent: this.currentFileId === fileId,
                 committed: false,
                 toastId: null
@@ -1374,7 +1528,6 @@ function vinylApp() {
             this.pendingRemovals = { ...this.pendingRemovals, [fileId]: entry };
 
             this.uploadedFiles = this.uploadedFiles.filter(f => f.id !== fileId);
-            this.forgetChoice(fileId);
             if (entry.wasCurrent) {
                 this.pauseWaveform();
                 this.destroyWaveform();
@@ -1406,9 +1559,6 @@ function vinylApp() {
             const files = [...this.uploadedFiles];
             files.splice(Math.min(entry.index, files.length), 0, entry.file);
             this.uploadedFiles = files;
-            if (entry.choice) {
-                this.releaseChoices = { ...this.releaseChoices, [fileId]: entry.choice };
-            }
             if (entry.wasCurrent && !this.currentFileId) {
                 this.selectFile(fileId);
             }
@@ -1469,7 +1619,7 @@ function vinylApp() {
          * Analyze file for silence detection
          */
         async analyzeFile() {
-            if (!this.currentFileId || this.analyzing) return;
+            if (!this.currentFileId || this.analyzing || this.exportBusy) return;
 
             this.analyzing = true;
             this.rescanNotice = '';
@@ -1516,14 +1666,13 @@ function vinylApp() {
          * toast restores the previous boundaries, release and mapping.
          */
         async reanalyzeFile() {
-            if (!this.currentFileId || this.analyzing) return;
+            if (!this.currentFileId || this.analyzing || this.exportBusy) return;
 
             const fileId = this.currentFileId;
             const snapshot = this.snapshotEdits();
             snapshot.selectedRelease = this.selectedRelease;
             snapshot.selectedSides = [...this.selectedSides];
             snapshot.suggestedSides = [...this.suggestedSides];
-            snapshot.choice = this.releaseChoices[fileId] || null;
             snapshot.status = this.currentFile?.status;
 
             this.detectedTracks = [];
@@ -1560,9 +1709,6 @@ function vinylApp() {
             this.resetDonors();
             this.selectedSides = snap.selectedSides;
             this.suggestedSides = snap.suggestedSides;
-            if (snap.choice) {
-                this.releaseChoices = { ...this.releaseChoices, [fileId]: snap.choice };
-            }
             this.trackCountMismatch = !!this.selectedRelease &&
                 this.activeTrackCount !== this.targetTracks.length;
             if (this.currentFile && snap.status) this.currentFile.status = snap.status;
@@ -1612,7 +1758,7 @@ function vinylApp() {
          */
         async smartRescan(target) {
             target = parseInt(target, 10);
-            if (!this.currentFileId || this.analyzing) return;
+            if (!this.currentFileId || this.analyzing || this.exportBusy) return;
             if (!target || target < 1 || target > 99) {
                 this.rescanNotice = 'Enter how many songs the recording contains (1–99) first.';
                 return;
@@ -1782,7 +1928,7 @@ function vinylApp() {
          * Card click: make sure the tracklist is loaded, then select.
          */
         async chooseResult(result) {
-            if (this.analyzing || result.opening) return;
+            if (this.analyzing || this.exportBusy || result.opening) return;
             if (result.tracks) {
                 this.selectRelease(result);
                 return;
@@ -2093,25 +2239,19 @@ function vinylApp() {
             return out;
         },
 
-        /**
-         * Remember which release/sides the current file uses
-         */
-        rememberChoice() {
-            if (!this.currentFileId || !this.selectedRelease) return;
-            this.releaseChoices = {
-                ...this.releaseChoices,
-                [this.currentFileId]: { release: this.selectedRelease, sides: [...this.selectedSides] }
-            };
+        /** Derived view for release shortcuts; the workspace remains the only stored state. */
+        get releaseChoices() {
+            const choices = {};
+            for (const file of this.uploadedFiles) {
+                const state = this.workspaceFor(file.id);
+                if (state?.selectedRelease) choices[file.id] = { release: state.selectedRelease, sides: state.selectedSides };
+            }
+            return choices;
         },
 
-        /**
-         * Drop a file's remembered release choice (file removed / release changed)
-         */
-        forgetChoice(fileId) {
-            if (!(fileId in this.releaseChoices)) return;
-            const next = { ...this.releaseChoices };
-            delete next[fileId];
-            this.releaseChoices = next;
+        /** Persist the chosen release/sides as part of the complete editing workspace. */
+        rememberChoice() {
+            this.saveWorkspace();
         },
 
         /**
@@ -2175,7 +2315,7 @@ function vinylApp() {
          * Apply a scope preset and re-run detection
          */
         applyPreset(sides) {
-            if (this.analyzing) return;
+            if (this.analyzing || this.exportBusy) return;
             this.selectedSides = this.sideChips.map(g => g.side).filter(k => sides.includes(k));
             this.rememberChoice();
             this.resetMappingToTargets();
@@ -2272,7 +2412,7 @@ function vinylApp() {
          * Snap boundaries to the Discogs lengths (undoable)
          */
         async snapToDiscogs() {
-            if (this.analyzing || !this.selectedRelease || this.targetTracks.length < 1) return;
+            if (this.analyzing || this.exportBusy || !this.selectedRelease || this.targetTracks.length < 1) return;
 
             const snapshot = {
                 tracks: JSON.parse(JSON.stringify(this.detectedTracks)),
@@ -2328,7 +2468,7 @@ function vinylApp() {
          * recording covers and (re)run detection for that many tracks.
          */
         selectRelease(release) {
-            if (this.analyzing) return;
+            if (this.analyzing || this.exportBusy) return;
 
             this.selectedRelease = release;
             this.resetDonors();
@@ -2352,7 +2492,7 @@ function vinylApp() {
          * and re-run detection for the new track count.
          */
         toggleSide(side) {
-            if (this.analyzing) return;
+            if (this.analyzing || this.exportBusy) return;
 
             const isSelected = this.selectedSides.includes(side);
             if (isSelected && this.selectedSides.length === 1) return;
@@ -2374,7 +2514,7 @@ function vinylApp() {
         async redetectForTargets() {
             const targets = this.targetTracks;
             const count = targets.length;
-            if (count < 1 || !this.currentFileId || this.analyzing) return false;
+            if (count < 1 || !this.currentFileId || this.analyzing || this.exportBusy) return false;
 
             let succeeded = false;
             this.analyzing = true;
@@ -2542,7 +2682,7 @@ function vinylApp() {
         /**
          * Copy a donor's lengths onto the selected release's tracks (missing
          * lengths only), mark the release as borrowed, re-detect, offer Undo.
-         * The release object is mutated in place: releaseChoices and the
+         * The release object is mutated in place: saved workspaces and the
          * same-release shortcut share it, so other files see the lengths too.
          */
         applyDonor(donor) {
@@ -2591,7 +2731,7 @@ function vinylApp() {
          * detection/waveform so another release can be picked.
          */
         changeRelease() {
-            this.forgetChoice(this.currentFileId);
+            if (this.exportBusy) return;
             this.selectedRelease = null;
             this.resetDonors();
             this.selectedSides = [];
@@ -2894,7 +3034,8 @@ function vinylApp() {
                     const containerWidth = container ? container.offsetWidth : 1000;
 
                     const calculatedZoom = containerWidth / duration;
-                    this.currentZoom = Math.max(1, Math.min(calculatedZoom, 200));
+                    this.currentZoom = this._restoreZoom || Math.max(1, Math.min(calculatedZoom, 200));
+                    this._restoreZoom = null;
                     this.waveform.zoom(this.currentZoom);
 
                     const openWaveformContextMenu = (e) => {
@@ -4120,140 +4261,142 @@ function vinylApp() {
             this.playerNotice = '';
             this.playerBuffering = false;
             this._pendingSeek = null;
+            this._restoreZoom = null;
             this._auditionStop = null;
         },
 
-        /**
-         * Process file with selected release
-         */
+        /** Validate and export just the recording currently in the editor. */
         async processFile() {
-            if (!this.currentFileId || !this.selectedRelease || this.isProcessing || this.processingComplete) return;
-
-            const activeTracks = this.detectedTracks.filter(t => !t.ignored);
-
-            if (activeTracks.length === 0) {
-                this.notify('No tracks selected for processing. Un-ignore at least one track.', { type: 'warning', timeout: 6000 });
+            if (!this.currentFileId || this.exportBusy || this.analyzing) return;
+            const readiness = this.fileReadiness(this.currentFileId);
+            if (!readiness.ready) {
+                if (!readiness.completed) this.notify(readiness.reason, { type: 'warning', timeout: 6000 });
                 return;
             }
+            this.saveWorkspace();
+            await this.submitExport(this.currentFileId, this.buildExportRequest(this.currentFileId), this.exportSignature());
+        },
 
-            const trackMapping = activeTracks.map((track, idx) => {
-                const originalIdx = this.detectedTracks.indexOf(track);
-                const discogsIdx = this.customMapping[originalIdx];
-                const discogsTrack = this.selectedRelease.tracks[discogsIdx];
-                return {
-                    detected: track.number,
-                    discogs: discogsTrack?.position || 'Unknown'
-                };
-            });
-
-            const trackBoundaries = activeTracks.map(track => ({
-                number: track.number,
-                start: track.start,
-                end: track.end,
-                duration: track.duration,
-                // per-track click-removal override; omitted = the panel setting
-                declick: track.declick || undefined
-            }));
-
+        /** Freeze the ready set, then wait for each terminal result before submitting the next. */
+        async processAllReady() {
+            if (this.exportBusy || this.analyzing) return;
+            this.batchProcessing = true;
+            this.batchSummary = null;
+            const results = [];
+            let items = [];
             try {
-                this.currentFile.pendingExportSignature = this.exportSignature();
-                this.successMessage = '';
+                await this.commitAllRemovals();
                 this.saveWorkspace();
-                this.isProcessing = true;
-                this.processingProgress = 0.1;
-                this.processingMessage = 'Starting...';
-                this.lastProgressAt = Date.now();
-
-                const response = await fetch('/api/process', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        file_id: this.currentFileId,
-                        release_id: this.selectedRelease.id,
-                        track_mapping: trackMapping,
-                        reversed: this.trackMappingReversed,
-                        track_boundaries: trackBoundaries,
-                        output_format: this.outputFormat,
-                        rumble_filter: this.rumbleFilter,
-                        declick: this.declick,
-                        hum_filter: this.humFilter,
-                        hum_freq: this.humFreq,
-                        hiss_reduction: this.hissReduction,
-                        album_gain: this.albumGain,
-                        replaygain: this.config.replaygain !== false,
-                        bit_depth: this.config.bit_depth
-                    })
-                });
-
-                const data = await response.json();
-                if (!response.ok || !data.job_id) {
-                    throw new Error(data.detail || 'Failed to start processing');
+                items = this.readyFiles.map(file => ({ fileId: file.id, filename: file.filename,
+                    previousStatus: file.status, signature: this.exportSignature(this.workspaceFor(file.id)),
+                    request: this.buildExportRequest(file.id) }));
+                // No object in the dispatch list may share mutable arrays with an editor workspace.
+                items = JSON.parse(JSON.stringify(items));
+                this.batchItems = items;
+                for (const item of items) this.uploadedFiles.find(file => file.id === item.fileId).status = 'queued';
+                for (const item of items) {
+                    this._batchFileId = item.fileId;
+                    const terminal = new Promise(resolve => { this._batchResolve = resolve; });
+                    await this.submitExport(item.fileId, item.request, item.signature);
+                    const result = await terminal;
+                    results.push({ fileId: item.fileId, filename: item.filename, ...result });
+                    if (result.status === 'uncertain') break;
                 }
-                console.log('Processing started:', data);
-                // A fast job can finish over WebSocket before this POST response arrives.
-                if (this.isProcessing) {
-                    this.startProcessPolling(data.job_id);
-                    const file = this.uploadedFiles.find(f => f.id === this.currentFileId);
-                    if (file) file.status = 'processing';
+            } finally {
+                for (const item of items) {
+                    const file = this.uploadedFiles.find(entry => entry.id === item.fileId);
+                    if (file?.status === 'queued') file.status = item.previousStatus;
                 }
-            } catch (error) {
-                console.error('Processing failed:', error);
-                this.stopProcessPolling();
-                this.isProcessing = false;
-                this.processingProgress = 0;
-                this.processingMessage = '';
-                this.notifyError('Processing failed', error);
+                this._batchFileId = null; this._batchResolve = null;
+                this.batchProcessing = false;
+                this.batchSummary = { results, completed: results.filter(result => result.status === 'complete').length,
+                    failed: results.filter(result => result.status === 'error').length,
+                    uncertain: results.filter(result => result.status === 'uncertain').length,
+                    notStarted: items.length - results.length };
             }
         },
 
-        startProcessPolling(jobId) {
-            this.stopProcessPolling();
-            this.currentJobId = jobId;
-            const token = this._processPollToken;
-
-            this.processPollTimer = setInterval(async () => {
-                if (!this.isProcessing || !jobId) {
-                    this.stopProcessPolling();
+        /** Submit one immutable request; a fast terminal event may precede its HTTP response. */
+        async submitExport(fileId, request, signature) {
+            const file = this.uploadedFiles.find(entry => entry.id === fileId);
+            const attempt = ++this._exportAttempt;
+            this._activeExportFileId = fileId;
+            file.pendingExportSignature = signature;
+            file.pendingExportAccepted = false;
+            file.status = 'processing'; file.progress = 0; file.error = '';
+            this.isProcessing = true;
+            this.successMessage = '';
+            this.exportProgress(fileId, 0.1, 'Starting…');
+            if (fileId === this.currentFileId) this.saveWorkspace();
+            else if (this.workspaces[fileId]) {
+                this.workspaces[fileId].pendingExportSignature = signature;
+                this.workspaces[fileId].pendingExportAccepted = false;
+                this.persistWorkspaces();
+            }
+            try {
+                const response = await fetch('/api/process', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request)
+                });
+                if (!response.ok) {
+                    const data = await response.json().catch(() => ({}));
+                    if (this._activeExportFileId === fileId && attempt === this._exportAttempt) {
+                        this.failExport(fileId, data.detail || `Export rejected (HTTP ${response.status}).`);
+                    }
                     return;
                 }
+                const data = await response.json();
+                if (!data.job_id) throw new Error('The server did not return an export status.');
+                if (this._activeExportFileId === fileId && attempt === this._exportAttempt) {
+                    file.pendingExportAccepted = true;
+                    if (fileId === this.currentFileId) this.saveWorkspace();
+                    else {
+                        this.workspaces[fileId].pendingExportAccepted = true;
+                        this.persistWorkspaces();
+                    }
+                    this.startProcessPolling(data.job_id, fileId);
+                }
+            } catch (error) {
+                if (this._activeExportFileId !== fileId || attempt !== this._exportAttempt) return;
+                // The request may already be running. Never dispatch another export on a guess.
+                file.status = 'uncertain';
+                file.error = 'Export status unknown. Reload to check the server before continuing.';
+                file.processingMessage = file.error;
+                if (fileId === this.currentFileId) this.processingMessage = file.error;
+                if (this._batchResolve && this._batchFileId === fileId) {
+                    const resolve = this._batchResolve;
+                    this._batchResolve = null;
+                    resolve({ status: 'uncertain', error: file.error });
+                } else this.notify(file.error, { type: 'error' });
+            }
+        },
 
+        /** Polling is the fallback for missed WebSocket events, scoped to the current attempt. */
+        startProcessPolling(jobId, fileId = this._activeExportFileId || this.currentFileId) {
+            this.stopProcessPolling();
+            this.currentJobId = jobId;
+            this._activeExportFileId = fileId;
+            const token = this._processPollToken;
+            let inFlight = false;
+            this.processPollTimer = setInterval(async () => {
+                if (!this.isProcessing || token !== this._processPollToken || inFlight) return;
+                inFlight = true;
                 try {
                     const response = await fetch(`/api/process/${jobId}`);
-                    if (!response.ok) {
-                        return;
-                    }
-
-                    const job = await response.json();
-                    // An in-flight poll from a stopped run must not finish a later run of this file.
                     if (token !== this._processPollToken) return;
-
-                    if (job.status === 'processing') {
-                        this.processingProgress = Math.max(this.processingProgress, job.progress || 0.1);
-                        this.processingMessage = job.message || 'Processing...';
+                    if (response.status === 404) {
+                        this.failExport(fileId, 'The recording session is no longer available.');
                         return;
                     }
-
-                    if (job.status === 'complete') {
-                        this.completeExport(job.file_id, Array.isArray(job.tracks) ? job.tracks : []);
-                        return;
-                    }
-
-                    if (job.status === 'error') {
-                        this.stopProcessPolling();
-                        this.isProcessing = false;
-                        this.processingMessage = `Error: ${job.error || 'Unknown error'}`;
-
-                        const file = this.uploadedFiles.find(f => f.id === job.file_id);
-                        if (file) {
-                            file.status = 'error';
-                        }
-
-                        this.notify(`Processing error: ${job.error || 'Unknown error'}`, { type: 'error' });
-                    }
+                    if (!response.ok) return;
+                    const job = await response.json();
+                    if (token !== this._processPollToken || job.file_id !== fileId) return;
+                    if (job.status === 'processing') this.exportProgress(fileId, job.progress || 0.1, job.message);
+                    if (job.status === 'complete') this.completeExport(fileId, job.tracks || []);
+                    if (job.status === 'error') this.failExport(fileId, job.error || 'Unknown export error');
                 } catch (error) {
-                    console.warn('Process polling failed:', error);
-                }
-            }, 1500);
+                    console.warn('Waiting for export status:', error);
+                } finally { inFlight = false; }
+            }, PROCESS_POLL_INTERVAL_MS);
         },
 
         stopProcessPolling() {
@@ -4269,6 +4412,7 @@ function vinylApp() {
          * Reset UI for next file
          */
         resetForNextFile() {
+            if (this.exportBusy) return;
             this.saveWorkspace();
             this.currentFileId = null;
             this.currentFile = null;

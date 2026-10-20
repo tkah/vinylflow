@@ -27,7 +27,7 @@ const trk = (n, s, e, extra = {}) => ({ number: n, start: s, end: e, duration: e
 function mk() {
   const a = vinylApp();
   a.notify = () => {}; a.notifyError = () => {}; a.saveExportDefault = () => {};
-  a.currentFileId = 'f1'; a.currentFile = {};
+  a.currentFileId = 'f1'; a.uploadedFiles = [{ id: 'f1', filename: 'record.wav', duration: 300 }]; a.currentFile = a.uploadedFiles[0];
   a.detectedTracks = [trk(1, 0, 100), trk(2, 100, 200), trk(3, 200, 300)];
   return a;
 }

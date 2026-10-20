@@ -99,8 +99,10 @@ const mk=()=>{ const a=vinylApp(); a.notify=()=>{}; a.currentFileId='f'; a.curre
   }
   // ---- process request carries the new fields ----
   { const a=mk(); a.rumbleFilter=true; a.declick='strong';
-    const m=/body: JSON\.stringify\(\{\s*file_id: this\.currentFileId,\s*release_id[\s\S]*?\}\)/.exec(src);
-    assert.ok(m && /rumble_filter: this\.rumbleFilter/.test(m[0]) && /declick: this\.declick/.test(m[0]) && !/restoration_level/.test(m[0]));
+    a.selectedRelease={id:5,tracks:[{position:'A1'}]}; a.customMapping=[0];
+    const request=a.buildExportRequest(a.currentFileId);
+    assert.strictEqual(request.rumble_filter,true); assert.strictEqual(request.declick,'strong');
+    assert.ok(!('restoration_level' in request));
   }
   // ---- markup ----
   { assert.ok(html.includes('Audio processing')); assert.ok(html.includes('Removes inaudible turntable rumble below 15 Hz.'));

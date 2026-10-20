@@ -47,7 +47,7 @@ function mkApp() {
     // ---- undo restores position and never calls DELETE ----
     deletes.length = 0;
     a = mkApp();
-    a.releaseChoices = { f1: { release: { id: 9 }, sides: ['A'] } };
+    a.workspaces = { f1: { selectedRelease: { id: 9 }, selectedSides: ['A'] } };
     a.removeFile('f1', 40);
     assert.ok(!('f1' in a.releaseChoices));
     a.runToastAction(a.toasts[0].id);

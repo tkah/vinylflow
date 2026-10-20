@@ -202,8 +202,13 @@ const mk=()=>{ const a=vinylApp(); a.notify=()=>{}; a.currentFileId='f'; a.curre
     assert.ok(srv.gets.includes('/api/hum/h')); console.log=log;
   }
   // ---- process request carries the new fields ----
-  { const m=/body: JSON\.stringify\(\{\s*file_id: this\.currentFileId,\s*release_id[\s\S]*?\}\)/.exec(src);
-    assert.ok(m && /hum_filter: this\.humFilter/.test(m[0]) && /hum_freq: this\.humFreq/.test(m[0]) && /hiss_reduction: this\.hissReduction/.test(m[0]));
+  { const a=vinylApp(); a.currentFileId='f';
+    a.selectedRelease={id:5,tracks:[{position:'A1'}]}; a.customMapping=[0];
+    a.detectedTracks=[{number:1,start:0,end:100}];
+    a.humFilter=true; a.humFreq=50; a.hissReduction='medium';
+    const request=a.buildExportRequest('f');
+    assert.strictEqual(request.hum_filter,true); assert.strictEqual(request.hum_freq,50);
+    assert.strictEqual(request.hiss_reduction,'medium');
   }
   // ---- markup ----
   { const panel=html.indexOf('data-testid="audio-panel"'), test=html.indexOf('Test on one track');

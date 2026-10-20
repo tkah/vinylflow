@@ -124,7 +124,7 @@ const click = (a) => a.runToastAction(a.toasts[a.toasts.length - 1].id);
     // ---- identity: marker + lengths travel with the shared release object ----
     a = mk();
     const shared = a.selectedRelease;
-    a.releaseChoices = { f1: { release: shared, sides: ['A'] } };
+    a.workspaces = { f1: { selectedRelease: shared, selectedSides: ['A'] } };
     a.applyDonor(donor());
     a.currentFileId = 'f2';
     a.currentFile = a.uploadedFiles[1];

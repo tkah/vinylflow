@@ -255,6 +255,23 @@ DEFAULT_OUTPUT_DIR=~/Music/VinylFlow
 
 Your files appear in the `output/` folder, organized as `Artist - Album/A1-Track Name.flac`.
 
+### Process several recordings
+
+Prepare each recording's release, cuts, position mapping, and output settings. Switching between
+recordings keeps those edits. The queue shows **Ready** or **Needs attention**, with the reason;
+ignored tracks do not need mappings. Conflicting positions for the same release and output format
+need correcting before export.
+
+Click **Process all ready** to export the prepared recordings one at a time using each recording's
+settings. A failed export stays in the queue with its error while later recordings continue. The
+summary reports completed and failed recordings; **Ready to retry** items can be retried explicitly.
+
+Keep the page open while queued recordings are being started. Refreshing preserves editing state
+and the server can finish its current export, but remaining recordings need another explicit batch
+start after recovery. If the connection drops before export acceptance is known, further dispatch
+stops until the server status can be checked. Album gain and ReplayGain are calculated separately
+for each recording; shared loudness across multiple recordings of a release is a future addition.
+
 ---
 
 ## Output Example
