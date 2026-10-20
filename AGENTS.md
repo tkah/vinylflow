@@ -189,7 +189,7 @@ audio_processor.py  metadata_handler.py  config.py    Discogs API
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/api/upload` | Upload WAV/AIFF, create session UUID, queue MP3 preview |
-| GET | `/api/import` | Import folder listing `{enabled, dir, error, files: [{name, size, mtime, stable, imported_id}]}` (recursive ≤3 levels, hidden/`._*` skipped, ≤500) |
+| GET | `/api/import` | Import folder listing `{enabled, dir, error, files: [{name, size, mtime, stable, imported_id, imported_status}]}` (recursive ≤3 levels, hidden/`._*` skipped, ≤500) |
 | POST | `/api/import` | `{names?, paths?}` -> in-place Sessions (same shape as upload + `in_place`; `skipped` with reasons). `names` must resolve inside the import dir; `paths` only if granted by the desktop file dialog |
 | POST | `/api/analyze` | Silence detection -> track boundaries (from the cached envelope) |
 | POST | `/api/rescan` | Smart Rescan: sweep detection settings to hit an expected track count |
@@ -270,6 +270,8 @@ These rules are **critical** — violating them breaks the bundled app silently.
 - All UI state lives in one Alpine.js `x-data` object (see `app.js`).
 - **WaveSurfer.js** handles waveform rendering with draggable region markers for track boundaries.
 - WebSocket (`/ws`) receives real-time progress updates during processing.
+- **Workspace recovery:** the browser saves per-session editing state under `vinylflow.workspaces.v1` in localStorage. Startup checks `/api/queue` before offering resume; deleted/expired server sessions are dropped. File switches preserve work. Resume restores paused without Discogs search or detection. Audio, source paths, and credentials are never stored; this does not survive a server restart that clears the session store.
+- **Import retries:** every stable folder row remains selectable; the server reuses the existing session. "In queue" and "Complete" are distinct. A completed-export signature drives the Process & Save / Complete button; changing export inputs permits another export.
 
 ### macOS Context Menu Fix (critical)
 WKWebView intercepts right-click before JavaScript sees it. Fix applied in `init()`:

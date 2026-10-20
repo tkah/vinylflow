@@ -48,21 +48,22 @@ function reset(files = []) {
     a = mkApp(); await a.loadImportList();
     assert.strictEqual(a.importInfo.error, 'Import folder is missing');
 
-    // ---- rows: imported / still copying are not selectable ----
+    // ---- requirement change: every stable row is selectable, including imported ones ----
     reset([row('a.wav'), row('b.wav', { imported_id: 'q1' }), row('c.wav', { stable: false })]);
     a = mkApp(); await a.loadImportList();
-    assert.deepStrictEqual(a.importableFiles.map(f => f.name), ['a.wav']);
+    assert.deepStrictEqual(a.importableFiles.map(f => f.name), ['a.wav', 'b.wav']);
     a.onImportRowClick(a.importInfo.files[2]);
     assert.deepStrictEqual(a.importSelected, []);
     a.onImportRowClick(a.importInfo.files[0]);
     assert.deepStrictEqual(a.importSelected, ['a.wav']);
+    a.toggleImportAll(); assert.deepStrictEqual(a.importSelected, ['a.wav', 'b.wav']);
     a.toggleImportAll(); assert.deepStrictEqual(a.importSelected, []);
-    a.toggleImportAll(); assert.deepStrictEqual(a.importSelected, ['a.wav']);
+    a.toggleImportAll(); assert.deepStrictEqual(a.importSelected, ['a.wav', 'b.wav']);
     assert.strictEqual(a.allImportSelected, true);
-    // clicking an imported row selects its queue entry
+    // clicking an imported row toggles its checkbox instead of disabling reimport
     a.uploadedFiles = [{ id: 'q1', filename: 'b.wav' }];
     a.onImportRowClick(a.importInfo.files[1]);
-    assert.strictEqual(a.currentFileId, 'q1');
+    assert.deepStrictEqual(a.importSelected, ['a.wav']);
 
     // ---- import selected: POST body, push, no duplicates, in_place, auto-select, refresh ----
     reset([row('a.wav'), row('d/b.wav')]);

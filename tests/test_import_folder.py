@@ -198,3 +198,22 @@ def test_config_import_dir_read_only(env):
     client.put("/api/config", json={"import_dir": str(root)})
     assert client.get("/api/config").json()["import_dir"] == str(imp)
     assert api.config.import_dir == str(imp)
+
+
+def test_listing_and_reimport_distinguish_queued_from_completed(env):
+    """Reimport remains idempotent and reports export state, not just import state."""
+    from backend.sessions.session import SessionState
+
+    imp, _, _ = env
+    _wav(imp / "again.wav")
+    entry = client.post("/api/import", json={"names": ["again.wav"]}).json()["files"][0]
+    session = session_store.get(entry["id"])
+    for state, expected in ((SessionState.READY, "uploaded"),
+                            (SessionState.FAILED, "error"),
+                            (SessionState.COMPLETE, "completed")):
+        session.state = state
+        row = client.get("/api/import").json()["files"][0]
+        assert row["imported_status"] == expected
+        again = client.post("/api/import", json={"names": ["again.wav"]}).json()["files"][0]
+        assert again["id"] == entry["id"]
+        assert again["status"] == expected

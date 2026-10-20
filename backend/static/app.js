@@ -21,6 +21,19 @@ const MIN_TRACK_LENGTH = 1;
 const EXPECTED_MARKER_COLOR = 'rgba(217, 64, 50, 0.75)';
 // Longest title shown in a waveform region label
 const REGION_TITLE_MAX = 28;
+// Version the allowlisted editing state; no audio, source paths, or credentials are stored.
+const WORKSPACE_STORAGE_KEY = 'vinylflow.workspaces.v1';
+const WORKSPACE_VERSION = 1;
+const WORKSPACE_SAVE_DELAY_MS = 400;
+const REGION_EDGE_HIT_PX = 6;
+const REGION_SHARED_EDGE_PX = 1;
+const WORKSPACE_FIELDS = [
+    'detectedTracks', 'selectedRelease', 'selectedSides', 'suggestedSides',
+    'sidesMatchedByDuration', 'sidesSuggestionReason', 'customMapping', 'trackMappingReversed',
+    'expectedBoundaries', 'boundariesEdited', 'searchQuery', 'expectedTracks',
+    'outputFormat', 'rumbleFilter', 'declick', 'humFilter', 'humFreq',
+    'hissReduction', 'hissStrength', 'albumGain', 'playTime'
+];
 
 // ---- Click detection helpers (pure; exposed on the app object for tests) ----
 
@@ -96,6 +109,10 @@ function vinylApp() {
         uploadedFiles: [],
         currentFileId: null,
         currentFile: null,
+        workspaces: {},
+        workspaceNotice: '',
+        _workspaceSaveTimer: null,
+        _workspacesLoaded: false,
 
         // Analysis
         detectedTracks: [],
@@ -106,6 +123,8 @@ function vinylApp() {
         playDuration: 0,
         playheadIdx: -1,       // index of the track under the playhead (-1 = gap / none)
         playerNotice: '',
+        playerBuffering: false,
+        _pendingSeek: null,
         _auditionStop: null,   // one-shot stop time (s) for cut-point auditions
         _regionDownX: null,
         _spaceToggled: false,  // space toggled playback; swallow the matching keyup
@@ -167,6 +186,7 @@ function vinylApp() {
         successMessage: '',
         currentJobId: null,
         processPollTimer: null,
+        _processPollToken: 0,
         lastProgressAt: null,
 
         // Output format
@@ -272,7 +292,13 @@ function vinylApp() {
 
             // Files removed from the queue are deleted server-side after an
             // undo window; flush them if the page goes away first.
-            window.addEventListener('pagehide', () => this.commitAllRemovals({ keepalive: true }));
+            window.addEventListener('pagehide', () => {
+                this.saveWorkspace();
+                this.commitAllRemovals({ keepalive: true });
+            });
+            document.addEventListener('visibilitychange', () => {
+                if (document.hidden) this.saveWorkspace();
+            });
 
             // Keep waveform region labels in step with the mapping
             this.$watch('customMapping', () => this.refreshRegionLabels());
@@ -286,6 +312,10 @@ function vinylApp() {
                 this.outputFormat = 'flac';
             }
             await this.checkStatus();
+            await this.loadWorkspaces();
+            for (const field of [...WORKSPACE_FIELDS, 'config.bit_depth', 'config.replaygain']) {
+                this.$watch(field, () => this.scheduleWorkspaceSave());
+            }
             this.connectWebSocket();
 
             // Import from folder: pywebview injects its bridge asynchronously
@@ -395,6 +425,153 @@ function vinylApp() {
             return this.notify(detail ? `${prefix}: ${detail}` : prefix, { type: 'error' });
         },
 
+        /** Save the active editing workspace, excluding transient players, tokens and audio. */
+        saveWorkspace() {
+            clearTimeout(this._workspaceSaveTimer);
+            this._workspaceSaveTimer = null;
+            if (this.currentFileId && this.currentFile && !this.pendingRemovals[this.currentFileId]) {
+                const state = {};
+                for (const field of WORKSPACE_FIELDS) state[field] = this[field];
+                state.bitDepth = this.config.bit_depth;
+                state.replaygain = this.config.replaygain;
+                state.completedExportSignature = this.currentFile.completedExportSignature || null;
+                state.pendingExportSignature = this.currentFile.pendingExportSignature || null;
+                this.workspaces = { ...this.workspaces,
+                    [this.currentFileId]: JSON.parse(JSON.stringify(state)) };
+            }
+            this.persistWorkspaces();
+        },
+
+        /** Debounce deep Alpine watchers; pagehide/visibilitychange also flush synchronously. */
+        scheduleWorkspaceSave() {
+            clearTimeout(this._workspaceSaveTimer);
+            this._workspaceSaveTimer = setTimeout(() => this.saveWorkspace(), WORKSPACE_SAVE_DELAY_MS);
+        },
+
+        /** Browser storage may be unavailable or full; keep the in-memory workspace usable. */
+        persistWorkspaces() {
+            // Never overwrite an existing save before checking the server queue successfully.
+            if (!this._workspacesLoaded) return;
+            try {
+                window.localStorage.setItem(WORKSPACE_STORAGE_KEY,
+                    JSON.stringify({ version: WORKSPACE_VERSION, workspaces: this.workspaces }));
+            } catch (error) {
+                this.workspaceNotice = 'Automatic saving is unavailable in this browser. Keep this page open to preserve your edits.';
+            }
+        },
+
+        /** Reconcile saved edits with live sessions; stale saves never recreate deleted sources. */
+        async loadWorkspaces() {
+            this._workspacesLoaded = false;
+            try {
+                const response = await fetch('/api/queue');
+                if (!response.ok) throw new Error('Queue unavailable');
+                const data = await response.json();
+                this.uploadedFiles = (data.uploaded || []).map(file => ({ ...file, musicStart: null, musicDuration: null }));
+                let saved = null;
+                try { saved = JSON.parse(window.localStorage.getItem(WORKSPACE_STORAGE_KEY) || 'null'); }
+                catch (error) { /* A corrupt save must not block the server queue. */ }
+                const liveIds = new Set(this.uploadedFiles.map(file => file.id));
+                const entries = saved?.version === WORKSPACE_VERSION && saved.workspaces
+                    ? Object.entries(saved.workspaces) : [];
+                this.workspaces = Object.fromEntries(entries.filter(([id, state]) =>
+                    liveIds.has(id) && this.validWorkspace(state)));
+                for (const file of this.uploadedFiles) {
+                    const state = this.workspaces[file.id];
+                    if (state) {
+                        file.completedExportSignature = state.completedExportSignature;
+                        file.pendingExportSignature = state.pendingExportSignature;
+                        // Export may have finished while the browser was refreshing/disconnected.
+                        if (file.status === 'completed' && file.pendingExportSignature) {
+                            state.completedExportSignature = file.completedExportSignature = file.pendingExportSignature;
+                            state.pendingExportSignature = null;
+                            delete file.pendingExportSignature;
+                        }
+                        if (state.selectedRelease) {
+                            this.releaseChoices[file.id] = { release: state.selectedRelease, sides: state.selectedSides };
+                        }
+                    }
+                }
+                this._workspacesLoaded = true;
+                this.persistWorkspaces();
+            } catch (error) {
+                this.workspaceNotice = 'Could not check saved work. Reload when the server is available to recover it.';
+            }
+        },
+
+        /** Reject malformed state before assigning it to the Alpine editing model. */
+        validWorkspace(state) {
+            if (!state || typeof state !== 'object' || !Array.isArray(state.detectedTracks)) return false;
+            if (!state.detectedTracks.every(track => track && Number.isFinite(track.start) && Number.isFinite(track.end)
+                && track.start >= 0 && track.end > track.start && Number.isInteger(track.number))) return false;
+            if (state.selectedRelease !== null && (!state.selectedRelease || !Array.isArray(state.selectedRelease.tracks))) return false;
+            return WORKSPACE_FIELDS.every(field => field in state &&
+                (Array.isArray(this[field]) ? Array.isArray(state[field]) :
+                    this[field] === null || typeof state[field] === typeof this[field]));
+        },
+
+        /** Live queue items that can be resumed, including imports abandoned before any editing. */
+        get recoverableFiles() {
+            return this.uploadedFiles.filter(file => file.id !== this.currentFileId && file.status !== 'completed');
+        },
+
+        /** Resume editing without detection/search/export side effects; rebuild only the waveform. */
+        restoreWorkspace(fileId) {
+            const state = this.workspaces[fileId];
+            if (!state) return false;
+            for (const field of WORKSPACE_FIELDS) {
+                this[field] = JSON.parse(JSON.stringify(state[field]));
+            }
+            this.config.bit_depth = state.bitDepth;
+            this.config.replaygain = state.replaygain;
+            this.trackCountMismatch = !!this.selectedRelease && this.activeTrackCount !== this.targetTracks.length;
+            this.rememberChoice();
+            if (this.detectedTracks.length) this.$nextTick(() => this.initWaveform());
+            return true;
+        },
+
+        /** Exact inputs that determine whether the current edit matches a successful export. */
+        exportSignature() {
+            return JSON.stringify({
+                tracks: this.detectedTracks.map(track => [track.number, track.start, track.end, !!track.ignored, track.declick || null]),
+                release: this.selectedRelease, mapping: this.customMapping, reversed: this.trackMappingReversed,
+                format: this.outputFormat, rumble: this.rumbleFilter, declick: this.declick,
+                hum: this.humFilter, frequency: this.humFreq, hiss: this.hissReduction,
+                gain: this.albumGain, replaygain: this.config.replaygain, depth: this.config.bit_depth,
+                outputDir: this.config.output_dir
+            });
+        },
+
+        get processingComplete() {
+            return this.currentFile?.status === 'completed' &&
+                this.currentFile.completedExportSignature === this.exportSignature();
+        },
+
+        /** Record completion by file id, even if the user is viewing another recording. */
+        completeExport(fileId, tracks = []) {
+            const file = this.uploadedFiles.find(entry => entry.id === fileId);
+            if (!file) return;
+            file.status = 'completed';
+            file.completedExportSignature = file.pendingExportSignature || file.completedExportSignature;
+            delete file.pendingExportSignature;
+            const state = this.workspaces[fileId];
+            if (state) {
+                state.completedExportSignature = file.completedExportSignature;
+                state.pendingExportSignature = null;
+            }
+            if (fileId === this.currentFileId) {
+                this.stopProcessPolling();
+                this.isProcessing = false;
+                this.processingProgress = 1;
+                this.processingMessage = 'Complete!';
+                this.successMessage = tracks.length
+                    ? `✅ ${tracks.length} tracks saved.\n\nTracks: ${tracks.join(', ')}`
+                    : '✅ Processing complete. Files saved.';
+                this.saveWorkspace();
+            } else this.persistWorkspaces();
+            this.loadImportList();
+        },
+
         /**
          * Load available output formats from API
          */
@@ -499,18 +676,7 @@ function vinylApp() {
                     break;
 
                 case 'complete':
-                    if (data.file_id === this.currentFileId) {
-                        this.stopProcessPolling();
-                        this.processingProgress = 1.0;
-                        this.processingMessage = 'Complete!';
-                        this.isProcessing = false;
-                        this.successMessage = `✅ ${data.tracks.length} tracks saved to your VinylFlow/output folder\n\nTracks: ${data.tracks.join(', ')}`;
-
-                        const file = this.uploadedFiles.find(f => f.id === data.file_id);
-                        if (file) {
-                            file.status = 'completed';
-                        }
-                    }
+                    this.completeExport(data.file_id, data.tracks || []);
                     break;
 
                 case 'error':
@@ -874,9 +1040,9 @@ function vinylApp() {
             return this.importInfo.enabled || this.desktopPicker;
         },
 
-        /** Files in the folder list that can be ticked (not imported, not still copying) */
+        /** Every stable source can be selected again, even after a previous import or export. */
         get importableFiles() {
-            return (this.importInfo.files || []).filter(f => !f.imported_id && f.stable !== false);
+            return (this.importInfo.files || []).filter(f => f.stable !== false);
         },
 
         /** Reload the folder listing; failures leave the previous list in place */
@@ -921,13 +1087,19 @@ function vinylApp() {
             this.importSelected = this.allImportSelected ? [] : this.importableFiles.map(f => f.name);
         },
 
-        /** Row click: tick a free row, or jump to the queue entry of an imported one */
+        /** A queue entry is not proof of a completed export. */
+        importFileLabel(file) {
+            if (file.stable === false) return 'Still copying…';
+            const entry = this.uploadedFiles.find(item => item.id === file.imported_id);
+            const status = entry?.status || file.imported_status;
+            if (status === 'processing') return 'Processing…';
+            if (status === 'completed' || entry?.completedExportSignature || file.imported_status === 'completed') return 'Complete';
+            return file.imported_id ? 'In queue' : '';
+        },
+
+        /** Row and checkbox use the same selection behavior; existing sessions are reused. */
         onImportRowClick(file) {
-            if (file.imported_id) {
-                if (this.uploadedFiles.some(f => f.id === file.imported_id)) this.selectFile(file.imported_id);
-            } else if (file.stable !== false) {
-                this.toggleImportSelected(file.name);
-            }
+            if (file.stable !== false) this.toggleImportSelected(file.name);
         },
 
         /** Import the ticked folder files */
@@ -955,6 +1127,7 @@ function vinylApp() {
         async postImport(body) {
             this.importBusy = true;
             try {
+                await this.commitAllRemovals();
                 const response = await fetch('/api/import', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -966,20 +1139,27 @@ function vinylApp() {
                 const known = new Set(this.uploadedFiles.map(f => f.id));
                 const added = [];
                 (data.files || []).forEach(file => {
-                    if (known.has(file.id)) return;
+                    if (known.has(file.id)) {
+                        const existing = this.uploadedFiles.find(entry => entry.id === file.id);
+                        if (file.status) existing.status = file.status;
+                        return;
+                    }
                     known.add(file.id);
                     const entry = {
                         ...file,
-                        status: 'uploaded',
+                        status: file.status || 'uploaded',
                         musicStart: null,
                         musicDuration: null  // Filled by the background scan (scan_complete / /api/scan)
                     };
                     this.uploadedFiles.push(entry);
                     added.push(entry);
                 });
-                if (!this.currentFile && added.length > 0) {
-                    this.selectFile(added[0].id);
+                if (!this.currentFile && data.files?.length > 0) {
+                    this.selectFile((added[0] || data.files[0]).id);
+                } else if (data.files?.length === 1 && known.has(data.files[0].id) && !added.length) {
+                    this.selectFile(data.files[0].id);
                 }
+                this.saveWorkspace();
 
                 const skipped = data.skipped || [];
                 if (skipped.length) {
@@ -1120,6 +1300,9 @@ function vinylApp() {
          * Select a file from the queue
          */
         selectFile(fileId) {
+            if (fileId === this.currentFileId || this.analyzing || this.isProcessing ||
+                !this.uploadedFiles.some(file => file.id === fileId)) return;
+            this.saveWorkspace();
             this.abReset();
             this.currentFileId = fileId;
             this.currentFile = this.uploadedFiles.find(f => f.id === fileId);
@@ -1151,6 +1334,13 @@ function vinylApp() {
 
             this.destroyWaveform();
 
+            const restored = this.restoreWorkspace(fileId);
+            if (this.currentFile?.status === 'processing') {
+                this.isProcessing = true;
+                this.currentJobId = fileId;
+                this.startProcessPolling(fileId);
+            }
+            if (restored) return;
             if (this.currentFile) {
                 this.searchQuery = this.cleanFilename(this.currentFile.filename);
 
@@ -1172,6 +1362,8 @@ function vinylApp() {
             if (index === -1 || this.pendingRemovals[fileId]) return;
 
             const file = this.uploadedFiles[index];
+            if (file.status === 'processing' || (fileId === this.currentFileId && this.analyzing)) return;
+            this.saveWorkspace();
             const entry = {
                 file, index,
                 choice: this.releaseChoices[fileId] || null,
@@ -1227,6 +1419,9 @@ function vinylApp() {
             const entry = this.pendingRemovals[fileId];
             if (!entry || entry.committed) return;
             entry.committed = true;
+            const workspace = this.workspaces[fileId];
+            delete this.workspaces[fileId];
+            this.persistWorkspaces();
             if (entry.toastId) this.dismissToast(entry.toastId, 'commit');
             try {
                 const response = await fetch(`/api/queue/${fileId}`, { method: 'DELETE', keepalive });
@@ -1239,6 +1434,8 @@ function vinylApp() {
                 // Server still has it: bring the file back so the queue
                 // reflects reality, and say so.
                 console.error('Failed to remove file:', error);
+                if (workspace) this.workspaces = { ...this.workspaces, [fileId]: workspace };
+                this.persistWorkspaces();
                 if (!this.uploadedFiles.some(f => f.id === fileId)) {
                     this.uploadedFiles = [...this.uploadedFiles, entry.file];
                 }
@@ -1253,6 +1450,19 @@ function vinylApp() {
         /** Commit every pending removal now (page unload, process start) */
         commitAllRemovals(opts = {}) {
             return Promise.all(Object.keys(this.pendingRemovals).map(id => this.commitRemoval(id, opts)));
+        },
+
+        /** Return to the existing search UI while keeping all current cuts. */
+        tryDiscogsAgain() {
+            if (this.analyzing || this.isProcessing) return;
+            if (!this.searchQuery.trim()) this.searchQuery = this.cleanFilename(this.currentFile?.filename || '');
+            this.searchDiscogs();
+            this.$nextTick(() => {
+                if (typeof document === 'undefined') return;
+                const search = document.getElementById('discogs-search');
+                search?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                document.getElementById('discogs-query')?.focus({ preventScroll: true });
+            });
         },
 
         /**
@@ -2584,6 +2794,7 @@ function vinylApp() {
             if (!this.currentFileId || this.waveform) return;
 
             this.waveformLoading = true;
+            const fileId = this.currentFileId;
 
             try {
                 if (typeof WaveSurfer === 'undefined') {
@@ -2617,6 +2828,8 @@ function vinylApp() {
                     barGap: 1
                 });
 
+                const waveform = this.waveform;
+
                 // With MediaElement + provided peaks, load() resolves without
                 // fetching the audio — a later fetch failure only surfaces as
                 // an 'error' event, which must clear the loading spinner.
@@ -2635,23 +2848,48 @@ function vinylApp() {
                 for (const ev of ['zoom', 'redraw', 'ready']) {
                     this.waveform.on(ev, () => this.refreshClickStrip());
                 }
-                this.waveform.on('audioprocess', (t) => this.onPlayerTime(t));
                 // User clicked/dragged on the waveform itself: abandon any audition
-                this.waveform.on('interaction', () => this.cancelAudition());
+                this.waveform.on('interaction', (time) => {
+                    this.cancelAudition();
+                    this.seekTo(time);
+                });
+                const media = this.waveform.getMediaElement();
+                media.preload = 'auto';
+                const mediaListeners = {
+                    loadedmetadata: () => this.applyPendingSeek(),
+                    seeking: () => { this.playerBuffering = true; },
+                    waiting: () => { this.playerBuffering = true; },
+                    seeked: () => { this.playerBuffering = false; },
+                    playing: () => { this.playerBuffering = false; },
+                    pause: () => { this.playerBuffering = false; },
+                    ended: () => { this.playerBuffering = false; }
+                };
+                for (const [event, listener] of Object.entries(mediaListeners)) media.addEventListener(event, listener);
+                waveform.on('destroy', () => {
+                    for (const [event, listener] of Object.entries(mediaListeners)) media.removeEventListener(event, listener);
+                });
 
                 this.waveformRegions = this.waveform.registerPlugin(WaveSurfer.Regions.create());
 
                 const peaksResponse = await fetch(`/api/waveform-peaks/${this.currentFileId}`);
+                if (waveform !== this.waveform) return;
                 if (!peaksResponse.ok) {
                     throw new Error('Failed to load waveform peaks');
                 }
                 const peaksData = await peaksResponse.json();
+                if (fileId !== this.currentFileId || waveform !== this.waveform) return;
 
                 this.waveform.on('ready', () => {
                     console.log('Waveform ready');
 
                     const duration = this.waveform.getDuration();
                     this.playDuration = duration;
+                    if (this.playTime > 0) this.seekTo(this.playTime);
+                    const wrapper = this.waveform.getWrapper();
+                    wrapper.addEventListener('pointermove', event => {
+                        const handle = event.target.closest?.('[part~="region-handle"]');
+                        if (handle) handle.style.cursor = this.regionCursorAt(event.clientX);
+                    });
                     const container = document.getElementById('waveform');
                     const containerWidth = container ? container.offsetWidth : 1000;
 
@@ -2683,6 +2921,7 @@ function vinylApp() {
                     container.addEventListener('mousedown', openWaveformContextMenu);
 
                     setTimeout(() => {
+                        if (waveform !== this.waveform) return;
                         this.addTrackRegions();
                         this.waveformLoading = false;
                     }, 100);
@@ -2699,13 +2938,18 @@ function vinylApp() {
                 this.waveformRegions.on('region-created', (region) => {
                     const regionElement = region.element;
                     if (regionElement) {
+                        // Set the actual v7 shadow-DOM handles, including directional native cursors.
+                        const startHandle = regionElement.querySelector('[part~="region-handle-left"]');
+                        const endHandle = regionElement.querySelector('[part~="region-handle-right"]');
+                        if (startHandle) startHandle.style.cursor = 'e-resize';
+                        if (endHandle) endHandle.style.cursor = 'w-resize';
                         const openRegionContextMenu = (e) => {
                             const isSecondaryClick = e.type === 'contextmenu' || e.button === 2 || (e.button === 0 && e.ctrlKey);
                             if (!isSecondaryClick) {
                                 return;
                             }
 
-                            if (e.target.classList.contains('wavesurfer-handle')) {
+                            if (e.target.closest?.('[part~=region-handle]')) {
                                 return;
                             }
 
@@ -3695,9 +3939,37 @@ function vinylApp() {
         },
 
         seekTo(time) {
-            if (!this.waveform) return;
+            if (!this.waveform || !Number.isFinite(time)) return;
+            time = Math.max(0, Math.min(time, this.waveform.getDuration()));
+            const media = this.waveform.getMediaElement?.();
+            this._pendingSeek = media?.readyState === 0 ? time : null;
             this.waveform.setTime(time);
-            this.updateCurrentTrack(time);
+            this.onPlayerTime(time);
+        },
+
+        /** MediaElement can reset an early currentTime assignment while loading metadata. */
+        applyPendingSeek() {
+            if (this._pendingSeek === null || !this.waveform) return;
+            const time = this._pendingSeek;
+            this._pendingSeek = null;
+            this.waveform.setTime(time);
+            this.onPlayerTime(time);
+        },
+
+        /** Distinguish the inside of either edge from the narrow shared boundary itself. */
+        regionCursorAt(clientX) {
+            if (!this.waveform) return 'ew-resize';
+            const rect = this.waveform.getWrapper().getBoundingClientRect();
+            const duration = this.waveform.getDuration();
+            const x = clientX - rect.left;
+            let start = false, end = false;
+            for (const track of this.detectedTracks) {
+                const startDelta = x - track.start / duration * rect.width;
+                const endDelta = x - track.end / duration * rect.width;
+                start ||= startDelta >= -REGION_SHARED_EDGE_PX && startDelta <= REGION_EDGE_HIT_PX;
+                end ||= endDelta >= -REGION_EDGE_HIT_PX && endDelta <= REGION_SHARED_EDGE_PX;
+            }
+            return start && end ? 'ew-resize' : end ? 'w-resize' : 'e-resize';
         },
 
         /**
@@ -3810,7 +4082,7 @@ function vinylApp() {
             if (e.button !== undefined && e.button !== 0) return;
             if (e.ctrlKey || e.metaKey) return;
             if (String(region.id).startsWith('expected-')) return;
-            if (e.target && e.target.classList && e.target.classList.contains('wavesurfer-handle')) return;
+            if (e.target && e.target.closest?.('[part~=region-handle]')) return;
             const down = this._regionDownX;
             this._regionDownX = null;
             if (down !== null && Math.abs(e.clientX - down) > 3) return;  // drag end, not a click
@@ -3846,6 +4118,8 @@ function vinylApp() {
             this.playDuration = 0;
             this.playheadIdx = -1;
             this.playerNotice = '';
+            this.playerBuffering = false;
+            this._pendingSeek = null;
             this._auditionStop = null;
         },
 
@@ -3853,7 +4127,7 @@ function vinylApp() {
          * Process file with selected release
          */
         async processFile() {
-            if (!this.currentFileId || !this.selectedRelease) return;
+            if (!this.currentFileId || !this.selectedRelease || this.isProcessing || this.processingComplete) return;
 
             const activeTracks = this.detectedTracks.filter(t => !t.ignored);
 
@@ -3882,6 +4156,9 @@ function vinylApp() {
             }));
 
             try {
+                this.currentFile.pendingExportSignature = this.exportSignature();
+                this.successMessage = '';
+                this.saveWorkspace();
                 this.isProcessing = true;
                 this.processingProgress = 0.1;
                 this.processingMessage = 'Starting...';
@@ -3903,7 +4180,8 @@ function vinylApp() {
                         hum_freq: this.humFreq,
                         hiss_reduction: this.hissReduction,
                         album_gain: this.albumGain,
-                        replaygain: this.config.replaygain !== false
+                        replaygain: this.config.replaygain !== false,
+                        bit_depth: this.config.bit_depth
                     })
                 });
 
@@ -3912,12 +4190,11 @@ function vinylApp() {
                     throw new Error(data.detail || 'Failed to start processing');
                 }
                 console.log('Processing started:', data);
-                this.currentJobId = data.job_id;
-                this.startProcessPolling(data.job_id);
-
-                const file = this.uploadedFiles.find(f => f.id === this.currentFileId);
-                if (file) {
-                    file.status = 'processing';
+                // A fast job can finish over WebSocket before this POST response arrives.
+                if (this.isProcessing) {
+                    this.startProcessPolling(data.job_id);
+                    const file = this.uploadedFiles.find(f => f.id === this.currentFileId);
+                    if (file) file.status = 'processing';
                 }
             } catch (error) {
                 console.error('Processing failed:', error);
@@ -3931,6 +4208,8 @@ function vinylApp() {
 
         startProcessPolling(jobId) {
             this.stopProcessPolling();
+            this.currentJobId = jobId;
+            const token = this._processPollToken;
 
             this.processPollTimer = setInterval(async () => {
                 if (!this.isProcessing || !jobId) {
@@ -3945,6 +4224,8 @@ function vinylApp() {
                     }
 
                     const job = await response.json();
+                    // An in-flight poll from a stopped run must not finish a later run of this file.
+                    if (token !== this._processPollToken) return;
 
                     if (job.status === 'processing') {
                         this.processingProgress = Math.max(this.processingProgress, job.progress || 0.1);
@@ -3953,22 +4234,7 @@ function vinylApp() {
                     }
 
                     if (job.status === 'complete') {
-                        this.stopProcessPolling();
-                        this.processingProgress = 1.0;
-                        this.processingMessage = 'Complete!';
-                        this.isProcessing = false;
-
-                        const tracks = Array.isArray(job.tracks) ? job.tracks : [];
-                        if (tracks.length > 0) {
-                            this.successMessage = `✅ ${tracks.length} tracks saved to your VinylFlow/output folder\n\nTracks: ${tracks.join(', ')}`;
-                        } else {
-                            this.successMessage = '✅ Processing complete. Files saved to your VinylFlow/output folder.';
-                        }
-
-                        const file = this.uploadedFiles.find(f => f.id === job.file_id);
-                        if (file) {
-                            file.status = 'completed';
-                        }
+                        this.completeExport(job.file_id, Array.isArray(job.tracks) ? job.tracks : []);
                         return;
                     }
 
@@ -3991,6 +4257,7 @@ function vinylApp() {
         },
 
         stopProcessPolling() {
+            this._processPollToken++;
             if (this.processPollTimer) {
                 clearInterval(this.processPollTimer);
                 this.processPollTimer = null;
@@ -4002,6 +4269,10 @@ function vinylApp() {
          * Reset UI for next file
          */
         resetForNextFile() {
+            this.saveWorkspace();
+            this.currentFileId = null;
+            this.currentFile = null;
+            this.destroyWaveform();
             this.stopProcessPolling();
             this.abReset();
             this.successMessage = '';

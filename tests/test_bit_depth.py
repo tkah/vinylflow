@@ -222,3 +222,30 @@ def test_upload_records_source_bit_depth(wav24, wav16, tmp_path, monkeypatch):
         assert r.status_code == 200, r.text
         fid = r.json()["files"][0]["id"]
         assert api.session_store.get(fid).source_bit_depth == expected
+
+
+@pytest.mark.parametrize('requested, expected', [('24', '24'), ('source', 'source'), (None, 'source')])
+def test_recovered_export_uses_its_saved_depth(tmp_config, tmp_path, monkeypatch, requested, expected):
+    """A recovered workspace can differ from today's server default without changing that default."""
+    import asyncio
+    from backend.sessions import SessionStore
+
+    store = SessionStore()
+    monkeypatch.setattr(api, 'session_store', store)
+    source = tmp_path / 'recovered.wav'
+    source.write_bytes(b'fake audio; the pipeline is stubbed')
+    store.create('depth-recovery', source, source.name, 120, source.stat().st_size)
+    specs = []
+
+    def capture_spec(session, spec, *args):
+        """Capture the export contract without invoking FFmpeg or Discogs."""
+        specs.append(spec)
+
+    monkeypatch.setattr(api.pipeline, 'run', capture_spec)
+    request = api.ProcessRequest(file_id='depth-recovery', release_id=7, track_mapping=[], bit_depth=requested)
+    asyncio.run(api.process_file_background(request))
+    assert specs[0].bit_depth == expected
+    assert api.config.bit_depth == 'source'
+    invalid = client.post('/api/process', json={
+        'file_id': 'depth-recovery', 'release_id': 7, 'track_mapping': [], 'bit_depth': '16'})
+    assert invalid.status_code == 400

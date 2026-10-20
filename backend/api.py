@@ -332,6 +332,7 @@ class ProcessRequest(BaseModel):
     hiss_reduction: str = "off"  # off | light | medium | strong
     album_gain: bool = False     # one gain for the whole album to -14 LUFS
     replaygain: bool = True      # write ReplayGain 2.0 track + album tags
+    bit_depth: Optional[str] = None  # per-workspace depth; omitted uses the server default
 
 
 class ConfigUpdate(BaseModel):
@@ -866,6 +867,7 @@ async def list_import():
     for e in entries:
         s = _session_for_source(e.pop("path"))
         e["imported_id"] = s.id if s else None
+        e["imported_status"] = _session_status(s) if s else None
     out["files"] = entries
     return out
 
@@ -907,6 +909,7 @@ async def import_files(req: ImportRequest):
             if existing is not None:
                 imported.append({
                     "id": existing.id,
+                    "status": _session_status(existing),
                     "filename": existing.source_filename,
                     "size": existing.source_size,
                     "duration": existing.source_duration,
@@ -1798,6 +1801,9 @@ async def process_file(request: ProcessRequest):
             f"Choose from: {', '.join(OUTPUT_FORMATS.keys())}",
         )
 
+    if request.bit_depth is not None and request.bit_depth not in ("source", "24"):
+        raise HTTPException(status_code=400, detail="bit_depth must be source or 24")
+
     # Normalise rumble/declick now (400 on bad values) so the background job can't fail on them.
     if request.rumble_filter is None and request.declick is None:
         # Legacy clients send restoration_level; no field at all = nothing on.
@@ -1871,7 +1877,7 @@ async def process_file_background(request: ProcessRequest):
         album_gain=request.album_gain,
         replaygain=request.replaygain,
         track_numbering=config.track_numbering,
-        bit_depth=config.bit_depth,
+        bit_depth=request.bit_depth or config.bit_depth,
     )
 
     loop = asyncio.get_running_loop()
