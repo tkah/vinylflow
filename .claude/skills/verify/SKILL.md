@@ -37,7 +37,7 @@ node --check backend/static/app.js
 node tests/frontend/run.js        # runs every tests/frontend/*.test.js, non-zero on failure
 ```
 
-Also check `grep -n "alert(\|confirm(" backend/static/` is empty (toasts only) and that
+Also check that `index.html` loads no external scripts/styles (covered by `tests/test_vendor_offline.py`), `grep -n "alert(\|confirm(" backend/static/` is empty (toasts only) and that
 `index.html` tags balance.
 
 ## Launch the app (sandboxed, offline)
@@ -103,6 +103,7 @@ docker rm -f vinylflow-verify
 
 Manual steps:
 
+0. `GET /` and every `/static/vendor/*.js` → 200 inside the `--network none` container (UI is fully offline).
 1. `curl -F "files=@<wav>" localhost:8000/api/upload` → expect duration 126.0
 2. `GET /api/scan/<id>` until `ready` → music span 0–126s; `POST /api/analyze {"file_id":...}`
    → 3 tracks at ~0/43/86s
