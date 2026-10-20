@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass(frozen=True)
@@ -15,9 +15,16 @@ class OutputSpec:
     output_format: str
     output_dir: Path
     flac_compression: int = 5
-    restoration_level: int = 0
-    hum_freq: int = 50
+    rumble_filter: bool = False
+    declick: str = "off"  # off | light | medium | strong
+    hum_filter: bool = False  # mains-hum notch (hum_freq 50|60 Hz + harmonics)
+    hum_freq: int = 60
+    hiss_reduction: str = "off"  # off | light | medium | strong
+    noise_profile: Optional[Any] = None  # audio_processor.NoiseProfile for the hiss filter
+    album_gain: bool = False
+    replaygain: bool = True
     track_numbering: str = "vinyl"
+    bit_depth: str = "source"  # "source" | "24"
 
 
 @dataclass(frozen=True)

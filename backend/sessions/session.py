@@ -41,6 +41,8 @@ class Session:
     source_audio: Path
     source_duration: float
     source_size: int
+    # 16 or 24, probed once at upload; None when unknown (treated as 16).
+    source_bit_depth: Optional[int] = None
 
     state: SessionState = SessionState.READY
     release: Optional[Any] = None
@@ -63,6 +65,7 @@ class Session:
         source_filename: str,
         source_duration: float,
         source_size: int,
+        source_bit_depth: Optional[int] = None,
     ) -> "Session":
         return cls(
             id=str(uuid.uuid4()),
@@ -70,6 +73,7 @@ class Session:
             source_audio=source_audio,
             source_duration=source_duration,
             source_size=source_size,
+            source_bit_depth=source_bit_depth,
         )
 
     def link_release(self, release: Any) -> None:

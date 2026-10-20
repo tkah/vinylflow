@@ -16,6 +16,11 @@ from dotenv import load_dotenv
 #                            appears as 1 disc. VINYLPOSITION custom tag preserved.
 # "vinyl"                  — TRACKNUMBER="A1" (legacy behaviour, no DISCNUMBER written).
 DEFAULT_TRACK_NUMBERING = "vinyl"
+OUTPUT_FORMATS = ("flac", "mp3", "aiff")
+BIT_DEPTHS = ("source", "24")
+DECLICK_LEVELS = ("off", "light", "medium", "strong")
+HISS_LEVELS = ("off", "light", "medium", "strong")
+HUM_FREQS = (50, 60)
 
 
 class Config:
@@ -87,6 +92,61 @@ class Config:
             json_settings.get("TRACK_NUMBERING")
             or os.getenv("TRACK_NUMBERING", DEFAULT_TRACK_NUMBERING)
         )
+
+        # Remembered export defaults (output format, rumble/declick, album gain)
+        output_format = json_settings.get("OUTPUT_FORMAT") or os.getenv("OUTPUT_FORMAT", "flac")
+        self.output_format = output_format if output_format in OUTPUT_FORMATS else "flac"
+        # Audio processing: rumble filter + click/pop removal strength. These
+        # replace the old RESTORATION_LEVEL (1 -> rumble on + declick "light");
+        # it is only consulted when the new keys are absent.
+        try:
+            legacy_level = int(
+                json_settings.get("RESTORATION_LEVEL", os.getenv("RESTORATION_LEVEL", "0"))
+            )
+        except (TypeError, ValueError):
+            legacy_level = 0
+        legacy_on = legacy_level == 1
+        self.rumble_filter = self._as_bool(
+            json_settings.get("RUMBLE_FILTER", os.getenv("RUMBLE_FILTER")), legacy_on
+        )
+        declick = str(
+            json_settings.get("DECLICK") or os.getenv("DECLICK") or ("light" if legacy_on else "off")
+        ).lower()
+        self.declick = declick if declick in DECLICK_LEVELS else ("light" if legacy_on else "off")
+        # Hum removal (mains notch) and hiss reduction: both off by default.  The hum
+        # frequency defaults to 60 Hz; the hiss strength is remembered separately so
+        # toggling the feature off and on keeps the last chosen strength.
+        self.hum_filter = self._as_bool(
+            json_settings.get("HUM_FILTER", os.getenv("HUM_FILTER")), False
+        )
+        try:
+            hum_freq = int(json_settings.get("HUM_FREQ") or os.getenv("HUM_FREQ") or 60)
+        except (TypeError, ValueError):
+            hum_freq = 60
+        self.hum_freq = hum_freq if hum_freq in HUM_FREQS else 60
+        hiss = str(json_settings.get("HISS_REDUCTION") or os.getenv("HISS_REDUCTION") or "off").lower()
+        self.hiss_reduction = hiss if hiss in HISS_LEVELS else "off"
+        strength = str(json_settings.get("HISS_STRENGTH") or os.getenv("HISS_STRENGTH") or "").lower()
+        if strength not in HISS_LEVELS or strength == "off":
+            strength = self.hiss_reduction if self.hiss_reduction != "off" else "light"
+        self.hiss_strength = strength
+        bit_depth = str(json_settings.get("BIT_DEPTH") or os.getenv("BIT_DEPTH", "source"))
+        self.bit_depth = bit_depth if bit_depth in BIT_DEPTHS else "source"
+        # Loudness: album gain (off by default), ReplayGain tags (on by default)
+        self.album_gain = self._as_bool(
+            json_settings.get("ALBUM_GAIN", os.getenv("ALBUM_GAIN")), False
+        )
+        self.replaygain = self._as_bool(
+            json_settings.get("REPLAYGAIN", os.getenv("REPLAYGAIN")), True
+        )
+
+    @staticmethod
+    def _as_bool(value, default: bool) -> bool:
+        if value is None or value == "":
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
 
     def validate(self):
         """
@@ -180,6 +240,45 @@ class Config:
 
     def save_track_numbering(self, scheme: str) -> bool:
         return self._write_settings({'TRACK_NUMBERING': scheme})
+
+    def save_output_format(self, fmt: str) -> bool:
+        return self._write_settings({'OUTPUT_FORMAT': fmt})
+
+    def save_bit_depth(self, bit_depth: str) -> bool:
+        return self._write_settings({'BIT_DEPTH': bit_depth})
+
+    def save_rumble_filter(self, enabled: bool) -> bool:
+        return self._write_settings({'RUMBLE_FILTER': bool(enabled)})
+
+    def save_declick(self, level: str) -> bool:
+        return self._write_settings({'DECLICK': level})
+
+    def save_hum_filter(self, enabled: bool) -> bool:
+        return self._write_settings({'HUM_FILTER': bool(enabled)})
+
+    def save_hum_freq(self, freq: int) -> bool:
+        return self._write_settings({'HUM_FREQ': int(freq)})
+
+    def save_hiss_reduction(self, level: str) -> bool:
+        """Persist the hiss setting; a real strength is also remembered as ``hiss_strength``."""
+        updates = {'HISS_REDUCTION': level}
+        if level != "off":
+            updates['HISS_STRENGTH'] = level
+        return self._write_settings(updates)
+
+    def save_hiss_strength(self, level: str) -> bool:
+        return self._write_settings({'HISS_STRENGTH': level})
+
+    @property
+    def restoration_level(self) -> int:
+        """Legacy 0/1 view: 1 when any rumble/declick processing is on."""
+        return 1 if (self.rumble_filter or self.declick != "off") else 0
+
+    def save_album_gain(self, enabled: bool) -> bool:
+        return self._write_settings({'ALBUM_GAIN': bool(enabled)})
+
+    def save_replaygain(self, enabled: bool) -> bool:
+        return self._write_settings({'REPLAYGAIN': bool(enabled)})
 
     def reload(self):
         """

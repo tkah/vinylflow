@@ -5,9 +5,11 @@ Handles Discogs API integration, metadata tagging, and cover art embedding.
 Manages release searches, track mapping, and file tagging for FLAC, MP3, and AIFF.
 """
 
+import itertools
 import re
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple, Optional
@@ -20,6 +22,8 @@ from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, TDRC, TRCK, TPOS, TPUB, COMM, APIC, TXXX
 from mutagen.aiff import AIFF
 from PIL import Image
+
+from track_matching import match_tracklists
 
 
 @dataclass(frozen=True)
@@ -105,6 +109,11 @@ class DiscogsRelease:
         self.id = release.id
         self.title = release.title
         self.year = getattr(release, "year", "")
+
+        # Master id from the raw payload (populated by the attribute reads
+        # above/below); .data only, never a fetch of its own.
+        raw = getattr(release, "data", None)
+        self.master_id = raw.get("master_id") if isinstance(raw, dict) else None
 
         # Get URI for Discogs link - construct from release ID
         self.uri = f"/release/{release.id}"
@@ -223,6 +232,13 @@ class MetadataHandler:
         self.last_request_time = 0
         self.min_request_interval = 1.0  # Rate limiting: max 1 req/sec
         self._rate_limit_lock = threading.Lock()
+        self._release_cache: "OrderedDict[int, DiscogsRelease]" = OrderedDict()
+        self._release_cache_lock = threading.Lock()
+        self._donor_cache: dict = {}
+        self._donor_cache_lock = threading.Lock()
+
+    RELEASE_CACHE_SIZE = 128
+    DONOR_VERSION_PAGES = 3  # max master-version pages read per search
 
     def reinitialize(self, discogs_token: str, user_agent: str):
         """
@@ -236,6 +252,10 @@ class MetadataHandler:
         self.discogs_user_agent = user_agent
         self.client = discogs_client.Client(user_agent, user_token=discogs_token)
         self.last_request_time = 0
+        with self._release_cache_lock:
+            self._release_cache.clear()
+        with self._donor_cache_lock:
+            self._donor_cache.clear()
         print(f"MetadataHandler reinitialized with new token")
 
     def _rate_limit(self):
@@ -273,44 +293,66 @@ class MetadataHandler:
 
         return name
 
-    def search_releases(self, query: str, max_results=5) -> List[Tuple[int, DiscogsRelease]]:
+    def search_basic(self, query: str, max_results: int = 5) -> List[dict]:
         """
-        Search Discogs for releases.
+        Search Discogs with ONE request and build basic results from the raw
+        search payloads (no per-release fetch).
+
+        Only each result's plain ``.data`` dict is read: attribute access on
+        discogs_client objects can lazily fetch the full release.
 
         Args:
             query: Search query
             max_results: Maximum number of results to return
 
         Returns:
-            List of (index, DiscogsRelease) tuples
+            List of dicts (id, artist, title, year, label, format, country,
+            cover_url, uri, master_id)
         """
         self._rate_limit()
+        results = self.client.search(query, type="release", per_page=max(1, int(max_results)))
 
-        try:
-            results = self.client.search(query, type="release")
-            releases = []
+        basic = []
+        for result in itertools.islice(results, max_results):
+            data = result.data
+            rid = data.get("id")
+            if rid is None:
+                continue
+            artist, title = self._split_search_title(data.get("title") or "")
+            basic.append(
+                {
+                    "id": rid,
+                    "artist": artist,
+                    "title": title,
+                    "year": data.get("year") or "",
+                    "label": self._first(data.get("label")),
+                    "format": self._first(data.get("format")),
+                    "country": data.get("country") or "",
+                    "cover_url": data.get("cover_image") or data.get("thumb") or None,
+                    "uri": f"/release/{rid}",
+                    "master_id": data.get("master_id") or None,
+                }
+            )
+        return basic
 
-            for i, result in enumerate(results, 1):
-                if i > max_results:
-                    break
+    @staticmethod
+    def _first(value) -> str:
+        """First element of a list-valued search field (or the string itself)."""
+        if isinstance(value, (list, tuple)):
+            return str(value[0]) if value else ""
+        return str(value) if value else ""
 
-                try:
-                    self._rate_limit()
-                    release = self.client.release(result.id)
-                    releases.append((i, DiscogsRelease(release)))
-                except Exception as e:
-                    print(f"Warning: Failed to fetch release {result.id}: {e}")
-                    continue
-
-            return releases
-
-        except Exception as e:
-            print(f"Search failed: {e}")
-            return []
+    @staticmethod
+    def _split_search_title(full: str) -> Tuple[str, str]:
+        """Split Discogs' "Artist - Title" search title (first " - " wins)."""
+        if " - " in full:
+            artist, title = full.split(" - ", 1)
+            return artist.strip(), title.strip()
+        return "Unknown Artist", full.strip()
 
     def get_release_by_id(self, release_id: int) -> Optional[DiscogsRelease]:
         """
-        Get release by Discogs ID.
+        Get release by Discogs ID (served from a bounded in-memory cache).
 
         Args:
             release_id: Discogs release ID
@@ -318,13 +360,163 @@ class MetadataHandler:
         Returns:
             DiscogsRelease or None
         """
+        key = int(release_id)
+        with self._release_cache_lock:
+            cached = self._release_cache.get(key)
+            if cached is not None:
+                self._release_cache.move_to_end(key)
+                return cached
+
         try:
             self._rate_limit()
-            release = self.client.release(release_id)
-            return DiscogsRelease(release)
+            release = DiscogsRelease(self.client.release(key))
         except Exception as e:
             print(f"Failed to fetch release {release_id}: {e}")
             return None
+
+        with self._release_cache_lock:
+            self._release_cache[key] = release
+            self._release_cache.move_to_end(key)
+            while len(self._release_cache) > self.RELEASE_CACHE_SIZE:
+                self._release_cache.popitem(last=False)
+        return release
+
+    @staticmethod
+    def _year_of(value) -> Optional[int]:
+        m = re.match(r"\s*(\d{4})", str(value or ""))
+        return int(m.group(1)) if m else None
+
+    def _master_versions(self, master_id: int) -> List[dict]:
+        """Raw ``.data`` dicts of a master's versions (a few rate-limited pages).
+
+        Only ``.data`` is read from the library objects: attribute access could
+        trigger a lazy fetch per version.  ``versions_url`` is derived from the
+        master's ``resource_url`` so no request is spent on the master itself.
+        """
+        master = self.client.master(master_id)
+        master.data["versions_url"] = f"{master.data['resource_url']}/versions"
+        versions = master.versions
+        versions.per_page = 100
+        out: List[dict] = []
+        self._rate_limit()
+        pages = versions.pages  # one request; page 1 is kept by the library
+        for page_no in range(1, min(int(pages or 0), self.DONOR_VERSION_PAGES) + 1):
+            if page_no > 1:
+                self._rate_limit()
+            out.extend(v.data for v in versions.page(page_no))
+        return out
+
+    def find_length_donors(
+        self,
+        release_id: int,
+        max_fetches: int = 12,
+        want: int = 3,
+        on_progress=None,
+    ) -> List[dict]:
+        """Find other pressings of the same master whose tracklists carry lengths.
+
+        Walks the master's versions (same major format as the release first,
+        then the rest; the release itself is skipped), fetching each
+        candidate's tracklist through the cached ``get_release_by_id`` --
+        at most ``max_fetches`` real fetches (cache hits are free) -- and stops
+        early once ``want`` donors cover every track.  Results are cached per
+        release id.  ``on_progress(checked, budget, found)`` is called from the
+        calling thread.
+
+        Returns dicts: release_id, label, year, country, format, matched,
+        total, lengths ({"<target index>": "m:ss"}), best coverage first.
+        A donor is kept when at least one matched track has a length.
+        Raises on Discogs errors while listing versions.
+        """
+        key = int(release_id)
+        with self._donor_cache_lock:
+            cached = self._donor_cache.get(key)
+        if cached is not None:
+            return [dict(d) for d in cached]
+
+        release = self.get_release_by_id(key)
+        if release is None:
+            raise LookupError("Release not found or Discogs unavailable")
+        total = len(release.tracks)
+        master_id = getattr(release, "master_id", None)
+        if not master_id or total == 0:
+            with self._donor_cache_lock:
+                self._donor_cache[key] = []
+            return []
+
+        def notify(checked, found):
+            if on_progress:
+                on_progress(checked, max_fetches, found)
+
+        notify(0, 0)
+        my_format = (release.format or "").strip().lower()
+        my_year = self._year_of(release.year)
+
+        def same_format(v: dict) -> bool:
+            majors = v.get("major_formats") or []
+            if isinstance(majors, str):
+                majors = [majors]
+            names = [str(m).strip().lower() for m in majors]
+            if not names:
+                names = [str(v.get("format") or "").split(",")[0].strip().lower()]
+            return bool(my_format) and my_format in names
+
+        def year_gap(v: dict) -> int:
+            y = self._year_of(v.get("released") or v.get("year"))
+            return abs(y - my_year) if (y and my_year) else 9999
+
+        candidates = [
+            v for v in self._master_versions(int(master_id))
+            if v.get("id") is not None and int(v["id"]) != key
+        ]
+        candidates.sort(key=lambda v: (not same_format(v), year_gap(v)))
+
+        targets = [t.title for t in release.tracks]
+        donors = []
+        fetches = 0
+        for v in candidates:
+            vid = int(v["id"])
+            with self._release_cache_lock:
+                is_cached = vid in self._release_cache
+            if not is_cached:
+                if fetches >= max_fetches:
+                    continue
+                fetches += 1
+            donor = self.get_release_by_id(vid)
+            if not is_cached:
+                notify(fetches, len(donors))
+            if donor is None:
+                continue
+            matches = match_tracklists(targets, donor.tracks)
+            lengths = {str(m.target_index): m.length for m in matches if m.length}
+            if not lengths:
+                continue
+            donors.append(
+                {
+                    "release_id": vid,
+                    "label": v.get("label") or donor.label or "",
+                    "year": self._year_of(v.get("released") or v.get("year"))
+                    or self._year_of(donor.year) or "",
+                    "country": v.get("country") or "",
+                    "format": v.get("format") or donor.format or "",
+                    "matched": len(lengths),
+                    "total": total,
+                    "lengths": lengths,
+                    "_same": same_format(v),
+                    "_gap": year_gap(v),
+                }
+            )
+            if sum(1 for d in donors if d["matched"] == total) >= want:
+                break
+            if not is_cached:
+                notify(fetches, len(donors))
+
+        donors.sort(key=lambda d: (-d["matched"], not d["_same"], d["_gap"]))
+        result = [{k: v for k, v in d.items() if not k.startswith("_")} for d in donors]
+        notify(fetches, len(result))
+        with self._donor_cache_lock:
+            self._donor_cache[key] = result
+        return [dict(d) for d in result]
 
     def download_cover_art(self, url: str, output_path: Path, max_size=1400) -> bool:
         """
@@ -545,6 +737,48 @@ class MetadataHandler:
             audio.tags["APIC"] = APIC(
                 encoding=3, mime="image/jpeg", type=3, desc="Cover", data=tags.cover_data,
             )
+
+    def write_replaygain(
+        self,
+        file_path: Path,
+        output_format: str,
+        track_gain: Optional[str] = None,
+        track_peak: Optional[str] = None,
+        album_gain: Optional[str] = None,
+        album_peak: Optional[str] = None,
+    ) -> bool:
+        """Write ReplayGain 2.0 tags (already-formatted strings; None skips
+        that tag).  FLAC gets Vorbis comments, MP3/AIFF get ID3 TXXX frames.
+        """
+        values = {
+            "REPLAYGAIN_TRACK_GAIN": track_gain,
+            "REPLAYGAIN_TRACK_PEAK": track_peak,
+            "REPLAYGAIN_ALBUM_GAIN": album_gain,
+            "REPLAYGAIN_ALBUM_PEAK": album_peak,
+        }
+        values = {k: v for k, v in values.items() if v is not None}
+        if not values:
+            return False
+        try:
+            if output_format == "flac":
+                audio = FLAC(file_path)
+                for key, value in values.items():
+                    audio[key] = value
+            elif output_format in ("mp3", "aiff"):
+                audio = MP3(file_path, ID3=ID3) if output_format == "mp3" else AIFF(file_path)
+                try:
+                    audio.add_tags()
+                except Exception:
+                    pass  # Tags already exist
+                for key, value in values.items():
+                    audio.tags[f"TXXX:{key}"] = TXXX(encoding=3, desc=key, text=value)
+            else:
+                return False
+            audio.save()
+            return True
+        except Exception as e:
+            print(f"Failed to write ReplayGain tags to {file_path}: {e}")
+            return False
 
     def _tag_flac(
         self,

@@ -5,7 +5,6 @@ Track Boundaries, with no ffmpeg subprocess and no mocks:
 
 - ``parse_silence_log``      stderr text  -> list[Gap]
 - ``boundaries_from_gaps``   gaps + duration -> list[Track]
-- ``boundaries_from_durations``  Discogs durations -> list[Track]
 
 The headline case is the fade-to-EOF bug: when a side fades into silence
 at end-of-file, ffmpeg emits a final ``silence_start`` with no matching
@@ -21,7 +20,6 @@ from audio_processor import AudioProcessor
 from track_boundaries import (
     Gap,
     boundaries_for_track_count,
-    boundaries_from_durations,
     boundaries_from_gaps,
     parse_silence_log,
 )
@@ -150,27 +148,6 @@ def test_parse_ignores_garbage_lines():
     gaps = parse_silence_log(stderr)
 
     assert gaps == [Gap(180.0, 182.0)]
-
-
-# --- boundaries_from_durations ----------------------------------------------
-
-
-def test_durations_lay_tracks_back_to_back():
-    """Each duration becomes a Track laid end-to-end from t=0, numbered
-    sequentially, with each Track's length equal to its duration."""
-    tracks = boundaries_from_durations([180.0, 200.0, 240.0])
-
-    assert [(t.number, t.start, t.end) for t in tracks] == [
-        (1, 0.0, 180.0),
-        (2, 180.0, 380.0),
-        (3, 380.0, 620.0),
-    ]
-    # The last Track ends at the sum of all durations.
-    assert tracks[-1].end == 180.0 + 200.0 + 240.0
-
-
-def test_durations_empty_is_no_tracks():
-    assert boundaries_from_durations([]) == []
 
 
 # --- boundaries_for_track_count (Smart Rescan) -------------------------------
@@ -315,3 +292,322 @@ def test_detect_silence_wires_parse_and_boundaries():
     assert [(t.start, t.end) for t in tracks] == [(0.0, 180.0), (182.0, 360.0)]
     # The old _calculate_tracks would have produced (182.0, 400.0) here.
     assert all(t.end <= 360.0 for t in tracks)
+
+
+# ---------------------------------------------------------------------------
+# Envelope-based detection (synthetic numpy envelopes, 10 ms frames)
+# ---------------------------------------------------------------------------
+
+import numpy as np
+
+from track_boundaries import (
+    boundaries_from_expected_durations,
+    envelope_from_pcm,
+    gaps_from_envelope,
+    music_span,
+)
+
+FRAME = 0.01
+LOUD = -15.0
+QUIET = -60.0
+
+
+def make_env(segments):
+    """Build an envelope from [(seconds, level_db), ...]."""
+    return np.concatenate(
+        [np.full(int(round(sec / FRAME)), level, dtype=np.float32) for sec, level in segments]
+    )
+
+
+def test_envelope_from_pcm_levels():
+    full = np.full(800, 16384, dtype=np.int16)  # half scale -> -6.02 dBFS
+    silent = np.zeros(800, dtype=np.int16)
+    db = envelope_from_pcm(np.concatenate([full, silent]), 80)
+    assert len(db) == 20
+    assert abs(db[0] - (-6.02)) < 0.05
+    assert db[-1] == -120.0
+
+
+def test_gaps_from_envelope_basic_and_min_duration():
+    env = make_env([(5, LOUD), (2, QUIET), (5, LOUD), (0.2, QUIET), (5, LOUD)])
+    gaps = gaps_from_envelope(env, FRAME, -40.0, 0.5)
+    assert len(gaps) == 1
+    assert abs(gaps[0].start - 5.0) < 0.02 and abs(gaps[0].end - 7.0) < 0.02
+
+
+def test_gaps_from_envelope_open_gap_at_eof_and_leading_silence():
+    env = make_env([(3, QUIET), (5, LOUD), (4, QUIET)])
+    gaps = gaps_from_envelope(env, FRAME, -40.0, 1.0)
+    assert gaps[0].start == 0.0 and abs(gaps[0].end - 3.0) < 0.02
+    assert gaps[1].end is None and abs(gaps[1].start - 8.0) < 0.02
+
+
+def test_gaps_from_envelope_short_trailing_run_ignored():
+    env = make_env([(5, LOUD), (0.3, QUIET)])
+    assert gaps_from_envelope(env, FRAME, -40.0, 1.0) == []
+
+
+def test_music_span_trims_lead_in_and_run_out():
+    env = make_env([(8, QUIET), (30, LOUD), (10, QUIET)])
+    start, end = music_span(env, FRAME)
+    assert abs(start - 8.0) < 0.05
+    assert abs(end - 38.0) < 0.05
+
+
+def test_music_span_ignores_click_in_lead_in():
+    env = make_env([(3, QUIET), (0.08, -5.0), (5, QUIET), (30, LOUD), (6, QUIET)])
+    start, end = music_span(env, FRAME)
+    assert abs(start - 8.08) < 0.05
+    assert abs(end - 38.08) < 0.05
+
+
+def test_music_span_survives_brief_dips_in_music():
+    env = make_env([(2, QUIET), (10, LOUD), (0.05, QUIET), (10, LOUD), (2, QUIET)])
+    start, end = music_span(env, FRAME)
+    assert abs(start - 2.0) < 0.05
+    assert abs(end - 22.05) < 0.05
+
+
+def test_music_span_no_music_returns_whole_file():
+    env = make_env([(20, QUIET)])
+    assert music_span(env, FRAME) == (0.0, 20.0)
+
+
+def test_music_span_all_music():
+    env = make_env([(20, LOUD)])
+    start, end = music_span(env, FRAME)
+    assert start == 0.0 and abs(end - 20.0) < 0.02
+
+
+def _durs(result):
+    return [round(t.duration, 2) for t in result.tracks]
+
+
+def test_expected_durations_snaps_to_gaps():
+    gaps = [Gap(40.0, 43.0), Gap(93.0, 96.0)]
+    r = boundaries_from_expected_durations(gaps, 0.0, 131.0, [40, 50, 35])
+    assert len(r.tracks) == 3
+    assert [b.snapped for b in r.boundaries] == [True, True]
+    assert (r.tracks[0].start, r.tracks[0].end) == (0.0, 40.0)
+    assert (r.tracks[1].start, r.tracks[1].end) == (43.0, 93.0)
+    assert (r.tracks[2].start, r.tracks[2].end) == (96.0, 131.0)
+    assert not r.scale_clamped
+
+
+def test_expected_durations_single_track():
+    r = boundaries_from_expected_durations([], 5.0, 65.0, [60])
+    assert len(r.tracks) == 1 and r.boundaries == []
+    assert (r.tracks[0].start, r.tracks[0].end) == (5.0, 65.0)
+
+
+def test_expected_durations_no_gaps_cuts_at_expected_times():
+    r = boundaries_from_expected_durations([], 0.0, 125.0, [40, 50, 35])
+    assert len(r.tracks) == 3
+    assert not any(b.snapped for b in r.boundaries)
+    assert r.tracks[0].end == r.tracks[1].start == 40.0
+    assert r.tracks[1].end == r.tracks[2].start == 90.0
+    assert r.tracks[2].end == 125.0
+
+
+def test_expected_durations_gap_just_outside_tolerance_not_used():
+    gaps = [Gap(51.0, 53.0)]  # expected boundary at 40; distance 11 > 10
+    r = boundaries_from_expected_durations(gaps, 0.0, 125.0, [40, 50, 35], tolerance_s=10.0)
+    assert r.boundaries[0].snapped is False
+    assert r.tracks[0].end == 40.0
+
+
+def test_expected_durations_gap_just_inside_tolerance_used():
+    gaps = [Gap(48.0, 50.0)]  # distance 8 from expected 40
+    r = boundaries_from_expected_durations(gaps, 0.0, 125.0, [40, 50, 35], tolerance_s=10.0)
+    assert r.boundaries[0].snapped is True
+    assert r.tracks[0].end == 48.0 and r.tracks[1].start == 50.0
+
+
+def test_expected_durations_longer_slightly_farther_gap_wins():
+    near_short = Gap(41.0, 41.6)  # 0.6 s, 1 s away
+    far_long = Gap(43.0, 47.0)  # 4 s, 3 s away
+    r = boundaries_from_expected_durations(
+        [near_short, far_long], 0.0, 125.0, [40, 50, 35]
+    )
+    assert r.boundaries[0].gap == far_long
+
+
+def test_expected_durations_much_farther_gap_loses_to_close_one():
+    close = Gap(39.0, 41.0)
+    far = Gap(48.0, 50.0)
+    r = boundaries_from_expected_durations([far, close], 0.0, 125.0, [40, 50, 35])
+    assert r.boundaries[0].gap == close
+
+
+def test_expected_durations_lead_in_and_lead_out_not_used_as_separators():
+    gaps = [Gap(0.0, 8.0), Gap(48.0, 51.0), Gap(101.0, 104.0), Gap(139.0, None)]
+    r = boundaries_from_expected_durations(gaps, 8.0, 139.0, [40, 50, 35])
+    assert r.tracks[0].start == 8.0 and r.tracks[-1].end == 139.0
+    assert [b.snapped for b in r.boundaries] == [True, True]
+    assert r.tracks[0].end == 48.0 and r.tracks[1].start == 51.0
+
+
+def test_expected_durations_choices_strictly_increasing():
+    # One gap sits between both expected boundaries' windows; it can only
+    # serve one boundary, the other must fall back to a cut after it.
+    gaps = [Gap(60.0, 63.0)]
+    r = boundaries_from_expected_durations(gaps, 0.0, 100.0, [30, 30, 40], tolerance_s=40)
+    assert len(r.tracks) == 3
+    ends = [t.end for t in r.tracks]
+    starts = [t.start for t in r.tracks]
+    assert starts == sorted(starts) and ends == sorted(ends)
+    assert sum(b.snapped for b in r.boundaries) == 1
+    for t in r.tracks:
+        assert t.end >= t.start
+
+
+def test_expected_durations_scale_applied_within_clamp():
+    # 111 s of durations on a 110 s span (negative residual) -> scale model
+    r = boundaries_from_expected_durations([], 0.0, 110.0, [37, 37, 37])
+    assert r.model == "scale" and r.gap_s == 0.0
+    assert not r.scale_clamped
+    assert abs(r.scale - 110 / 111) < 1e-9
+    assert abs(r.tracks[0].end - 37 * 110 / 111) < 1e-9
+
+
+def test_expected_durations_scale_outside_clamp_uses_one_and_reports():
+    r = boundaries_from_expected_durations([], 0.0, 200.0, [40, 50, 35])
+    assert r.scale_clamped and r.scale == 1.0
+    assert abs(r.raw_scale - 200 / 125) < 1e-9
+    assert len(r.tracks) == 3
+    assert r.tracks[0].end == 40.0
+    assert r.tracks[-1].end == 200.0  # last track still ends at music_end
+
+
+# --- refine_cuts -----------------------------------------------------------
+
+from track_boundaries import Track, refine_cuts
+
+FADE = -35.0  # between -40 and -30
+
+
+def test_refine_keeps_fade_out_tail():
+    env = make_env([(10, LOUD), (2, FADE), (3, QUIET), (10, LOUD), (3, QUIET)])
+    out = refine_cuts(env, FRAME, [Track(1, 0.0, 10.0), Track(2, 15.0, 25.0)], -40.0)
+    assert abs(out[0].end - 12.0) < 0.02
+    assert out[1].start == 15.0 and abs(out[1].end - 25.0) < 0.02
+    assert abs(out[0].duration - 12.0) < 0.02
+
+
+def test_refine_keeps_fade_in():
+    env = make_env([(3, QUIET), (2, FADE), (10, LOUD), (3, QUIET)])
+    out = refine_cuts(env, FRAME, [Track(1, 5.0, 15.0)], -40.0)
+    assert abs(out[0].start - 3.0) < 0.02
+    assert abs(out[0].end - 15.0) < 0.02
+
+
+def test_refine_neighbours_never_overlap():
+    # Gap region stays above the threshold the whole way: tracks meet midway.
+    env = make_env([(10, LOUD), (4, FADE), (10, LOUD)])
+    out = refine_cuts(env, FRAME, [Track(1, 0.0, 10.0), Track(2, 14.0, 24.0)], -40.0)
+    assert out[0].end == out[1].start
+    assert abs(out[0].end - 12.0) < 0.02
+    assert out[0].start == 0.0 and abs(out[1].end - 24.0) < 0.02
+
+
+def test_refine_isolated_click_not_absorbed():
+    env = make_env([(2, QUIET), (0.05, -5.0), (3, QUIET), (10, LOUD), (3, QUIET), (0.05, -5.0), (2, QUIET)])
+    start = 5.05
+    out = refine_cuts(env, FRAME, [Track(1, start, start + 10.0)], -40.0)
+    assert abs(out[0].start - start) < 0.02
+    assert abs(out[0].end - (start + 10.0)) < 0.02
+
+
+def test_refine_respects_file_edges_and_count():
+    env = make_env([(10, FADE)])
+    tracks = [Track(1, 2.0, 5.0), Track(2, 6.0, 8.0)]
+    out = refine_cuts(env, FRAME, tracks, -40.0)
+    assert [t.number for t in out] == [1, 2]
+    assert out[0].start == 0.0
+    assert abs(out[-1].end - 10.0) < 0.02
+    assert out[0].end <= out[1].start
+
+
+def test_refine_empty():
+    assert refine_cuts(make_env([(5, LOUD)]), FRAME, [], -40.0) == []
+
+
+# --- gap-aware expected boundaries ------------------------------------------
+
+def _old_expected(durs, music_start, music_end):
+    """The previous proportional formula, for drift comparison."""
+    total = sum(durs)
+    raw = (music_end - music_start) / total
+    scale = raw if 0.9 <= raw <= 1.1 else 1.0
+    out, cum = [], 0.0
+    for d in durs[:-1]:
+        cum += d
+        out.append(music_start + cum * scale)
+    return out
+
+
+def test_gap_model_three_tracks_with_real_gaps():
+    gaps = [Gap(40.0, 43.0), Gap(93.0, 96.0)]
+    r = boundaries_from_expected_durations(gaps, 0.0, 131.0, [40, 50, 35])
+    assert r.model == "gap" and abs(r.gap_s - 3.0) < 1e-9
+    assert r.scale == 1.0 and not r.scale_clamped
+    assert [round(b.expected, 6) for b in r.boundaries] == [41.5, 94.5]
+    assert [b.snapped for b in r.boundaries] == [True, True]
+
+
+def test_gap_model_offset_by_music_start():
+    r = boundaries_from_expected_durations([], 10.0, 141.0, [40, 50, 35])
+    assert [round(b.expected, 6) for b in r.boundaries] == [51.5, 104.5]
+
+
+def test_gap_model_residual_zero_gives_zero_gap():
+    r = boundaries_from_expected_durations([], 0.0, 125.0, [40, 50, 35])
+    assert r.model == "gap" and abs(r.gap_s) < 1e-9
+    assert [b.expected for b in r.boundaries] == [40.0, 90.0]
+
+
+def test_negative_residual_uses_scale_model_within_clamp():
+    r = boundaries_from_expected_durations([], 0.0, 120.0, [40, 50, 35])
+    assert r.model == "scale" and r.gap_s == 0.0
+    assert not r.scale_clamped and abs(r.scale - 120 / 125) < 1e-9
+    assert abs(r.boundaries[0].expected - 40 * 120 / 125) < 1e-9
+
+
+def test_huge_residual_uses_scale_model_clamped():
+    # (200 - 125) / 2 = 37.5 s per gap > MAX_GAP_S
+    r = boundaries_from_expected_durations([], 0.0, 200.0, [40, 50, 35])
+    assert r.model == "scale" and r.gap_s == 0.0
+    assert r.scale_clamped and r.scale == 1.0
+    assert [b.expected for b in r.boundaries] == [40.0, 90.0]
+
+
+def test_max_gap_boundary_between_models():
+    # 2 tracks, 100 s of durations: a residual of 8 s is the gap-model limit, 8.5 is over
+    r = boundaries_from_expected_durations([], 0.0, 108.5, [50, 50])
+    assert r.model == "scale" and abs(r.scale - 1.085) < 1e-9
+    r2 = boundaries_from_expected_durations([], 0.0, 108.0, [50, 50])
+    assert r2.model == "gap" and abs(r2.gap_s - 8.0) < 1e-9
+
+
+def test_single_track_model_unchanged():
+    r = boundaries_from_expected_durations([], 5.0, 65.0, [60])
+    assert r.boundaries == [] and r.model == "scale" and r.gap_s == 0.0
+
+
+def test_eleven_track_gap_model_beats_proportional_drift():
+    durs = [320, 290, 310, 60, 45, 70, 50, 65, 55, 60, 40]
+    g = 2.5
+    start = 7.0
+    end = start + sum(durs) + g * (len(durs) - 1)
+    # true gap centres
+    truth, pos = [], start
+    for d in durs[:-1]:
+        pos += d
+        truth.append(pos + g / 2)
+        pos += g
+    r = boundaries_from_expected_durations([], start, end, durs)
+    assert r.model == "gap" and abs(r.gap_s - g) < 1e-9
+    new_err = max(abs(b.expected - t) for b, t in zip(r.boundaries, truth))
+    old_err = max(abs(e - t) for e, t in zip(_old_expected(durs, start, end), truth))
+    assert new_err < 0.1
+    assert old_err > 2.0

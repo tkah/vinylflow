@@ -5,9 +5,16 @@ pure functions over plain data turn audio analysis into Track Boundaries:
 
 - ``parse_silence_log``       ffmpeg silencedetect stderr -> list[Gap]
 - ``boundaries_from_gaps``    Gaps + total duration       -> list[Track]
-- ``boundaries_from_durations``  Discogs track durations  -> list[Track]
 - ``boundaries_for_track_count``  permissive-scan Gaps + a target Track
   count -> list[Track] (Smart Rescan: pick the likeliest separator Gaps)
+
+Envelope-based helpers (one decode, then everything in memory):
+
+- ``envelope_from_pcm``       int16 PCM -> per-frame RMS dBFS array
+- ``gaps_from_envelope``      envelope + threshold -> list[Gap]
+- ``music_span``              envelope -> (music_start, music_end)
+- ``boundaries_from_expected_durations``  Gaps + music span + Discogs
+  durations -> GuidedBoundaries (Tracks snapped to nearby Gaps)
 
 A **Gap** is a ``(start, end)`` span of detected silence.  A Track occupies
 the audio *between* consecutive Gaps.  The final Gap may be **open**
@@ -23,7 +30,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
+import numpy as np
 
 
 @dataclass(frozen=True)
@@ -56,6 +65,7 @@ class Track:
         self.duration = end - start
         self.vinyl_number = None  # Will be set during mapping (e.g., "A1", "B2")
         self.title = None  # Will be set from Discogs
+        self.declick = None  # Optional per-track click-removal override (None = panel setting)
 
     def format_time(self, seconds: float) -> str:
         """Format seconds as MM:SS."""
@@ -206,20 +216,293 @@ def boundaries_for_track_count(
     return boundaries_from_gaps(chosen, total_duration, min_track_length)
 
 
-def boundaries_from_durations(durations: List[float]) -> List[Track]:
-    """Lay Tracks end-to-end from Discogs durations (the fallback path).
+# ---------------------------------------------------------------------------
+# Envelope-based detection
+# ---------------------------------------------------------------------------
 
-    Used when silence detection fails: each duration becomes a Track placed
-    immediately after the previous one, starting at t=0, numbered
-    sequentially.
+ENVELOPE_FLOOR_DB = -120.0
+
+
+def envelope_from_pcm(samples: np.ndarray, frame_samples: int) -> np.ndarray:
+    """Per-frame RMS level in dBFS (float32) from mono int16 PCM.
+
+    A trailing partial frame is dropped.  Digital silence maps to
+    ``ENVELOPE_FLOOR_DB``.  Works in chunks so a 90-minute side does not
+    need a float copy of the whole signal.
     """
-    tracks: List[Track] = []
-    current_time = 0.0
+    n_frames = len(samples) // frame_samples
+    out = np.empty(n_frames, dtype=np.float32)
+    chunk_frames = max(1, (1 << 20) // frame_samples)
+    for i in range(0, n_frames, chunk_frames):
+        j = min(n_frames, i + chunk_frames)
+        block = samples[i * frame_samples : j * frame_samples].astype(np.float32) / 32768.0
+        block = block.reshape(-1, frame_samples)
+        mean_sq = np.mean(block * block, axis=1)
+        out[i:j] = 10.0 * np.log10(np.maximum(mean_sq, 1e-12))
+    return np.maximum(out, ENVELOPE_FLOOR_DB)
 
-    for num, duration in enumerate(durations, start=1):
-        start = current_time
-        end = current_time + duration
-        tracks.append(Track(num, start, end))
-        current_time = end
 
-    return tracks
+def _runs(mask: np.ndarray) -> List[Tuple[int, int]]:
+    """Half-open index runs ``[start, end)`` where ``mask`` is True."""
+    if mask.size == 0:
+        return []
+    padded = np.concatenate(([False], mask.astype(bool), [False]))
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    return [(int(a), int(b)) for a, b in zip(edges[0::2], edges[1::2])]
+
+
+def gaps_from_envelope(
+    db: np.ndarray, frame_s: float, threshold_db: float, min_silence_s: float
+) -> List[Gap]:
+    """Gaps from an envelope, mirroring ffmpeg ``silencedetect``.
+
+    A run of frames below ``threshold_db`` lasting at least
+    ``min_silence_s`` is a Gap.  A run that reaches the end of the
+    envelope is an open Gap (``end=None``).
+    """
+    gaps: List[Gap] = []
+    n = len(db)
+    for a, b in _runs(db < threshold_db):
+        if (b - a) * frame_s + 1e-9 < min_silence_s:
+            continue
+        gaps.append(Gap(a * frame_s, None if b >= n else b * frame_s))
+    return gaps
+
+
+# Vinyl surface noise and an empty lead-in/run-out groove normally sit
+# around -50..-60 dBFS; music (even quiet passages) spends its time above
+# -35.  -38 dB is just above the noise and below quiet music, and matches
+# the app's default silence threshold of -40 dB.  Requiring ~1 s of
+# sustained level (90% of frames, so brief dips between notes don't break
+# it) rejects needle-drop thumps and clicks, which last tens to a few
+# hundred milliseconds.
+MUSIC_FLOOR_DB = -38.0
+MUSIC_SUSTAIN_S = 1.0
+MUSIC_SUSTAIN_FRACTION = 0.9
+
+
+def music_span(
+    db: np.ndarray,
+    frame_s: float,
+    floor_db: float = MUSIC_FLOOR_DB,
+    sustain_s: float = MUSIC_SUSTAIN_S,
+    sustain_fraction: float = MUSIC_SUSTAIN_FRACTION,
+) -> Tuple[float, float]:
+    """``(music_start, music_end)`` with lead-in and run-out trimmed.
+
+    Music starts where the level first stays above ``floor_db`` for
+    ``sustain_s`` (at least ``sustain_fraction`` of the frames in that
+    window) and ends at the last such point.  Returns ``(0, total)`` when
+    no sustained music is found.
+    """
+    total = len(db) * frame_s
+    n = len(db)
+    win = max(1, int(round(sustain_s / frame_s)))
+    if n < win:
+        return 0.0, total
+
+    above = (db > floor_db).astype(np.int32)
+    csum = np.concatenate(([0], np.cumsum(above)))
+    counts = csum[win:] - csum[:-win]  # above-count of window starting at i
+    ok = np.flatnonzero(counts >= sustain_fraction * win)
+    if ok.size == 0:
+        return 0.0, total
+
+    first_win, last_win = int(ok[0]), int(ok[-1])
+    # Tighten to the actual first/last above-floor frame inside the windows.
+    start_idx = first_win + int(np.argmax(above[first_win : first_win + win]))
+    tail = above[last_win : last_win + win]
+    end_idx = last_win + (len(tail) - int(np.argmax(tail[::-1])))
+    return start_idx * frame_s, min(end_idx, n) * frame_s
+
+
+@dataclass(frozen=True)
+class BoundaryInfo:
+    """How one internal Track Boundary was placed."""
+
+    index: int  # 1 = boundary between track 1 and 2
+    expected: float  # where the Discogs durations put it (gap centre or scaled)
+    snapped: bool
+    gap: Optional[Gap]  # the chosen Gap when snapped
+    position: float  # where the cut actually landed (gap midpoint if snapped)
+
+
+@dataclass
+class GuidedBoundaries:
+    tracks: List[Track]
+    boundaries: List[BoundaryInfo]
+    scale: float  # scale actually applied to the Discogs durations
+    scale_clamped: bool  # True when span/total was outside the clamp (scale=1.0)
+    raw_scale: float
+    model: str = "scale"  # 'gap' (lengths exclude gaps) or 'scale' (proportional)
+    gap_s: float = 0.0  # per-gap silence assumed by the gap model; 0.0 in 'scale'
+
+
+# Snap scoring: a Gap's length (capped) minus a penalty per second of
+# distance from the expected time.  1 s away costs 0.25 s of gap length, so
+# a clearly longer gap beats a slightly closer short one, but a long gap at
+# the edge of the window does not beat a decent gap right on target.
+SNAP_GAP_CAP_S = 6.0
+SNAP_DISTANCE_PENALTY = 0.25
+SNAP_MIN_SEPARATION_S = 1.0
+
+# Largest per-gap residual (seconds) still read as "Discogs lengths exclude the
+# silent gaps between tracks"; beyond it the lengths are assumed wrong/partial.
+MAX_GAP_S = 8.0
+
+
+def boundaries_from_expected_durations(
+    gaps: List[Gap],
+    music_start: float,
+    music_end: float,
+    durations: List[float],
+    tolerance_s: float = 10.0,
+    scale_clamp: Tuple[float, float] = (0.9, 1.1),
+) -> GuidedBoundaries:
+    """Place Track Boundaries from Discogs durations, snapped to Gaps.
+
+    Discogs lengths usually exclude the 2-4 s silent gaps between vinyl
+    tracks.  With ``n`` tracks, ``residual = span - sum(durations)`` and
+    ``0 <= residual / (n - 1) <= MAX_GAP_S``, the **gap model** applies:
+    ``gap = residual / (n - 1)``, scale 1.0, and expected boundary ``k`` is
+    the middle of gap ``k``: ``music_start + cum_k + (k-1)*gap + gap/2``.
+    Otherwise (negative residual, or a per-gap residual above MAX_GAP_S) the
+    **scale model** applies: cumulative durations are scaled onto the span
+    (scale clamped to ``scale_clamp``; outside it the scale is 1.0 and
+    ``scale_clamped`` is reported).  ``model`` / ``gap_s`` report which.
+
+    Each internal boundary is snapped to the best closed Gap whose distance
+    from the expected time is within ``tolerance_s`` (also limited to 40% of
+    the shorter neighbouring track), scored by length minus a distance
+    penalty, and kept strictly increasing.  With no usable Gap the cut falls
+    on the expected time.
+
+    Always returns exactly ``len(durations)`` Tracks.
+    """
+    if not durations:
+        raise ValueError("durations must not be empty")
+
+    total = float(sum(durations))
+    span = max(0.0, music_end - music_start)
+    raw_scale = span / total if total > 0 else 1.0
+    lo, hi = scale_clamp
+    clamped = not (lo <= raw_scale <= hi)
+    scale = 1.0 if clamped else raw_scale
+
+    n = len(durations)
+    model = "scale"
+    gap_s = 0.0
+    if n > 1:
+        per_gap = (span - total) / (n - 1)
+        if 0.0 <= per_gap <= MAX_GAP_S:
+            model, gap_s, scale = "gap", per_gap, 1.0
+
+    closed = [g for g in gaps if g.end is not None]
+    infos: List[BoundaryInfo] = []
+    track_starts = [music_start]
+    track_ends: List[float] = []
+    prev_pos = music_start  # end of the previous chosen cut (monotonic floor)
+
+    cum = 0.0
+    for i in range(len(durations) - 1):
+        cum += durations[i]
+        if model == "gap":
+            expected = music_start + cum + i * gap_s + gap_s / 2
+        else:
+            expected = music_start + cum * scale
+        tol = min(
+            tolerance_s,
+            0.4 * min(durations[i], durations[i + 1]) * scale,
+        )
+
+        best: Optional[Gap] = None
+        best_score = float("-inf")
+        for g in closed:
+            if g.start < music_start or g.end > music_end:
+                continue
+            if g.start < prev_pos + SNAP_MIN_SEPARATION_S:
+                continue
+            if g.start <= expected <= g.end:
+                dist = 0.0
+            else:
+                dist = min(abs(g.start - expected), abs(g.end - expected))
+            if dist > tol:
+                continue
+            score = min(g.end - g.start, SNAP_GAP_CAP_S) - SNAP_DISTANCE_PENALTY * dist
+            if score > best_score:
+                best, best_score = g, score
+
+        if best is not None:
+            track_ends.append(best.start)
+            track_starts.append(best.end)
+            prev_pos = best.end
+            infos.append(
+                BoundaryInfo(i + 1, expected, True, best, (best.start + best.end) / 2)
+            )
+        else:
+            cut = min(max(expected, prev_pos), music_end)
+            track_ends.append(cut)
+            track_starts.append(cut)
+            prev_pos = cut
+            infos.append(BoundaryInfo(i + 1, expected, False, None, cut))
+
+    track_ends.append(music_end)
+    tracks = [
+        Track(n, s, max(s, e)) for n, (s, e) in enumerate(zip(track_starts, track_ends), start=1)
+    ]
+    return GuidedBoundaries(
+        tracks, infos, scale, clamped and model == "scale", raw_scale, model, gap_s
+    )
+
+
+def refine_cuts(
+    db: np.ndarray, frame_s: float, tracks: List[Track], threshold_db: float
+) -> List[Track]:
+    """Widen each Track over adjacent audio that is still above ``threshold_db``.
+
+    Gap-based cuts sit at the edge of the gap as found at a (possibly more
+    permissive) threshold, which clips quiet fade-ins and fade-outs.  Each
+    start walks backwards, and each end forwards, while the neighbouring
+    frame is above ``threshold_db``.  The walk stops at the first quiet
+    frame, so a click separated from the music by quiet frames is not
+    absorbed.  Walks never cross the neighbouring Track's original edge, 0,
+    or the end of the envelope; if two neighbours both walk through a
+    gap that never drops below the threshold they meet in its middle.
+    Track numbers and count are kept; durations are recomputed.
+    """
+    n = len(db)
+    if not tracks:
+        return []
+
+    def idx(t: float) -> int:
+        return max(0, min(n, int(round(t / frame_s))))
+
+    starts = [idx(t.start) for t in tracks]
+    ends = [idx(t.end) for t in tracks]
+    new_starts = list(starts)
+    new_ends = list(ends)
+
+    for k in range(len(tracks)):
+        lo = ends[k - 1] if k > 0 else 0
+        hi = starts[k + 1] if k + 1 < len(tracks) else n
+        i = starts[k]
+        while i > lo and db[i - 1] > threshold_db:
+            i -= 1
+        new_starts[k] = i
+        j = ends[k]
+        while j < hi and db[j] > threshold_db:
+            j += 1
+        new_ends[k] = j
+
+    for k in range(len(tracks) - 1):
+        if new_ends[k] > new_starts[k + 1]:
+            mid = (new_ends[k] + new_starts[k + 1]) // 2
+            new_ends[k] = new_starts[k + 1] = mid
+
+    refined = []
+    for t, s, e in zip(tracks, new_starts, new_ends):
+        # Keep the original time when the walk didn't move it (no float drift).
+        start = t.start if s == idx(t.start) else s * frame_s
+        end = t.end if e == idx(t.end) else e * frame_s
+        refined.append(Track(t.number, start, max(start, end)))
+    return refined

@@ -7,8 +7,12 @@ Supports WAV and AIFF input, with FLAC, MP3, and AIFF output.
 """
 
 import os
+import re
+import math
+import hashlib
 import uuid
 import shutil
+import threading
 from pathlib import Path
 from subprocess import CalledProcessError
 from typing import List, Optional
@@ -32,7 +36,32 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import Config
-from audio_processor import AudioProcessor, SUPPORTED_INPUT_EXTENSIONS, OUTPUT_FORMATS, run_ffmpeg
+from audio_processor import (
+    AudioProcessor,
+    SUPPORTED_INPUT_EXTENSIONS,
+    OUTPUT_FORMATS,
+    ENVELOPE_FRAME_S,
+    run_ffmpeg,
+    build_export_filters,
+    hiss_filter,
+    removed_graph,
+    trim_filter,
+    seek_args,
+    DECLICK_LEVELS,
+    HISS_LEVELS,
+    HUM_FREQS,
+    LEGACY_RESTORE,
+    NoiseProfile,
+    album_gain_db,
+    Loudness,
+)
+import click_detection
+import silence_analysis
+from track_boundaries import (
+    boundaries_from_expected_durations,
+    gaps_from_envelope,
+    music_span,
+)
 from metadata_handler import MetadataHandler
 from backend.sessions import (
     OutputSpec,
@@ -168,6 +197,10 @@ def cleanup_session(file_id: str) -> bool:
         print(f"Cleanup failed for {file_id}: {e}")
         session_store.remove(file_id)
         return False
+    finally:
+        _envelope_tasks.pop(file_id, None)
+        _analysis_tasks.pop(file_id, None)
+        _drop_click_scans(file_id)
 
 
 # Background cleanup task
@@ -216,14 +249,16 @@ class AnalyzeRequest(BaseModel):
     file_id: str
 
 
-class DurationBasedAnalyzeRequest(BaseModel):
-    file_id: str
-    discogs_durations: List[float]
-
-
 class RescanRequest(BaseModel):
     file_id: str
     expected_tracks: int
+
+
+class GuidedAnalyzeRequest(BaseModel):
+    file_id: str
+    expected_tracks: int
+    # One entry per expected track; null for tracks Discogs has no length for.
+    durations: Optional[List[Optional[float]]] = None
 
 
 class SearchRequest(BaseModel):
@@ -241,6 +276,36 @@ class TrackBoundary(BaseModel):
     start: float
     end: float
     duration: float
+    declick: Optional[str] = None  # per-track override; None = the panel setting
+
+
+def _legacy_restore(level: Optional[int]) -> tuple:
+    """Map the legacy ``restoration_level`` (0/1) to (rumble, declick)."""
+    if level not in (0, 1):
+        raise HTTPException(status_code=400, detail="restoration_level must be 0 or 1")
+    return LEGACY_RESTORE if level == 1 else (False, "off")
+
+
+def _check_declick(value: str) -> str:
+    if value not in DECLICK_LEVELS:
+        raise HTTPException(
+            status_code=400, detail="declick must be off, light, medium or strong"
+        )
+    return value
+
+
+def _check_hiss(value: str) -> str:
+    if value not in HISS_LEVELS:
+        raise HTTPException(
+            status_code=400, detail="hiss_reduction must be off, light, medium or strong"
+        )
+    return value
+
+
+def _check_hum_freq(value) -> int:
+    if isinstance(value, bool) or value not in HUM_FREQS:
+        raise HTTPException(status_code=400, detail="hum_freq must be 50 or 60")
+    return int(value)
 
 
 class ProcessRequest(BaseModel):
@@ -250,8 +315,14 @@ class ProcessRequest(BaseModel):
     reversed: bool = False
     track_boundaries: Optional[List[TrackBoundary]] = None
     output_format: str = "flac"  # 'flac', 'mp3', or 'aiff'
-    restoration_level: int = 0   # 0=none, 1=light clean, 2=full restore
-    hum_freq: int = 50           # Electrical hum frequency in Hz (50=EU, 60=US)
+    rumble_filter: Optional[bool] = None  # 15 Hz high-pass
+    declick: Optional[str] = None         # off | light | medium | strong
+    restoration_level: Optional[int] = None  # legacy: 1 = rumble + light declick
+    hum_filter: bool = False     # mains-hum notch
+    hum_freq: int = 60           # 50 | 60 Hz (ignored while hum_filter is off, so old clients sending 50 are harmless)
+    hiss_reduction: str = "off"  # off | light | medium | strong
+    album_gain: bool = False     # one gain for the whole album to -14 LUFS
+    replaygain: bool = True      # write ReplayGain 2.0 track + album tags
 
 
 class ConfigUpdate(BaseModel):
@@ -260,6 +331,17 @@ class ConfigUpdate(BaseModel):
     min_track_length: Optional[float] = None
     output_dir: Optional[str] = None
     track_numbering: Optional[str] = None
+    output_format: Optional[str] = None
+    bit_depth: Optional[str] = None
+    rumble_filter: Optional[bool] = None
+    declick: Optional[str] = None
+    restoration_level: Optional[int] = None  # legacy: 1 = rumble + light declick, 0 = both off
+    hum_filter: Optional[bool] = None
+    hum_freq: Optional[int] = None           # 50 | 60
+    hiss_reduction: Optional[str] = None     # off | light | medium | strong
+    hiss_strength: Optional[str] = None      # remembered strength (light | medium | strong)
+    album_gain: Optional[bool] = None
+    replaygain: Optional[bool] = None
 
 
 class DiscogsSetupRequest(BaseModel):
@@ -323,6 +405,269 @@ async def get_output_formats():
             for fmt_id, fmt in OUTPUT_FORMATS.items()
         ]
     }
+
+
+# Energy envelope (per-frame RMS dBFS), computed once per Session in the
+# background at upload and cached as envelope.npy in the session dir.  The
+# task's result is the array itself, so endpoints just await it instead of
+# re-decoding.  file_id -> Task[np.ndarray]
+_envelope_tasks: dict = {}
+
+
+def _load_or_compute_envelope(file_id: str, file_path: Path):
+    """Blocking: load envelope.npy if cached, else decode and cache it."""
+    import numpy as np
+
+    cache_path = get_session_path(file_id, "envelope.npy")
+    if cache_path.exists():
+        try:
+            return np.load(cache_path)
+        except Exception:
+            cache_path.unlink(missing_ok=True)  # corrupt cache: recompute
+
+    db = audio_processor.compute_envelope(file_path)
+
+    # Write via a temp file + atomic rename so a reader never sees a
+    # half-written cache.  Caching is best-effort (the session dir may have
+    # been removed while we were decoding).
+    part_path = get_session_path(file_id, f"envelope.{uuid.uuid4().hex[:8]}.part")
+    try:
+        with open(part_path, "wb") as f:
+            np.save(f, db)
+        os.replace(part_path, cache_path)
+    except OSError:
+        part_path.unlink(missing_ok=True)
+    return db
+
+
+async def _run_envelope(file_id: str, file_path: Path):
+    db = await asyncio.to_thread(_load_or_compute_envelope, file_id, file_path)
+    start, end = music_span(db, ENVELOPE_FRAME_S)
+    await broadcast_message(
+        {
+            "type": "scan_complete",
+            "file_id": file_id,
+            "music_start": start,
+            "music_end": end,
+            "music_duration": max(0.0, end - start),
+        }
+    )
+    return db
+
+
+def start_envelope(file_id: str, file_path: Path) -> "asyncio.Task":
+    """Start (or join) the envelope computation for a Session."""
+    task = _envelope_tasks.get(file_id)
+    if task is None:
+        task = asyncio.create_task(_run_envelope(file_id, file_path))
+        _envelope_tasks[file_id] = task
+
+        def _done(t: "asyncio.Task") -> None:
+            # Failed scans must not poison later requests: drop the task so
+            # the next caller retries.
+            if t.cancelled() or t.exception() is not None:
+                if t.exception() is not None:
+                    print(f"Envelope scan failed for {file_id}: {t.exception()}")
+                if _envelope_tasks.get(file_id) is t:
+                    _envelope_tasks.pop(file_id, None)
+
+        task.add_done_callback(_done)
+    return task
+
+
+async def get_envelope(session: Session):
+    """Awaitable accessor: in-flight task -> cache on disk -> compute now."""
+    task = start_envelope(session.id, session.source_audio)
+    # shield: a cancelled request must not cancel the shared background scan.
+    return await asyncio.shield(task)
+
+
+# --- Silent-stretch analysis (plan 07 slice 4): hum detector + noise profile --------
+# One background task per file_id; the result is cached as silence_analysis.json in
+# the session dir.  It decodes only the silent stretches (<= ~30 s), so it is cheap.
+_analysis_tasks: dict = {}
+
+
+def _compute_silence_analysis(file_id: str, source: Path, db) -> dict:
+    """Blocking: cached result, else analyse the silent stretches and cache it."""
+    cache = silence_analysis.cache_path(get_session_path(file_id))
+    cached = silence_analysis.read_cache(cache)
+    if cached is not None:
+        return cached
+    _, rate = audio_processor.probe_info(source)
+    result = silence_analysis.analyze_source(source, db, ENVELOPE_FRAME_S, int(rate or 44100))
+    silence_analysis.write_cache(cache, result)
+    return result
+
+
+async def _run_silence_analysis(session: Session) -> dict:
+    db = await get_envelope(session)
+    return await asyncio.to_thread(
+        _compute_silence_analysis, session.id, session.source_audio, db
+    )
+
+
+async def get_silence_analysis(session: Session) -> dict:
+    """Awaitable accessor: in-flight task -> cache on disk -> compute now."""
+    task = _analysis_tasks.get(session.id)
+    if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
+        task = asyncio.create_task(_run_silence_analysis(session))
+        _analysis_tasks[session.id] = task
+    # shield: a cancelled request must not cancel the shared analysis.
+    return await asyncio.shield(task)
+
+
+async def _noise_profile_for(session: Session) -> Optional[NoiseProfile]:
+    """The file's measured NoiseProfile for hiss reduction, or None (generic
+    fallback chain) when the analysis finds no usable silence or fails."""
+    try:
+        data = await get_silence_analysis(session)
+    except Exception as e:
+        logger.warning(f"Noise profile unavailable for {session.id}: {e}")
+        return None
+    return NoiseProfile.from_analysis(data.get("noise"))
+
+
+@app.get("/api/hum/{file_id}")
+async def get_hum(file_id: str):
+    """Mains-hum detection (50/60 Hz + harmonics) in the file's silent stretches.
+
+    ``{detected: 50|60|null, level_dbfs, prominence_db, harmonics: [Hz...]}`` plus
+    ``analyzed_s`` (audio examined) and ``noise`` (the surface-noise profile that
+    hiss reduction uses, or null).  Cached in the session dir.
+    """
+    session = session_store.get(file_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    try:
+        data = await get_silence_analysis(session)
+    except Exception as e:
+        logger.error(f"Hum analysis failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Hum analysis failed: {e}")
+    return {**data["hum"], "analyzed_s": data.get("analyzed_s", 0.0), "noise": data.get("noise")}
+
+
+# --- Click scans (plan 07 slice 2) --------------------------------------------
+# One background task per (file_id, strength); results cached as
+# clicks_<strength>.json in the session dir.  Progress lives in memory.
+_click_tasks: dict = {}      # (file_id, strength) -> asyncio.Task
+_click_progress: dict = {}   # (file_id, strength) -> 0..1
+_click_errors: dict = {}     # (file_id, strength) -> message
+_click_cancel: dict = {}     # file_id -> threading.Event
+
+
+def _drop_click_scans(file_id: str) -> None:
+    """Cancel and forget every click scan of a removed Session."""
+    event = _click_cancel.pop(file_id, None)
+    if event is not None:
+        event.set()  # the worker thread checks this between chunks
+    for key in [k for k in _click_tasks if k[0] == file_id]:
+        task = _click_tasks.pop(key, None)
+        if task is not None and not task.done():
+            task.cancel()
+    for d in (_click_progress, _click_errors):
+        for key in [k for k in d if k[0] == file_id]:
+            d.pop(key, None)
+
+
+def _click_cached(file_id: str, strength: str) -> Optional[dict]:
+    return click_detection.read_cache(click_detection.cache_path(get_session_path(file_id), strength), strength)
+
+
+def _click_view(file_id: str, strength: str, requested: str, payload: Optional[dict]) -> dict:
+    """Response body shared by POST and GET /api/clicks."""
+    key = (file_id, strength)
+    base = {"strength": strength, "requested": requested}
+    if payload is not None:
+        return {**base, "status": "done", "progress": 1.0, "count": payload["count"],
+                "times": payload["times"], "music_start": payload.get("music_start"),
+                "music_end": payload.get("music_end"), "scanned_at": payload.get("scanned_at")}
+    task = _click_tasks.get(key)
+    if task is not None and not task.done():
+        return {**base, "status": "running", "progress": _click_progress.get(key, 0.0)}
+    if key in _click_errors:
+        return {**base, "status": "error", "progress": 0.0, "error": _click_errors[key]}
+    return {**base, "status": "none", "progress": 0.0}
+
+
+async def _run_click_scan(file_id: str, session: Session, strength: str) -> None:
+    key = (file_id, strength)
+    loop = asyncio.get_running_loop()
+    cancel = _click_cancel.setdefault(file_id, threading.Event())
+    db = await get_envelope(session)
+    start, end = music_span(db, ENVELOPE_FRAME_S)
+    if end - start <= 0:
+        start, end = 0.0, session.source_duration
+
+    def progress(fraction: float) -> None:
+        _click_progress[key] = fraction
+        asyncio.run_coroutine_threadsafe(
+            broadcast_message({"type": "click_scan_progress", "file_id": file_id,
+                               "strength": strength, "progress": fraction}),
+            loop,
+        )
+
+    times = await asyncio.to_thread(
+        click_detection.scan_clicks, session.source_audio, start, end, strength,
+        session.source_duration, progress, cancel.is_set,
+    )
+    payload = click_detection.make_payload(strength, start, end, times)
+    click_detection.write_cache(click_detection.cache_path(get_session_path(file_id), strength), payload)
+    await broadcast_message({"type": "click_scan_complete", "file_id": file_id,
+                             "strength": strength, "count": len(times)})
+
+
+def start_click_scan(session: Session, strength: str) -> "asyncio.Task":
+    """Start (or join) the click scan of a Session at ``strength``."""
+    key = (session.id, strength)
+    task = _click_tasks.get(key)
+    if task is None or task.done():
+        _click_errors.pop(key, None)
+        _click_progress[key] = 0.0
+        task = asyncio.create_task(_run_click_scan(session.id, session, strength))
+        _click_tasks[key] = task
+
+        def _done(t: "asyncio.Task") -> None:
+            if t.cancelled():
+                return
+            if t.exception() is not None:
+                print(f"Click scan failed for {key}: {t.exception()}")
+                _click_errors[key] = str(t.exception())
+                asyncio.ensure_future(broadcast_message({
+                    "type": "click_scan_complete", "file_id": key[0], "strength": key[1],
+                    "count": 0, "error": str(t.exception())}))
+
+        task.add_done_callback(_done)
+    return task
+
+
+class ClickScanRequest(BaseModel):
+    declick: str = "medium"   # panel strength; "off" scans at medium
+
+
+@app.post("/api/clicks/{file_id}")
+async def post_clicks(file_id: str, req: ClickScanRequest):
+    """Start (or join) a click scan; a cached result returns immediately."""
+    session = session_store.get(file_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    requested = _check_declick(req.declick)
+    strength = click_detection.scan_strength(requested)
+    cached = _click_cached(file_id, strength)
+    if cached is None:
+        start_click_scan(session, strength)
+    return _click_view(file_id, strength, requested, cached)
+
+
+@app.get("/api/clicks/{file_id}")
+async def get_clicks(file_id: str, declick: str = "medium"):
+    """Scan state / result for the strength the panel maps to; never blocks."""
+    session = session_store.get(file_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    requested = _check_declick(declick)
+    strength = click_detection.scan_strength(requested)
+    return _click_view(file_id, strength, requested, _click_cached(file_id, strength))
 
 
 async def preconvert_to_mp3(file_id: str, file_path: Path):
@@ -395,12 +740,15 @@ async def upload_files(files: List[UploadFile] = File(...)):
         file_size = file_path.stat().st_size
 
         # Get duration using audio processor (off the event loop)
+        # One header read gives duration and source bit depth.
         try:
-            duration = await asyncio.to_thread(audio_processor.get_audio_duration, file_path)
+            duration, source_bit_depth = await asyncio.to_thread(
+                audio_processor.probe_audio, file_path
+            )
             if duration is None:
                 duration = 0
         except Exception:
-            duration = 0
+            duration, source_bit_depth = 0, None
 
         session_store.create(
             session_id=file_id,
@@ -408,10 +756,13 @@ async def upload_files(files: List[UploadFile] = File(...)):
             source_filename=file.filename,
             source_duration=float(duration),
             source_size=file_size,
+            source_bit_depth=source_bit_depth,
         )
 
         # Start MP3 conversion in background (for fast waveform loading)
         asyncio.create_task(preconvert_to_mp3(file_id, file_path))
+        # ...and the energy envelope (music span + instant silence rescans).
+        start_envelope(file_id, file_path)
 
         uploaded.append(
             {"id": file_id, "filename": file.filename, "size": file_size, "duration": duration}
@@ -506,10 +857,11 @@ async def rescan_file(request: RescanRequest):
     )
 
     try:
-        # Same full-file ffmpeg decode as /api/analyze (possibly several) —
-        # keep it off the event loop.
+        # Ladder sweep runs in memory over the cached envelope (awaiting the
+        # background scan if it is still decoding) — no per-rung ffmpeg run.
+        db = await get_envelope(session)
         tracks, scan_info = await asyncio.to_thread(
-            audio_processor.detect_tracks_for_count, file_path, request.expected_tracks
+            audio_processor.tracks_for_count_from_envelope, db, request.expected_tracks
         )
 
         tracks_data = [
@@ -542,58 +894,110 @@ async def rescan_file(request: RescanRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/analyze-duration-based")
-async def analyze_duration_based(request: DurationBasedAnalyzeRequest):
+@app.get("/api/scan/{file_id}")
+async def get_scan(file_id: str):
+    """Music span from the background envelope scan; never blocks on it."""
+    session = session_store.get(file_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    task = _envelope_tasks.get(file_id)
+    if task is None and get_session_path(file_id, "envelope.npy").exists():
+        db = await get_envelope(session)  # cached on disk: quick load
+    elif task is not None and task.done() and not task.cancelled() and task.exception() is None:
+        db = task.result()
+    else:
+        return {"ready": False}
+
+    start, end = music_span(db, ENVELOPE_FRAME_S)
+    return {
+        "ready": True,
+        "music_start": start,
+        "music_end": end,
+        "music_duration": max(0.0, end - start),
+    }
+
+
+@app.post("/api/analyze-guided")
+async def analyze_guided(request: GuidedAnalyzeRequest):
     """
-    Create track boundaries based on Discogs track durations.
-    Fallback method when silence detection fails.
+    Place track boundaries using the cached envelope.  With a Discogs
+    duration for every expected track, boundaries are laid out from those
+    lengths over the music span and snapped to nearby silence gaps;
+    otherwise the Smart Rescan ladder is swept in memory for the count.
     """
+    if not 1 <= request.expected_tracks <= 99:
+        raise HTTPException(status_code=422, detail="expected_tracks must be between 1 and 99")
+
     session = session_store.get(request.file_id)
     if session is None:
         raise HTTPException(status_code=404, detail="File not found")
 
-    file_path = session.source_audio
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Audio file not found")
+    durations = request.durations
+    use_durations = (
+        durations is not None
+        and len(durations) == request.expected_tracks
+        and all(d is not None and d > 0 for d in durations)
+    )
 
     try:
-        # Use existing duration-based splitting method
-        processor = AudioProcessor(
-            silence_threshold=config.default_silence_threshold,
-            min_silence_duration=config.default_min_silence_duration,
-            min_track_length=config.default_min_track_length,
-        )
+        db = await get_envelope(session)
 
-        tracks = processor.split_tracks_duration_based(
-            file_path,
-            request.discogs_durations,
-            verbose=True
-        )
+        def _compute():
+            music_start, music_end = music_span(db, ENVELOPE_FRAME_S)
+            if use_durations:
+                gaps = gaps_from_envelope(
+                    db,
+                    ENVELOPE_FRAME_S,
+                    audio_processor.SMART_RESCAN_LADDER[0][0],
+                    audio_processor.SMART_RESCAN_LADDER[0][1],
+                )
+                result = boundaries_from_expected_durations(
+                    gaps, music_start, music_end, [float(d) for d in durations]
+                )
+                refined = audio_processor.refine_tracks(db, result.tracks)
+                return refined, True, result, music_start, music_end
+            tracks, info = audio_processor.tracks_for_count_from_envelope(
+                db, request.expected_tracks
+            )
+            return tracks, info["matched"], None, music_start, music_end
 
+        tracks, matched, guided, music_start, music_end = await asyncio.to_thread(_compute)
         session.set_boundaries(tracks)
 
-        # Broadcast via WebSocket
-        await broadcast_message({
-            "type": "analysis_complete",
-            "file_id": request.file_id,
-            "track_count": len(tracks),
-            "method": "duration_based"
-        })
+        boundaries = []
+        if guided is not None:
+            boundaries = [
+                {
+                    "index": b.index,
+                    "expected": b.expected,
+                    "snapped": b.snapped,
+                    "position": b.position,
+                    "gap": {"start": b.gap.start, "end": b.gap.end} if b.gap else None,
+                }
+                for b in guided.boundaries
+            ]
 
         return {
             "tracks": [
-                {
-                    "number": track.number,
-                    "start": track.start,
-                    "end": track.end,
-                    "duration": track.duration,
-                }
-                for track in tracks
-            ]
+                {"number": i + 1, "start": t.start, "end": t.end, "duration": t.duration}
+                for i, t in enumerate(tracks)
+            ],
+            "method": "durations" if use_durations else "count",
+            "matched": matched,
+            "boundaries": boundaries,
+            "scale": guided.scale if guided else None,
+            "scale_clamped": guided.scale_clamped if guided else None,
+            "model": guided.model if guided else None,
+            "gap_s": guided.gap_s if guided else None,
+            "music_start": music_start,
+            "music_end": music_end,
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Duration-based analysis failed: {e}", exc_info=True)
+        logger.error(f"Guided analysis failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -611,15 +1015,18 @@ async def preview_track(
     if session is None:
         raise HTTPException(status_code=404, detail="File not found")
 
+    # Explicit start/end (manual edits, e.g. splits the backend hasn't seen)
+    # don't need a stored boundary; otherwise look the track up.
     boundaries = session.boundaries
-    if track_number < 1 or track_number > len(boundaries):
-        raise HTTPException(status_code=404, detail="Track not found")
-
-    track = boundaries[track_number - 1]
     file_path = session.source_audio
-
-    track_start = start if start is not None else track.start
-    track_end = end if end is not None else track.end
+    if start is not None and end is not None:
+        track_start, track_end = start, end
+    else:
+        if track_number < 1 or track_number > len(boundaries):
+            raise HTTPException(status_code=404, detail="Track not found")
+        track = boundaries[track_number - 1]
+        track_start = start if start is not None else track.start
+        track_end = end if end is not None else track.end
     track_duration = track_end - track_start
 
     if track_duration <= 0 or track_start < 0:
@@ -675,6 +1082,340 @@ async def preview_track(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Preview generation failed: {str(e)}")
+
+
+# --- Plan 06 slice 1: A/B test of the audio processing chain on one track -----------
+
+_RT_NAME_RE = re.compile(r"rt(?:orig|proc|diff)_[0-9a-f]{12}\.flac")
+_RT_MAX_RANGES = 200
+
+
+class RestorationTestRequest(BaseModel):
+    file_id: str
+    start: float
+    end: float
+    rumble: Optional[bool] = None
+    declick: Optional[str] = None
+    restore: Optional[bool] = None   # legacy: True = rumble + light declick
+    hum_filter: bool = False         # mains-hum notch at hum_freq
+    hum_freq: int = 60
+    hiss_reduction: str = "off"      # off | light | medium | strong
+    album_gain: bool = False
+    # [start, end] or [start, end, declick|null]: per-track click strength for the album measurement
+    album_ranges: Optional[List[list]] = None
+
+
+def hiss_filter_key(hiss: str, noise: Optional[NoiseProfile]) -> str:
+    """Cache-key text for a hiss setting (the full afftdn string, so the noise profile counts)."""
+    return hiss_filter(hiss, noise) if hiss and hiss != "off" else ""
+
+
+def _rt_hash(*parts) -> str:
+    return hashlib.sha1("|".join(str(p) for p in parts).encode()).hexdigest()[:12]
+
+
+def _rt_write_json(path: Path, data) -> None:
+    part = path.with_name(f"{path.stem}.{uuid.uuid4().hex[:8]}.part")
+    try:
+        part.write_text(json.dumps(data))
+        os.replace(part, path)
+    except Exception:
+        part.unlink(missing_ok=True)
+        raise
+
+
+def _rt_read_json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+
+def _rt_loud_to_json(loud: Optional[Loudness]):
+    return None if loud is None else {"integrated": loud.integrated, "true_peak": loud.true_peak}
+
+
+def _rt_loud_from_json(d) -> Optional[Loudness]:
+    if not isinstance(d, dict):
+        return None
+    try:
+        return Loudness(integrated=float(d["integrated"]), true_peak=float(d["true_peak"]))
+    except Exception:
+        return None
+
+
+def _rt_render(source: Path, start: float, end: float, chain: Optional[str], out: Path) -> bool:
+    """Render [start, end] to FLAC at ``out`` unless cached.  Identical
+    encoding for original and processed.  Returns True on a cache hit."""
+    if out.exists():
+        return True
+    part = out.with_name(f"{out.stem}.{uuid.uuid4().hex[:8]}.part")
+    window = audio_processor.padded_cut(source, start, end) if chain else None
+    if window:
+        seek_s, read_dur, t0, t1 = window
+        args = ["-y", *seek_args(seek_s, read_dur), "-i", str(source),
+                "-af", f"{chain},{trim_filter(t0, t1)}"]
+    else:
+        args = ["-y", "-ss", str(start), "-t", str(end - start), "-i", str(source)]
+        if chain:
+            args += ["-af", chain]
+    args += [
+        "-c:a", "flac", "-compression_level", str(audio_processor.flac_compression),
+        "-sample_fmt", "s16", "-f", "flac", str(part),
+    ]
+    try:
+        run_ffmpeg(args, check=True, capture_output=True, timeout=600)
+        os.replace(part, out)
+    except Exception:
+        part.unlink(missing_ok=True)
+        raise
+    return False
+
+
+_CHANNELS_RE = re.compile(r"Audio:.*?\d+ Hz, (mono|stereo|\d+ channels)")
+_MAX_VOL_RE = re.compile(r"max_volume:\s*(-?inf|-?\d+(?:\.\d+)?)\s*dB")
+
+
+def _rt_channels(source: Path) -> int:
+    """1 for a mono source, else 2 (anything else is rendered as stereo)."""
+    try:
+        res = run_ffmpeg(["-hide_banner", "-i", str(source)], capture_output=True, timeout=60)
+        m = _CHANNELS_RE.search(res.stderr or "")
+        return 1 if m and m.group(1) == "mono" else 2
+    except Exception:
+        return 2
+
+
+def _rt_render_removed(
+    source: Path, start: float, end: float, cleanup: str, out: Path, chunked: bool = False
+) -> bool:
+    """Render ``original - cleanup(original)`` as 24-bit FLAC (the residual is
+    small; 16 bits would add quantisation noise to it).  True on a cache hit.
+
+    ``chunked`` is for cleanups holding the zero-phase hum notch / rumble filter, which buffers what it
+    filters: rendered in short chunks (bounded memory) by the AudioProcessor."""
+    if out.exists():
+        return True
+    part = out.with_name(f"{out.stem}.{uuid.uuid4().hex[:8]}.part")
+    if chunked:
+        try:
+            audio_processor.render_removed_flac(
+                source, start, end, cleanup, _rt_channels(source), part
+            )
+            os.replace(part, out)
+        except Exception:
+            part.unlink(missing_ok=True)
+            raise
+        return False
+    window = audio_processor.padded_cut(source, start, end)
+    if window:
+        seek_s, read_dur, t0, t1 = window
+        graph = removed_graph(cleanup, _rt_channels(source), (t0, t1))
+        seek = seek_args(seek_s, read_dur)
+    else:
+        graph = removed_graph(cleanup, _rt_channels(source))
+        seek = ["-ss", str(start), "-t", str(end - start)]
+    args = [
+        "-y", *seek, "-i", str(source),
+        "-filter_complex", graph, "-map", "[out]",
+        "-c:a", "flac", "-compression_level", str(audio_processor.flac_compression),
+        "-sample_fmt", "s32", "-bits_per_raw_sample", "24", "-f", "flac", str(part),
+    ]
+    try:
+        run_ffmpeg(args, check=True, capture_output=True, timeout=600)
+        os.replace(part, out)
+    except Exception:
+        part.unlink(missing_ok=True)
+        raise
+    return False
+
+
+def _rt_removed_stats(path: Path) -> dict:
+    """{'lufs': float|None, 'peak_dbfs': float|None} of the residual, cached beside it."""
+    side = path.with_name(path.name + ".stats.json")
+    data = _rt_read_json(side) if side.exists() else None
+    if isinstance(data, dict) and "lufs" in data and "peak_dbfs" in data:
+        return data
+    loud = audio_processor.measure_file(path)
+    peak = None
+    try:
+        res = run_ffmpeg(
+            ["-hide_banner", "-nostats", "-i", str(path), "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True, timeout=300,
+        )
+        m = _MAX_VOL_RE.search(res.stderr or "")
+        if m and "inf" not in m.group(1):
+            peak = float(m.group(1))
+    except Exception:
+        peak = None
+    data = {"lufs": loud.integrated if loud else None, "peak_dbfs": peak}
+    _rt_write_json(side, data)
+    return data
+
+
+def _rt_loudness(path: Path) -> Optional[Loudness]:
+    side = path.with_name(path.name + ".loud.json")
+    if side.exists():
+        data = _rt_read_json(side)
+        loud = _rt_loud_from_json(data)
+        if loud is not None:
+            return loud
+    loud = audio_processor.measure_file(path)
+    if loud is not None:
+        _rt_write_json(side, _rt_loud_to_json(loud))
+    return loud
+
+
+def _rt_album_gain(
+    session_id: str, source: Path, ranges, rumble: bool, declick: str,
+    hum: int = 0, hiss: str = "off", noise: Optional[NoiseProfile] = None,
+) -> Optional[float]:
+    """Album gain exactly as export computes it (post clean-up filters, all active ranges)."""
+    key = _rt_hash(
+        json.dumps(ranges), rumble, declick, hum, hiss,
+        hiss_filter_key(hiss, noise),
+    )
+    cache = get_session_path(session_id, f"rtgain_{key}.json")
+    loud = _rt_loud_from_json(_rt_read_json(cache)) if cache.exists() else None
+    if loud is None:
+        extra = {"hum": hum, "hiss": hiss, "noise": noise} if (hum or hiss != "off") else {}
+        loud = audio_processor.measure_ranges(
+            source, [tuple(r) for r in ranges], rumble, declick, **extra
+        )
+        if loud is not None:
+            _rt_write_json(cache, _rt_loud_to_json(loud))
+    return album_gain_db(loud)
+
+
+def _rt_settings(req: RestorationTestRequest) -> tuple:
+    """(rumble, declick, hum, hiss): rumble/declick from the new fields, else the
+    legacy ``restore`` bool; ``hum`` is the mains frequency or 0 (off)."""
+    if req.rumble is None and req.declick is None:
+        rumble, declick = LEGACY_RESTORE if req.restore else (False, "off")
+    else:
+        rumble, declick = bool(req.rumble), _check_declick(req.declick or "off")
+    hum = _check_hum_freq(req.hum_freq) if req.hum_filter else 0
+    return rumble, declick, hum, _check_hiss(req.hiss_reduction or "off")
+
+
+def _run_restoration_test(
+    session_id: str, source: Path, req: RestorationTestRequest, ranges,
+    rumble: bool, declick: str, hum: int = 0, hiss: str = "off",
+    noise: Optional[NoiseProfile] = None,
+) -> dict:
+    gain_db = None
+    if req.album_gain:
+        gain_db = _rt_album_gain(session_id, source, ranges, rumble, declick, hum, hiss, noise)
+    chain = build_export_filters(rumble, declick, gain_db, hum=hum, hiss=hiss, noise=noise)
+    if not chain:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not measure album loudness, so there is nothing to test",
+        )
+
+    base = _rt_hash(f"{req.start:.6f}", f"{req.end:.6f}")
+    orig_name = f"rtorig_{base}.flac"
+    proc_name = f"rtproc_{_rt_hash(f'{req.start:.6f}', f'{req.end:.6f}', chain)}.flac"
+    orig_path = get_session_path(session_id, orig_name)
+    proc_path = get_session_path(session_id, proc_name)
+
+    hit_o = _rt_render(source, req.start, req.end, None, orig_path)
+    hit_p = _rt_render(source, req.start, req.end, chain, proc_path)
+    # Residual: clean-up filters only (no gain, no dither), cached under that chain.
+    # The residual shows what the clean-up took out, so the hum notch and rumble filter run
+    # zero-phase there: a normal filter's phase shift would leak a faint copy of the music into it.
+    cleanup = build_export_filters(
+        rumble, declick, None, hum=hum, hiss=hiss, noise=noise,
+        zero_phase_hum=bool(hum), zero_phase_rumble=bool(rumble),
+    )
+    removed = {"removed_url": None, "removed_lufs": None, "removed_peak_dbfs": None}
+    hit_r = True
+    if cleanup:
+        diff_name = f"rtdiff_{_rt_hash(f'{req.start:.6f}', f'{req.end:.6f}', cleanup, 'diff24')}.flac"
+        diff_path = get_session_path(session_id, diff_name)
+        hit_r = _rt_render_removed(source, req.start, req.end, cleanup, diff_path,
+                                 chunked=bool(hum) or bool(rumble))
+        stats = _rt_removed_stats(diff_path)
+        removed = {
+            "removed_url": f"/api/restoration-test/{session_id}/{diff_name}",
+            "removed_lufs": stats["lufs"],
+            "removed_peak_dbfs": stats["peak_dbfs"],
+        }
+    orig_loud = _rt_loudness(orig_path)
+    proc_loud = _rt_loudness(proc_path)
+    return {
+        "original_url": f"/api/restoration-test/{session_id}/{orig_name}",
+        "processed_url": f"/api/restoration-test/{session_id}/{proc_name}",
+        "original_lufs": orig_loud.integrated if orig_loud else None,
+        "processed_lufs": proc_loud.integrated if proc_loud else None,
+        "gain_db": gain_db,
+        "rumble": rumble,
+        "declick": declick,
+        "hum": hum,
+        "hiss": hiss,
+        "chain": chain,
+        **removed,
+        "cached": bool(hit_o and hit_p and hit_r),
+    }
+
+
+@app.post("/api/restoration-test")
+async def restoration_test(req: RestorationTestRequest):
+    """Render one track range with and without the export filter chain."""
+    session = session_store.get(req.file_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    rumble, declick, hum, hiss = _rt_settings(req)
+    if not (rumble or declick != "off" or hum or hiss != "off" or req.album_gain):
+        raise HTTPException(
+            status_code=400,
+            detail="Turn on a clean-up (rumble, hum, clicks or hiss) or album gain to test",
+        )
+    if not (math.isfinite(req.start) and math.isfinite(req.end)) or req.start < 0 or req.end <= req.start:
+        raise HTTPException(status_code=400, detail="Invalid range: end must be after start")
+
+    ranges = []
+    if req.album_gain:
+        ranges = req.album_ranges or [[req.start, req.end]]
+        if len(ranges) > _RT_MAX_RANGES:
+            raise HTTPException(status_code=400, detail="Too many album ranges")
+        clean = []
+        for r in ranges:
+            ok = isinstance(r, list) and len(r) in (2, 3) and all(
+                isinstance(x, (int, float)) and math.isfinite(x) for x in r[:2]
+            )
+            if not ok or r[0] < 0 or r[1] <= r[0]:
+                raise HTTPException(status_code=400, detail="Invalid album range")
+            override = _check_declick(r[2]) if len(r) == 3 and r[2] is not None else None
+            clean.append([round(r[0], 6), round(r[1], 6)] + ([override] if override else []))
+        ranges = clean
+
+    noise = await _noise_profile_for(session) if hiss != "off" else None
+    try:
+        return await asyncio.to_thread(
+            _run_restoration_test, req.file_id, session.source_audio, req, ranges,
+            rumble, declick, hum, hiss, noise,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Restoration test failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Test render failed: {e}")
+
+
+@app.get("/api/restoration-test/{file_id}/{name}")
+async def get_restoration_test_audio(file_id: str, name: str):
+    """Serve a rendered A/B file (FileResponse handles range requests)."""
+    from fastapi.responses import FileResponse
+
+    if session_store.get(file_id) is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    if not _RT_NAME_RE.fullmatch(name):
+        raise HTTPException(status_code=400, detail="Invalid name")
+    path = get_session_path(file_id, name)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Render not found")
+    return FileResponse(path, media_type="audio/flac")
 
 
 @app.get("/api/waveform-peaks/{file_id}")
@@ -793,39 +1534,85 @@ async def get_audio_file(file_id: str):
     )
 
 
+def _serialize_release(release) -> dict:
+    """Full release payload shared by /api/release/{id} (tracks always set)."""
+    return {
+        "id": release.id,
+        "artist": release.artist,
+        "title": release.title,
+        "year": release.year,
+        "label": release.label,
+        "format": release.format,
+        "cover_url": release.cover_url,
+        "uri": release.uri,
+        "tracks": [
+            {"position": t.position, "title": t.title, "duration": t.duration_str}
+            for t in release.tracks
+        ],
+    }
+
+
 @app.post("/api/search")
 async def search_discogs(request: SearchRequest):
-    """Search Discogs for releases."""
+    """Search Discogs; basic cards only (tracks: null = not loaded yet).
+
+    Full tracklists come from GET /api/release/{id}.
+    """
     try:
-        # Discogs does 1+N HTTP round-trips with rate-limit sleeps — keep
-        # that off the event loop.
-        releases = await asyncio.to_thread(
-            metadata_handler.search_releases, request.query, max_results=request.max_results
+        # One search round-trip (rate-limit sleep inside) — off the event loop.
+        basic = await asyncio.to_thread(
+            metadata_handler.search_basic, request.query, request.max_results
         )
-
-        results = []
-        for idx, release in releases:
-            results.append(
-                {
-                    "id": release.id,
-                    "artist": release.artist,
-                    "title": release.title,
-                    "year": release.year,
-                    "label": release.label,
-                    "format": release.format,
-                    "cover_url": release.cover_url,
-                    "uri": release.uri,
-                    "tracks": [
-                        {"position": t.position, "title": t.title, "duration": t.duration_str}
-                        for t in release.tracks
-                    ],
-                }
-            )
-
-        return {"results": results}
+        return {"results": [{**r, "tracks": None} for r in basic]}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/release/{release_id}")
+async def get_release(release_id: int):
+    """Full release details including tracklist (server-side cached)."""
+    release = await asyncio.to_thread(metadata_handler.get_release_by_id, release_id)
+    if release is None:
+        raise HTTPException(status_code=404, detail="Release not found or Discogs unavailable")
+    return _serialize_release(release)
+
+
+@app.get("/api/release/{release_id}/length-donors")
+async def get_length_donors(release_id: int):
+    """Other pressings (same master) whose track lengths match this release.
+
+    Runs in a worker thread (rate-limited Discogs fetches); progress goes out
+    over the WebSocket as ``donor_progress`` messages.  Results are cached per
+    release by the handler.
+    """
+    loop = asyncio.get_running_loop()
+
+    def on_progress(checked: int, budget: int, found: int) -> None:
+        asyncio.run_coroutine_threadsafe(
+            broadcast_message({
+                "type": "donor_progress",
+                "release_id": release_id,
+                "checked": checked,
+                "budget": budget,
+                "found": found,
+            }),
+            loop,
+        )
+
+    try:
+        donors = await asyncio.to_thread(
+            metadata_handler.find_length_donors, release_id, on_progress=on_progress
+        )
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.warning("length-donors lookup failed for %s: %s", release_id, e)
+        raise HTTPException(
+            status_code=502,
+            detail="Couldn't reach Discogs to look for other pressings. Try again in a moment.",
+        )
+    return {"donors": donors}
 
 
 @app.post("/api/process")
@@ -846,7 +1633,23 @@ async def process_file(request: ProcessRequest):
             f"Choose from: {', '.join(OUTPUT_FORMATS.keys())}",
         )
 
+    # Normalise rumble/declick now (400 on bad values) so the background job can't fail on them.
+    if request.rumble_filter is None and request.declick is None:
+        # Legacy clients send restoration_level; no field at all = nothing on.
+        request.rumble_filter, request.declick = _legacy_restore(request.restoration_level or 0)
+    else:
+        request.rumble_filter = bool(request.rumble_filter)
+        request.declick = _check_declick(request.declick or "off")
+
+    request.hiss_reduction = _check_hiss(request.hiss_reduction or "off")
+    request.hum_filter = bool(request.hum_filter)
+    if request.hum_filter:
+        request.hum_freq = _check_hum_freq(request.hum_freq)
+
     if request.track_boundaries:
+        for b in request.track_boundaries:
+            if b.declick is not None:
+                _check_declick(b.declick)
         session.set_boundaries(list(request.track_boundaries))
     session.set_mappings({m.detected: m.discogs for m in request.track_mapping})
 
@@ -886,13 +1689,24 @@ async def process_file_background(request: ProcessRequest):
     if session is None:
         return
 
+    noise_profile = None
+    if request.hiss_reduction != "off":
+        noise_profile = await _noise_profile_for(session)
+
     spec = OutputSpec(
         output_format=request.output_format,
         output_dir=Path(config.default_output_dir),
         flac_compression=config.default_flac_compression,
-        restoration_level=request.restoration_level,
-        hum_freq=request.hum_freq,
+        rumble_filter=bool(request.rumble_filter),
+        declick=request.declick or "off",
+        hum_filter=request.hum_filter,
+        hum_freq=request.hum_freq if request.hum_filter else 60,
+        hiss_reduction=request.hiss_reduction,
+        noise_profile=noise_profile,
+        album_gain=request.album_gain,
+        replaygain=request.replaygain,
         track_numbering=config.track_numbering,
+        bit_depth=config.bit_depth,
     )
 
     loop = asyncio.get_running_loop()
@@ -1012,12 +1826,30 @@ async def get_config():
         "flac_compression": audio_processor.flac_compression,
         "output_dir": config.default_output_dir,
         "track_numbering": config.track_numbering,
+        "output_format": config.output_format,
+        "bit_depth": config.bit_depth,
+        "rumble_filter": config.rumble_filter,
+        "declick": config.declick,
+        "restoration_level": config.restoration_level,  # legacy, derived
+        "hum_filter": config.hum_filter,
+        "hum_freq": config.hum_freq,
+        "hiss_reduction": config.hiss_reduction,
+        "hiss_strength": config.hiss_strength,
+        "album_gain": config.album_gain,
+        "replaygain": config.replaygain,
     }
 
 
 @app.put("/api/config")
 async def update_config(updates: ConfigUpdate):
     """Update configuration parameters."""
+    # Validate the clean-up fields before touching anything (no half-applied update).
+    if updates.hum_freq is not None:
+        _check_hum_freq(updates.hum_freq)
+    if updates.hiss_reduction is not None:
+        _check_hiss(updates.hiss_reduction)
+    if updates.hiss_strength is not None and updates.hiss_strength not in HISS_LEVELS[1:]:
+        raise HTTPException(status_code=400, detail="hiss_strength must be light, medium or strong")
     if updates.silence_threshold is not None:
         audio_processor.silence_threshold = updates.silence_threshold
     if updates.min_silence_duration is not None:
@@ -1032,6 +1864,47 @@ async def update_config(updates: ConfigUpdate):
         if updates.track_numbering in ("sequential_disc_per_lp", "vinyl"):
             config.track_numbering = updates.track_numbering
             config.save_track_numbering(updates.track_numbering)
+    if updates.output_format is not None:
+        if updates.output_format not in ("flac", "mp3", "aiff"):
+            raise HTTPException(status_code=400, detail="output_format must be flac, mp3 or aiff")
+        config.output_format = updates.output_format
+        config.save_output_format(updates.output_format)
+    if updates.bit_depth is not None:
+        if updates.bit_depth not in ("source", "24"):
+            raise HTTPException(status_code=400, detail="bit_depth must be source or 24")
+        config.bit_depth = updates.bit_depth
+        config.save_bit_depth(updates.bit_depth)
+    if updates.restoration_level is not None:  # legacy: maps to the new pair
+        rumble, declick = _legacy_restore(updates.restoration_level)
+        config.rumble_filter, config.declick = rumble, declick
+        config.save_rumble_filter(rumble)
+        config.save_declick(declick)
+    if updates.rumble_filter is not None:
+        config.rumble_filter = updates.rumble_filter
+        config.save_rumble_filter(updates.rumble_filter)
+    if updates.declick is not None:
+        config.declick = _check_declick(updates.declick)
+        config.save_declick(updates.declick)
+    if updates.hum_filter is not None:
+        config.hum_filter = bool(updates.hum_filter)
+        config.save_hum_filter(config.hum_filter)
+    if updates.hum_freq is not None:
+        config.hum_freq = int(updates.hum_freq)
+        config.save_hum_freq(config.hum_freq)
+    if updates.hiss_strength is not None:      # first: an explicit hiss_reduction below wins
+        config.hiss_strength = updates.hiss_strength
+        config.save_hiss_strength(updates.hiss_strength)
+    if updates.hiss_reduction is not None:
+        config.hiss_reduction = updates.hiss_reduction
+        if updates.hiss_reduction != "off":
+            config.hiss_strength = updates.hiss_reduction
+        config.save_hiss_reduction(updates.hiss_reduction)
+    if updates.album_gain is not None:
+        config.album_gain = updates.album_gain
+        config.save_album_gain(updates.album_gain)
+    if updates.replaygain is not None:
+        config.replaygain = updates.replaygain
+        config.save_replaygain(updates.replaygain)
 
     return await get_config()
 

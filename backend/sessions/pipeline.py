@@ -16,6 +16,7 @@ need the calling event loop to stay responsive while ffmpeg runs.
 from __future__ import annotations
 
 import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -28,7 +29,16 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from audio_processor import OUTPUT_FORMATS, AudioProcessor, Track
+from audio_processor import (
+    OUTPUT_FORMATS,
+    target_bit_depth,
+    AudioProcessor,
+    Track,
+    album_gain_db,
+    format_replaygain_gain,
+    format_replaygain_peak,
+    replaygain_gain_db,
+)
 from metadata_handler import MetadataHandler
 
 from .events import OutputSpec, ProcessingRun, ProgressEvent
@@ -89,6 +99,12 @@ def run(
         output_files: list[str] = []
         total = len(tracks)
 
+        bit_depth = target_bit_depth(spec.bit_depth, session.source_bit_depth)
+
+        gain_db = None
+        if spec.album_gain:
+            gain_db = _measure_album_gain(session, spec, tracks, audio_processor, on_progress)
+
         for i, track in enumerate(tracks):
             fraction = 0.4 + (i / total) * 0.5
             on_progress(
@@ -108,8 +124,13 @@ def run(
                 track,
                 temp_output,
                 spec.output_format,
-                restoration_level=spec.restoration_level,
-                hum_freq=spec.hum_freq,
+                rumble=spec.rumble_filter,
+                declick=track.declick or spec.declick,
+                hum=(spec.hum_freq if spec.hum_filter else 0),
+                hiss=spec.hiss_reduction,
+                noise=spec.noise_profile,
+                gain_db=gain_db,
+                bit_depth=bit_depth,
             )
 
             metadata_handler.tag_file(
@@ -124,6 +145,11 @@ def run(
             temp_output.rename(final_path)
 
             output_files.append(final_filename)
+
+        if spec.replaygain:
+            _write_replaygain_tags(
+                album_folder, output_files, spec, audio_processor, metadata_handler, on_progress
+            )
 
         session.mark_complete(album_folder, output_files)
 
@@ -150,7 +176,8 @@ def run(
 
 
 def _build_tracks(session: Session) -> list[Track]:
-    """Convert Session boundaries into Tracks with vinyl_number applied.
+    """Convert Session boundaries into Tracks with vinyl_number and the optional
+    per-track ``declick`` override applied.
 
     Boundaries may be either ``audio_processor.Track`` (set by /api/analyze)
     or pydantic ``TrackBoundary`` (set by /api/process when the user
@@ -162,7 +189,110 @@ def _build_tracks(session: Session) -> list[Track]:
         existing = getattr(b, "vinyl_number", None)
         if existing is not None:
             t.vinyl_number = existing
+        t.declick = getattr(b, "declick", None) or None
         if t.number in session.mappings:
             t.vinyl_number = session.mappings[t.number]
         tracks.append(t)
     return tracks
+
+
+def _measure_album_gain(session, spec, tracks, audio_processor, on_progress):
+    """Measure the active track ranges (post clean-up filters) and return the album
+    gain in dB, or None (with a progress warning) if it can't be measured."""
+    on_progress(
+        ProgressEvent(
+            phase="measuring_loudness",
+            fraction=0.32,
+            message="Measuring album loudness...",
+        )
+    )
+    try:
+        loudness = audio_processor.measure_ranges(
+            session.source_audio,
+            [(t.start, t.end, t.declick or spec.declick) for t in tracks],
+            spec.rumble_filter,
+            spec.declick,
+            hum=(spec.hum_freq if spec.hum_filter else 0),
+            hiss=spec.hiss_reduction,
+            noise=spec.noise_profile,
+        )
+        gain = album_gain_db(loudness)
+    except Exception:
+        traceback.print_exc()
+        gain = None
+        loudness = None
+
+    if gain is None:
+        message = "Warning: could not measure album loudness - album gain skipped"
+    else:
+        message = f"Album gain {gain:+.1f} dB (from {loudness.integrated:.1f} LUFS)"
+    on_progress(ProgressEvent(phase="measuring_loudness", fraction=0.38, message=message))
+    return gain
+
+
+def _write_replaygain_tags(
+    album_folder, output_files, spec, audio_processor, metadata_handler, on_progress
+):
+    """Measure every final file and the album as a whole, then tag them.
+
+    Measurement or tagging failures log a warning and skip RG for that file
+    (or the album values); they never fail the job.
+    """
+    paths = [album_folder / name for name in output_files]
+    total = len(paths)
+    per_file = []
+    for i, path in enumerate(paths):
+        on_progress(
+            ProgressEvent(
+                phase="replaygain",
+                fraction=0.9 + (i / total) * 0.04,
+                message=f"Measuring loudness for ReplayGain {i + 1}/{total}...",
+                track_index=i + 1,
+                track_total=total,
+            )
+        )
+        try:
+            per_file.append(audio_processor.measure_file(path))
+        except Exception:
+            traceback.print_exc()
+            per_file.append(None)
+
+    on_progress(
+        ProgressEvent(
+            phase="replaygain",
+            fraction=0.94,
+            message="Measuring album loudness for ReplayGain...",
+        )
+    )
+    try:
+        album = audio_processor.measure_files(paths)
+    except Exception:
+        traceback.print_exc()
+        album = None
+
+    album_gain = format_replaygain_gain(replaygain_gain_db(album)) if album else None
+    album_peak = format_replaygain_peak(album.true_peak) if album else None
+
+    written = 0
+    for path, loud in zip(paths, per_file):
+        if loud is None and album is None:
+            continue
+        try:
+            ok = metadata_handler.write_replaygain(
+                path,
+                spec.output_format,
+                format_replaygain_gain(replaygain_gain_db(loud)) if loud else None,
+                format_replaygain_peak(loud.true_peak) if loud else None,
+                album_gain,
+                album_peak,
+            )
+        except Exception:
+            traceback.print_exc()
+            ok = False
+        written += 1 if ok else 0
+
+    if written == total and album is not None:
+        message = f"ReplayGain tags written (album {album_gain})"
+    else:
+        message = f"Warning: ReplayGain tags written for {written}/{total} files"
+    on_progress(ProgressEvent(phase="replaygain", fraction=0.98, message=message))

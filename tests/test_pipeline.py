@@ -94,7 +94,7 @@ def session(tmp_path: Path) -> Session:
 
 @pytest.fixture
 def spec(tmp_path: Path) -> OutputSpec:
-    return OutputSpec(output_format="flac", output_dir=tmp_path / "out")
+    return OutputSpec(output_format="flac", output_dir=tmp_path / "out", replaygain=False)
 
 
 def test_happy_path(session: Session, spec: OutputSpec):
