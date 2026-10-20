@@ -26,6 +26,7 @@ const WORKSPACE_STORAGE_KEY = 'vinylflow.workspaces.v1';
 const WORKSPACE_VERSION = 1;
 const WORKSPACE_SAVE_DELAY_MS = 400;
 const PROCESS_POLL_INTERVAL_MS = 1500;
+const PREVIEW_AUDIO_NOTICE = "Playing the preview \u2014 this browser can't play the original WAV, so cut points may be up to ~50 ms less precise.";
 // Additional workspace fields are optional when reading saves made before Plan 05.
 const WORKSPACE_ADDITIONS = { searchResults: [], onlyWithLengths: false, detailsSettled: false, currentZoom: 50 };
 const REGION_EDGE_HIT_PX = 6;
@@ -126,6 +127,8 @@ function vinylApp() {
         playDuration: 0,
         playheadIdx: -1,       // index of the track under the playhead (-1 = gap / none)
         playerNotice: '',
+        playerInfo: '',        // muted, persistent note (preview fallback); playerNotice is for errors
+        _audioSource: null,    // {waveform, fileId, precise, peaks, duration, fellBack} of the loaded audio
         playerBuffering: false,
         _pendingSeek: null,
         _auditionStop: null,   // one-shot stop time (s) for cut-point auditions
@@ -197,6 +200,7 @@ function vinylApp() {
         _exportAttempt: 0,
         _batchFileId: null,
         _batchResolve: null,
+        exportQueue: [],          // Frozen single exports waiting for the running one (browser-side only, FIFO)
         _restoreZoom: null,
         currentAlbumJobId: null,
         albumWarnings: [],
@@ -317,6 +321,8 @@ function vinylApp() {
             this.$watch('customMapping', () => this.refreshRegionLabels());
             this.$watch('selectedRelease', () => this.refreshRegionLabels());
             this.$watch('selectedSides', () => this.refreshRegionLabels());
+            // Freeze / release region dragging when the viewed recording's lock changes
+            this.$watch('currentLocked', () => { if (this.waveform && this.waveformRegions) this.addTrackRegions(); });
 
             await this.loadConfig();
             await this.loadFormats();
@@ -627,7 +633,8 @@ function vinylApp() {
         baseReadiness(fileId, shared = true) {
             const file = this.uploadedFiles.find(entry => entry.id === fileId);
             if (!file || this.pendingRemovals[fileId]) return { ready: false, reason: 'Recording removed.' };
-            if (['processing', 'queued', 'uncertain'].includes(file.status)) return { ready: false, reason: file.error || 'Export in progress.' };
+            if (file.status === 'queued') return { ready: false, reason: 'Waiting for the current export to finish.' };
+            if (['processing', 'uncertain'].includes(file.status)) return { ready: false, reason: file.error || 'Export in progress.' };
             const state = this.workspaceFor(fileId);
             const reason = this.exportProblem(file, state);
             if (reason) return { ready: false, reason };
@@ -692,8 +699,73 @@ function vinylApp() {
             return this.uploadedFiles.filter(file => this.fileReadiness(file.id).ready);
         },
 
-        get exportBusy() {
+        /** Locked = exporting, waiting for its export turn, status unknown, or in an unfinished album job. */
+        isLocked(fileId) {
+            const file = this.uploadedFiles.find(entry => entry.id === fileId);
+            if (!file) return false;
+            return ['processing', 'queued', 'uncertain'].includes(file.status) ||
+                !!(file.album_job_status && file.album_job_status !== 'complete');
+        },
+
+        /** The recording in the editor is read-only while it is locked; others stay editable. */
+        get currentLocked() {
+            return !!this.currentFileId && this.isLocked(this.currentFileId);
+        },
+
+        /** Genuinely global: an export is in flight (single, batch, album, or recovered from the server). */
+        get exportRunning() {
             return this.batchProcessing || this.isProcessing || this.uploadedFiles.some(file => ['processing', 'uncertain'].includes(file.status));
+        },
+
+        /** Running or waiting: Process all ready and the dispatcher use this, editing gates do not. */
+        get exportBusy() {
+            return this.exportRunning || this.exportQueue.length > 0;
+        },
+
+        get hasUncertainExport() {
+            return this.uploadedFiles.some(file => file.status === 'uncertain');
+        },
+
+        /** Single-export button state follows the viewed recording, not the global flag. */
+        get currentExporting() {
+            return this.currentFile?.status === 'processing';
+        },
+
+        get processDisabled() {
+            return !this.currentFileId || this.analyzing || this.currentLocked || this.hasUncertainExport ||
+                !this.fileReadiness(this.currentFileId, false).ready;
+        },
+
+        get processButtonLabel() {
+            const status = this.currentFile?.status;
+            if (this.processingComplete) return '✓ Complete';
+            if (status === 'queued') return 'Queued';
+            if (status === 'uncertain') return 'Status unknown';
+            if (!this.currentLocked && this.exportBusy) return 'Queue export';
+            return '✓ Process & Save';
+        },
+
+        /** Why the button is disabled or what it will do; empty when nothing needs saying. */
+        get processHint() {
+            const file = this.currentFile;
+            if (!file) return '';
+            if (file.status === 'queued') return 'Waiting for the current export to finish. It starts automatically.';
+            if (file.status === 'uncertain') return file.error || 'Export status unknown. Reload to check the server before continuing.';
+            if (file.status === 'processing') return '';
+            if (this.analyzing) return 'Track detection is running.';
+            if (this.hasUncertainExport) return "An earlier export's status is unknown. Reload to check the server before exporting.";
+            const readiness = this.fileReadiness(file.id, false);
+            if (!readiness.ready) return readiness.completed ? '' : readiness.reason;
+            if (this.exportBusy) return 'Another export is running. This one starts right after it finishes.';
+            return '';
+        },
+
+        /** Visible reason Process all ready is disabled ('' = enabled). */
+        get processAllReason() {
+            if (this.batchProcessing) return '';
+            if (this.exportBusy) return 'Available when the current and queued exports have finished.';
+            if (this.analyzing) return 'Available when track detection has finished.';
+            return '';
         },
 
         queueLabel(file) {
@@ -750,6 +822,35 @@ function vinylApp() {
                 this._batchResolve = null;
                 resolve(result);
             }
+            this.scheduleExportDrain();
+        },
+
+        /** Start the next frozen queued export once nothing else is running (one POST in flight at a time). */
+        scheduleExportDrain() {
+            if (this.exportQueue.length) Promise.resolve().then(() => this.drainExportQueue());
+        },
+
+        drainExportQueue() {
+            if (!this.exportQueue.length) return;
+            if (this.hasUncertainExport) { this.haltExportQueue(); return; }
+            if (this.exportRunning) return;
+            const item = this.exportQueue.shift();
+            const file = this.uploadedFiles.find(entry => entry.id === item.fileId);
+            if (!file || file.status !== 'queued') { this.drainExportQueue(); return; }
+            this.submitExport(item.fileId, item.request, item.signature);
+        },
+
+        /** An export of unknown outcome may still be running: start nothing else, hand the rest back. */
+        haltExportQueue() {
+            const waiting = this.exportQueue.splice(0);
+            for (const item of waiting) {
+                const file = this.uploadedFiles.find(entry => entry.id === item.fileId);
+                if (file?.status === 'queued') {
+                    file.status = item.previousStatus;
+                    file.error = "Not started: an earlier export's status is unknown.";
+                }
+            }
+            if (waiting.length) this.notify(`${waiting.length} queued export${waiting.length > 1 ? 's were' : ' was'} not started because an earlier export's status is unknown.`, { type: 'warning' });
         },
 
         /** Record completion for the exported snapshot, not edits made while a batch was running. */
@@ -758,6 +859,7 @@ function vinylApp() {
             if (!file) return;
             file.status = 'completed'; file.progress = 1; file.processingMessage = 'Complete!';
             file.error = '';
+            file.successMessage = tracks.length ? `✅ ${tracks.length} tracks saved.\n\nTracks: ${tracks.join(', ')}` : '✅ Processing complete. Files saved.';
             file.completedExportSignature = file.pendingExportSignature || file.completedExportSignature;
             delete file.pendingExportSignature;
             delete file.pendingExportAccepted;
@@ -774,7 +876,7 @@ function vinylApp() {
             if (fileId === this.currentFileId) {
                 this.processingProgress = 1;
                 this.processingMessage = 'Complete!';
-                this.successMessage = tracks.length ? `✅ ${tracks.length} tracks saved.\n\nTracks: ${tracks.join(', ')}` : '✅ Processing complete. Files saved.';
+                this.successMessage = file.successMessage;
                 this.saveWorkspace();
             } else this.persistWorkspaces();
             this.settleExport(fileId, { status: 'complete' });
@@ -986,7 +1088,8 @@ function vinylApp() {
          * Save configuration to API
          */
         async saveConfig() {
-            if (this.exportBusy) return;
+            // Allowed during exports: running jobs captured their spec when accepted. A frozen
+            // queued export keeps its request too, but the server reads the output dir when it dispatches.
             try {
                 const response = await fetch('/api/config', {
                     method: 'PUT',
@@ -994,12 +1097,17 @@ function vinylApp() {
                     body: JSON.stringify(this.configPayload())
                 });
                 const data = await response.json();
-                this.config = data;
-                this.outputFormat = data.output_format || 'flac';
-                this.rumbleFilter = !!data.rumble_filter;
-                this.declick = this.normDeclick(data.declick);
-                this.albumGain = !!data.album_gain;
-                this.syncCleanupFromConfig(data);
+                if (this.currentLocked) {
+                    // The exporting recording in the editor keeps its own values.
+                    this.config = { ...data, bit_depth: this.config.bit_depth, replaygain: this.config.replaygain };
+                } else {
+                    this.config = data;
+                    this.outputFormat = data.output_format || 'flac';
+                    this.rumbleFilter = !!data.rumble_filter;
+                    this.declick = this.normDeclick(data.declick);
+                    this.albumGain = !!data.album_gain;
+                    this.syncCleanupFromConfig(data);
+                }
                 this.showSettings = false;
                 this.notify('Settings saved.', { type: 'success' });
             } catch (error) {
@@ -1514,8 +1622,12 @@ function vinylApp() {
          * Select a file from the queue
          */
         selectFile(fileId) {
-            if (fileId === this.currentFileId || this.analyzing || this.isProcessing || this.batchProcessing ||
-                !this.uploadedFiles.some(file => file.id === fileId)) return;
+            if (fileId === this.currentFileId || !this.uploadedFiles.some(file => file.id === fileId)) return;
+            // Exports never block switching; only this recording's own detection does.
+            if (this.analyzing) {
+                this.notify('Wait for track detection to finish before switching recordings.', { type: 'warning', timeout: 5000 });
+                return;
+            }
             this.saveWorkspace();
             this.abReset();
             this.currentFileId = fileId;
@@ -1549,8 +1661,17 @@ function vinylApp() {
             this.destroyWaveform();
 
             const restored = this.restoreWorkspace(fileId);
-            if (this.currentFile?.status === 'processing' ||
-                (this.currentFile?.album_job_status && this.currentFile.album_job_status !== 'complete')) {
+            const viewed = this.currentFile;
+            if (viewed && ['processing', 'queued'].includes(viewed.status)) {
+                this.processingProgress = viewed.progress || 0;
+                this.processingMessage = viewed.processingMessage || '';
+            }
+            if (viewed?.status === 'completed' && viewed.successMessage && viewed.completedExportSignature === this.exportSignature()) {
+                this.successMessage = viewed.successMessage;
+            }
+            // Recover an export only when nothing is observed yet (after a reload); a live one keeps its own polling.
+            if (!this.isProcessing && !this.batchProcessing && (this.currentFile?.status === 'processing' ||
+                (this.currentFile?.album_job_status && this.currentFile.album_job_status !== 'complete'))) {
                 this.isProcessing = true;
                 this.currentJobId = fileId;
                 if (this.currentFile.album_job_id) this.startAlbumPolling(this.currentFile.album_job_id);
@@ -1578,9 +1699,10 @@ function vinylApp() {
             if (index === -1 || this.pendingRemovals[fileId]) return;
 
             const file = this.uploadedFiles[index];
-            if (this.batchProcessing || ['processing', 'uncertain'].includes(file.status) ||
-                (file.album_job_status && file.album_job_status !== 'complete') ||
-                (fileId === this.currentFileId && this.analyzing)) return;
+            if (this.isLocked(fileId) || (fileId === this.currentFileId && this.analyzing)) {
+                this.notify(this.isLocked(fileId) ? "A recording can't be removed while it is exporting or waiting to export." : 'Wait for track detection to finish before removing this recording.', { type: 'warning', timeout: 5000 });
+                return;
+            }
             this.saveWorkspace();
             const entry = {
                 file, index,
@@ -1667,7 +1789,7 @@ function vinylApp() {
 
         /** Return to the existing search UI while keeping all current cuts. */
         tryDiscogsAgain() {
-            if (this.analyzing || this.isProcessing) return;
+            if (this.analyzing || this.currentLocked) return;
             if (!this.searchQuery.trim()) this.searchQuery = this.cleanFilename(this.currentFile?.filename || '');
             this.searchDiscogs();
             this.$nextTick(() => {
@@ -1682,7 +1804,7 @@ function vinylApp() {
          * Analyze file for silence detection
          */
         async analyzeFile() {
-            if (!this.currentFileId || this.analyzing || this.exportBusy) return;
+            if (!this.currentFileId || this.analyzing || this.currentLocked) return;
 
             this.analyzing = true;
             this.rescanNotice = '';
@@ -1729,7 +1851,7 @@ function vinylApp() {
          * toast restores the previous boundaries, release and mapping.
          */
         async reanalyzeFile() {
-            if (!this.currentFileId || this.analyzing || this.exportBusy) return;
+            if (!this.currentFileId || this.analyzing || this.currentLocked) return;
 
             const fileId = this.currentFileId;
             const snapshot = this.snapshotEdits();
@@ -1821,7 +1943,7 @@ function vinylApp() {
          */
         async smartRescan(target) {
             target = parseInt(target, 10);
-            if (!this.currentFileId || this.analyzing || this.exportBusy) return;
+            if (!this.currentFileId || this.analyzing || this.currentLocked) return;
             if (!target || target < 1 || target > 99) {
                 this.rescanNotice = 'Enter how many songs the recording contains (1–99) first.';
                 return;
@@ -1991,7 +2113,7 @@ function vinylApp() {
          * Card click: make sure the tracklist is loaded, then select.
          */
         async chooseResult(result) {
-            if (this.analyzing || this.exportBusy || result.opening) return;
+            if (this.analyzing || this.currentLocked || result.opening) return;
             if (result.tracks) {
                 this.selectRelease(result);
                 return;
@@ -2378,7 +2500,7 @@ function vinylApp() {
          * Apply a scope preset and re-run detection
          */
         applyPreset(sides) {
-            if (this.analyzing || this.exportBusy) return;
+            if (this.analyzing || this.currentLocked) return;
             this.selectedSides = this.sideChips.map(g => g.side).filter(k => sides.includes(k));
             this.rememberChoice();
             this.resetMappingToTargets();
@@ -2475,7 +2597,7 @@ function vinylApp() {
          * Snap boundaries to the Discogs lengths (undoable)
          */
         async snapToDiscogs() {
-            if (this.analyzing || this.exportBusy || !this.selectedRelease || this.targetTracks.length < 1) return;
+            if (this.analyzing || this.currentLocked || !this.selectedRelease || this.targetTracks.length < 1) return;
 
             const snapshot = {
                 tracks: JSON.parse(JSON.stringify(this.detectedTracks)),
@@ -2531,7 +2653,7 @@ function vinylApp() {
          * recording covers and (re)run detection for that many tracks.
          */
         selectRelease(release) {
-            if (this.analyzing || this.exportBusy) return;
+            if (this.analyzing || this.currentLocked) return;
 
             this.selectedRelease = release;
             this.resetDonors();
@@ -2555,7 +2677,7 @@ function vinylApp() {
          * and re-run detection for the new track count.
          */
         toggleSide(side) {
-            if (this.analyzing || this.exportBusy) return;
+            if (this.analyzing || this.currentLocked) return;
 
             const isSelected = this.selectedSides.includes(side);
             if (isSelected && this.selectedSides.length === 1) return;
@@ -2577,7 +2699,7 @@ function vinylApp() {
         async redetectForTargets() {
             const targets = this.targetTracks;
             const count = targets.length;
-            if (count < 1 || !this.currentFileId || this.analyzing || this.exportBusy) return false;
+            if (count < 1 || !this.currentFileId || this.analyzing || this.currentLocked) return false;
 
             let succeeded = false;
             this.analyzing = true;
@@ -2800,7 +2922,7 @@ function vinylApp() {
          * detection/waveform so another release can be picked.
          */
         changeRelease() {
-            if (this.exportBusy) return;
+            if (this.currentLocked) return;
             this.selectedRelease = null;
             this.resetDonors();
             this.selectedSides = [];
@@ -3038,12 +3160,14 @@ function vinylApp() {
                 });
 
                 const waveform = this.waveform;
+                let uiBound = false;
 
                 // With MediaElement + provided peaks, load() resolves without
                 // fetching the audio — a later fetch failure only surfaces as
                 // an 'error' event, which must clear the loading spinner.
                 this.waveform.on('error', (err) => {
                     console.error('Waveform error:', err);
+                    if (this.fallBackToPreview(waveform, fileId)) return;
                     this.waveformLoading = false;
                     this.showPlayerNotice('Audio playback error: ' + ((err && err.message) || err || 'unknown'));
                 });
@@ -3065,6 +3189,11 @@ function vinylApp() {
                 const media = this.waveform.getMediaElement();
                 media.preload = 'auto';
                 const mediaListeners = {
+                    // DECODE (3) / SRC_NOT_SUPPORTED (4) on the original WAV: retry once with the MP3 preview
+                    error: () => {
+                        const code = media.error?.code;
+                        if (code === 3 || code === 4) this.fallBackToPreview(waveform, fileId);
+                    },
                     loadedmetadata: () => this.applyPendingSeek(),
                     seeking: () => { this.playerBuffering = true; },
                     waiting: () => { this.playerBuffering = true; },
@@ -3091,11 +3220,14 @@ function vinylApp() {
                 this.waveform.on('ready', () => {
                     console.log('Waveform ready');
 
+                    // 'ready' fires again after a preview-fallback reload: bind DOM listeners only once.
+                    const firstReady = !uiBound;
+                    uiBound = true;
                     const duration = this.waveform.getDuration();
                     this.playDuration = duration;
                     if (this.playTime > 0) this.seekTo(this.playTime);
                     const wrapper = this.waveform.getWrapper();
-                    wrapper.addEventListener('pointermove', event => {
+                    if (firstReady) wrapper.addEventListener('pointermove', event => {
                         const handle = event.target.closest?.('[part~="region-handle"]');
                         if (handle) handle.style.cursor = this.regionCursorAt(event.clientX);
                     });
@@ -3127,8 +3259,10 @@ function vinylApp() {
                     };
 
                     // Add right-click handler for manual splits
-                    container.addEventListener('contextmenu', openWaveformContextMenu);
-                    container.addEventListener('mousedown', openWaveformContextMenu);
+                    if (firstReady) {
+                        container.addEventListener('contextmenu', openWaveformContextMenu);
+                        container.addEventListener('mousedown', openWaveformContextMenu);
+                    }
 
                     setTimeout(() => {
                         if (waveform !== this.waveform) return;
@@ -3194,13 +3328,58 @@ function vinylApp() {
                 // If duration is missing or 0 (probe failed at upload), omit it
                 // so WaveSurfer falls back to fetching the file (slower but safe).
                 const knownDuration = peaksData.duration > 0 ? peaksData.duration : undefined;
-                await this.waveform.load(`/api/audio/${this.currentFileId}?precise=true`, [peaksData.peaks], knownDuration);
+                // Browsers that cannot play WAV at all go straight to the MP3 preview.
+                const preciseOk = !!(media.canPlayType && media.canPlayType('audio/wav'));
+                this._audioSource = { waveform, fileId, precise: preciseOk, peaks: [peaksData.peaks],
+                    duration: knownDuration, fellBack: false };
+                this.playerInfo = preciseOk ? '' : PREVIEW_AUDIO_NOTICE;
+                await this.waveform.load(this.audioUrl(fileId, preciseOk), [peaksData.peaks], knownDuration);
 
             } catch (error) {
+                // A fallback reload already took over this load's failure.
+                if (this._audioSource?.fellBack) return;
                 console.error('Waveform initialization failed:', error);
                 this.notifyError('Failed to load waveform', error);
                 this.waveformLoading = false;
             }
+        },
+
+        audioUrl(fileId, precise) {
+            return precise ? `/api/audio/${fileId}?precise=true` : `/api/audio/${fileId}`;
+        },
+
+        /**
+         * The original WAV failed to play: reload the pinned MP3 preview once, keeping peaks,
+         * zoom, playhead and paused state. Returns true when it took over the error.
+         * Never loops: an error on the preview URL falls through to the normal notice.
+         */
+        fallBackToPreview(waveform, fileId) {
+            const source = this._audioSource;
+            if (!source || source.waveform !== waveform || waveform !== this.waveform || fileId !== this.currentFileId) return false;
+            // The media element and WaveSurfer both report the same failure: absorb the twin while reloading.
+            if (source.fellBack && !source.settled) return true;
+            if (!source.precise) return false;
+            source.precise = false;
+            source.fellBack = true;
+            source.settled = false;
+            const resume = this.isPlaying;
+            this.isPlaying = false;
+            this.playerInfo = PREVIEW_AUDIO_NOTICE;
+            this.waveformLoading = true;
+            this._restoreZoom = this.currentZoom;
+            if (this.playTime > 0) this._pendingSeek = this.playTime;
+            const stale = () => waveform !== this.waveform || fileId !== this.currentFileId;
+            Promise.resolve(waveform.load(this.audioUrl(fileId, false), source.peaks, source.duration)).then(() => {
+                source.settled = true;
+                if (!stale() && resume) this.startPlayback();
+            }, (err) => {
+                source.settled = true;
+                if (stale()) return;
+                console.error('Preview fallback failed:', err);
+                this.waveformLoading = false;
+                this.showPlayerNotice('Audio playback error: ' + ((err && err.message) || err || 'unknown'));
+            });
+            return true;
         },
 
         /**
@@ -3228,8 +3407,9 @@ function vinylApp() {
                         start: clampedStart,
                         end: clampedEnd,
                         color: track.ignored ? IGNORED_TRACK_COLOR : this.getTrackColor(idx),
-                        drag: true,
-                        resize: true,
+                        // An exporting recording is read-only: its cuts can't be dragged
+                        drag: !this.currentLocked,
+                        resize: !this.currentLocked,
                         id: `track-${track.number}`,
                         content: this.regionLabel(track)
                     });
@@ -4328,6 +4508,8 @@ function vinylApp() {
             this.playDuration = 0;
             this.playheadIdx = -1;
             this.playerNotice = '';
+            this.playerInfo = '';
+            this._audioSource = null;
             this.playerBuffering = false;
             this._pendingSeek = null;
             this._restoreZoom = null;
@@ -4336,19 +4518,53 @@ function vinylApp() {
 
         /** Validate and export just the recording currently in the editor. */
         async processFile() {
-            if (!this.currentFileId || this.exportBusy || this.analyzing) return;
+            if (!this.currentFileId) return;
+            if (this.analyzing) {
+                this.notify('Wait for track detection to finish before exporting.', { type: 'warning', timeout: 5000 });
+                return;
+            }
+            if (this.currentLocked) {
+                this.notify('This recording is already exporting or waiting to export.', { type: 'info', timeout: 4000 });
+                return;
+            }
             const readiness = this.fileReadiness(this.currentFileId, false);
             if (!readiness.ready) {
                 if (!readiness.completed) this.notify(readiness.reason, { type: 'warning', timeout: 6000 });
                 return;
             }
+            // An export of unknown outcome may still be running: never start or queue another on a guess.
+            if (this.hasUncertainExport) {
+                this.notify("An earlier export's status is unknown. Reload to check the server before exporting.", { type: 'warning', timeout: 6000 });
+                return;
+            }
             this.saveWorkspace();
-            await this.submitExport(this.currentFileId, this.buildExportRequest(this.currentFileId), this.exportSignature());
+            const request = this.buildExportRequest(this.currentFileId);
+            const signature = this.exportSignature();
+            if (this.exportBusy) {
+                this.enqueueExport(this.currentFileId, request, signature);
+                return;
+            }
+            await this.submitExport(this.currentFileId, request, signature);
+        },
+
+        /** Freeze this recording's request now; the dispatcher starts it after the running export settles. */
+        enqueueExport(fileId, request, signature) {
+            const file = this.uploadedFiles.find(entry => entry.id === fileId);
+            this.exportQueue.push(JSON.parse(JSON.stringify({ fileId, filename: file.filename,
+                previousStatus: file.status, signature, request })));
+            file.status = 'queued'; file.error = ''; file.progress = 0;
+            file.processingMessage = 'Waiting for the current export…';
+            this.successMessage = '';
+            this.notify(`"${this.shortFilename(file.filename)}" is queued. It starts after the current export.`, { type: 'info', timeout: 5000 });
+            this.scheduleExportDrain();
         },
 
         /** Freeze the ready set, then wait for each terminal result before submitting the next. */
         async processAllReady() {
-            if (this.exportBusy || this.analyzing) return;
+            if (this.exportBusy || this.analyzing) {
+                this.notify(this.processAllReason || 'Wait for the current export to finish.', { type: 'warning', timeout: 5000 });
+                return;
+            }
             this.batchProcessing = true;
             this.batchSummary = null;
             this.albumWarnings = [];
@@ -4391,6 +4607,7 @@ function vinylApp() {
                 }
                 this._batchFileId = null; this._batchResolve = null;
                 this.batchProcessing = false;
+                this.scheduleExportDrain();
                 this.batchSummary = { results, completed: results.filter(result => result.status === 'complete').length,
                     failed: results.filter(result => result.status === 'error').length,
                     uncertain: results.filter(result => result.status === 'uncertain').length,
@@ -4485,6 +4702,7 @@ function vinylApp() {
             }
             this.isProcessing = false;
             this.stopProcessPolling();
+            this.scheduleExportDrain();
             if (this._albumResolve) {
                 const resolve = this._albumResolve;
                 this._albumResolve = null;
@@ -4530,7 +4748,7 @@ function vinylApp() {
             file.album_job_id = null;
             file.status = 'processing'; file.progress = 0; file.error = '';
             this.isProcessing = true;
-            this.successMessage = '';
+            if (fileId === this.currentFileId) this.successMessage = '';
             this.exportProgress(fileId, 0.1, 'Starting…');
             if (fileId === this.currentFileId) this.saveWorkspace();
             else if (this.workspaces[fileId]) {
@@ -4571,7 +4789,10 @@ function vinylApp() {
                     const resolve = this._batchResolve;
                     this._batchResolve = null;
                     resolve({ status: 'uncertain', error: file.error });
-                } else this.notify(file.error, { type: 'error' });
+                } else {
+                    this.notify(file.error, { type: 'error' });
+                    this.scheduleExportDrain();   // halts anything queued behind the unknown export
+                }
             }
         },
 
@@ -4618,15 +4839,14 @@ function vinylApp() {
          * Reset UI for next file
          */
         resetForNextFile() {
-            if (this.exportBusy) return;
+            if (this.currentLocked) return;
             this.saveWorkspace();
             this.currentFileId = null;
             this.currentFile = null;
             this.destroyWaveform();
-            this.stopProcessPolling();
+            // Another recording's export may be running: leave its polling and flag alone.
             this.abReset();
             this.successMessage = '';
-            this.isProcessing = false;
             this.detectedTracks = [];
             this.resetEditState();
             this.searchSeq++;

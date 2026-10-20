@@ -94,6 +94,26 @@ def parse_sample_rate(ffmpeg_stderr: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+_CHANNELS_RE = re.compile(r"Audio:.*?,\s*\d+ Hz,\s*([^,\n]+)")
+
+
+def parse_channels(ffmpeg_stderr: str) -> Optional[int]:
+    """Channel count of the first audio stream from ffmpeg's header dump
+    (``mono``, ``stereo``, ``3 channels``; named surround layouts count as 3)."""
+    m = _CHANNELS_RE.search(ffmpeg_stderr or "")
+    if not m:
+        return None
+    word = m.group(1).strip()
+    if word == "mono":
+        return 1
+    if word == "stereo":
+        return 2
+    n = re.match(r"(\d+) channels", word)
+    if n:
+        return int(n.group(1))
+    return 3 if word else None
+
+
 def parse_source_bit_depth(ffmpeg_stderr: str) -> Optional[int]:
     """Map ffmpeg's first audio stream line to an export depth: 16 or 24.
 
@@ -491,6 +511,20 @@ class LoudnessSource:
     noise: Optional[NoiseProfile] = None
 
 
+def _measure_layout(channels: int, all_mono: bool) -> str:
+    """Filter tail bringing one part to the group's layout for the combined ebur128.
+
+    Each part must read as it does when the finished file is measured alone: an all-mono
+    group stays mono; in a mixed group a mono part is folded into stereo at -3.01 dB per
+    channel (dual-mono at unity reads +3 LU louder); stereo is unchanged; >2 channels
+    are downmixed to stereo."""
+    if all_mono:
+        return "aformat=sample_fmts=dbl:channel_layouts=mono"
+    if channels == 1:
+        return "aformat=sample_fmts=dbl:channel_layouts=mono,pan=stereo|c0=0.70711*c0|c1=0.70711*c0"
+    return "aformat=sample_fmts=dbl:channel_layouts=stereo"
+
+
 def parse_ebur128_summary(ffmpeg_stderr: str) -> Optional[Loudness]:
     """Parse the ``Summary:`` block printed by ``ebur128=peak=true``.
 
@@ -608,8 +642,18 @@ class AudioProcessor:
         self.min_silence_duration = min_silence_duration
         self.min_track_length = min_track_length
         self.flac_compression = flac_compression
-        # (path, mtime_ns, size) -> (duration, sample_rate); one header read per source.
+        # (path, mtime_ns, size) -> (duration, sample_rate, channels); one header read per source.
         self._probe_cache: dict = {}
+
+    def probe_layout(self, file_path: Path) -> Tuple[Optional[int], Optional[int]]:
+        """(sample rate Hz, channel count) from the same cached header read as ``probe_info``."""
+        self.probe_info(file_path)
+        try:
+            st = Path(file_path).stat()
+            hit = self._probe_cache.get((str(file_path), st.st_mtime_ns, st.st_size))
+        except OSError:
+            hit = None
+        return (hit[1], hit[2]) if hit else (None, None)
 
     def probe_info(self, file_path: Path) -> Tuple[Optional[float], Optional[int]]:
         """(duration seconds, sample rate Hz), cached per source file."""
@@ -619,16 +663,17 @@ class AudioProcessor:
         except OSError:
             key = None
         if key is not None and key in self._probe_cache:
-            return self._probe_cache[key]
+            return self._probe_cache[key][:2]
         try:
             result = run_ffmpeg(["-i", str(file_path)], capture_output=True, timeout=30)
-            info = (parse_duration_header(result.stderr), parse_sample_rate(result.stderr))
+            info = (parse_duration_header(result.stderr), parse_sample_rate(result.stderr),
+                    parse_channels(result.stderr))
         except Exception as e:
             print(f"Error probing audio: {e}")
             return None, None
         if key is not None and info[0] is not None and info[1]:
             self._probe_cache[key] = info
-        return info
+        return info[:2]
 
     def padded_cut(self, file_path: Path, start: float, end: float):
         """``padded_window`` for a cut of ``file_path`` or None if the source
@@ -671,7 +716,8 @@ class AudioProcessor:
             try:
                 st = Path(file_path).stat()
                 if duration is not None and rate:
-                    self._probe_cache[(str(file_path), st.st_mtime_ns, st.st_size)] = (duration, rate)
+                    self._probe_cache[(str(file_path), st.st_mtime_ns, st.st_size)] = (
+                        duration, rate, parse_channels(result.stderr))
             except OSError:
                 pass
             return duration, parse_source_bit_depth(result.stderr)
@@ -972,25 +1018,33 @@ class AudioProcessor:
         """Measure concatenated, separately cleaned cuts, retaining the native peak ceiling.
 
         A single integrated pass applies the loudness gate to the entire programme. Native
-        per-source measurements supply a conservative peak when layouts/sample rates differ.
+        per-source measurements supply a conservative peak only when layouts/sample rates differ
+        (uniform groups take the peak from the combined pass).
         FFmpeg streams the cuts; no album-sized PCM array is returned to Python.
         """
         if not sources or any(not source.ranges for source in sources):
             return None
-        peaks = []
-        rates = []
-        for source in sources:
-            native = self.measure_ranges(source.path, source.ranges, source.rumble, source.declick,
-                                         hum=source.hum, hiss=source.hiss, noise=source.noise)
-            _, rate = self.probe_info(source.path)
-            if native is None or not rate:
-                return None
-            peaks.append(native.true_peak)
-            rates.append(rate)
+        layouts = [self.probe_layout(source.path) for source in sources]
+        if any(not rate or not channels for rate, channels in layouts):
+            return None
+        rates = [rate for rate, _ in layouts]
+        channels = [count for _, count in layouts]
         common_rate = max(rates)
+        # Same rate and layout everywhere: the combined pass sees the samples as decoded, so its
+        # peak is the native peak and the slow per-source cleaning pass is skipped.
+        uniform = len(set(rates)) == 1 and len(set(channels)) == 1 and channels[0] <= 2
+        peaks = []
+        if not uniform:
+            for source in sources:
+                native = self.measure_ranges(source.path, source.ranges, source.rumble, source.declick,
+                                             hum=source.hum, hiss=source.hiss, noise=source.noise)
+                if native is None:
+                    return None
+                peaks.append(native.true_peak)
+        all_mono = all(count == 1 for count in channels)
         args = ["-hide_banner", "-nostats"]
         parts = []
-        for source in sources:
+        for source, count in zip(sources, channels):
             for bounds in source.ranges:
                 start, end = bounds[:2]
                 declick = bounds[2] if len(bounds) > 2 and bounds[2] else source.declick
@@ -1004,12 +1058,12 @@ class AudioProcessor:
                     args += ["-ss", f"{start:.6f}", "-t", f"{end-start:.6f}", "-i", str(source.path)]
                     chain = "asetpts=PTS-STARTPTS"
                 index = len(parts)
-                parts.append(f"[{index}:a]{chain},aresample={common_rate},"
-                             f"aformat=sample_fmts=dbl:channel_layouts=stereo[s{index}]")
+                resample = "" if uniform else f",aresample={common_rate}"
+                parts.append(f"[{index}:a]{chain}{resample},{_measure_layout(count, all_mono)}[s{index}]")
         inputs = "".join(f"[s{index}]" for index in range(len(parts)))
         graph = ";".join(parts) + f";{inputs}concat=n={len(parts)}:v=0:a=1,ebur128=peak=true:framelog=quiet"
         album = self._measure(args + ["-filter_complex", graph])
-        return Loudness(album.integrated, max(album.true_peak, *peaks)) if album else None
+        return Loudness(album.integrated, max([album.true_peak, *peaks])) if album else None
 
     def measure_file(self, file_path: Path) -> Optional[Loudness]:
         """Loudness of one finished file."""
@@ -1027,12 +1081,13 @@ class AudioProcessor:
         args = ["-hide_banner", "-nostats"]
         for p in file_paths:
             args += ["-i", str(p)]
-        rates = [self.probe_info(path)[1] for path in file_paths]
-        if not all(rates):
+        layouts = [self.probe_layout(path) for path in file_paths]
+        if any(not rate or not channels for rate, channels in layouts):
             return None
-        common_rate = max(rates)
-        parts = [f"[{index}:a]aresample={common_rate},aformat=sample_fmts=dbl:channel_layouts=stereo,"
-                 f"asetpts=PTS-STARTPTS[s{index}]" for index in range(len(file_paths))]
+        common_rate = max(rate for rate, _ in layouts)
+        all_mono = all(channels == 1 for _, channels in layouts)
+        parts = [f"[{index}:a]aresample={common_rate},{_measure_layout(channels, all_mono)},"
+                 f"asetpts=PTS-STARTPTS[s{index}]" for index, (_, channels) in enumerate(layouts)]
         inputs = "".join(f"[s{index}]" for index in range(len(file_paths)))
         graph = ";".join(parts) + f";{inputs}concat=n={len(file_paths)}:v=0:a=1,ebur128=peak=true:framelog=quiet"
         return self._measure(args + ["-filter_complex", graph])

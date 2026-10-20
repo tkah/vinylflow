@@ -292,7 +292,7 @@
                     <h1 class="text-3xl font-bold text-white">
                     VinylFlow
                     </h1>
-                    <button @click="showSettings = !showSettings" :disabled="exportBusy" class="px-4 py-2 bg-white bg-opacity-10 hover:bg-opacity-20 text-white rounded-lg transition">
+                    <button @click="showSettings = !showSettings" class="px-4 py-2 bg-white bg-opacity-10 hover:bg-opacity-20 text-white rounded-lg transition">
                         ⚙️ Settings
                     </button>
                 </div>
@@ -574,7 +574,7 @@
                 <p x-show="workspaceNotice" role="status" class="text-sm text-secondary mb-2" x-text="workspaceNotice"></p>
                 <div class="flex flex-wrap gap-2">
                     <template x-for="file in recoverableFiles" :key="file.id">
-                        <button @click="selectFile(file.id)" :disabled="analyzing || isProcessing" class="px-3 py-2 rounded-lg text-sm text-primary hover:bg-page border" style="border-color: #8A8A86;">
+                        <button @click="selectFile(file.id)" :disabled="analyzing" :title="analyzing ? 'Wait for track detection to finish before switching recordings' : ''" class="px-3 py-2 rounded-lg text-sm text-primary hover:bg-page border" style="border-color: #8A8A86;">
                             Resume <span class="font-semibold" x-text="file.filename"></span>
                             <span x-show="file.status === 'processing'"> — Processing…</span>
                         </button>
@@ -693,10 +693,11 @@
                     <div class="bg-card rounded-lg shadow p-4">
                         <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
                             <h2 class="text-lg font-semibold text-primary">Queue (<span x-text="uploadedFiles.length"></span>)</h2>
-                            <button @click="processAllReady()" :disabled="exportBusy || analyzing || readyFiles.length === 0"
+                            <button @click="processAllReady()" :disabled="exportBusy || analyzing || readyFiles.length === 0" :title="processAllReason"
                                     class="px-3 py-2 btn-primary rounded-lg text-sm font-semibold"
                                     x-text="batchProcessing ? 'Batch processing…' : `Process all ready (${readyFiles.length})`"></button>
                         </div>
+                        <p x-show="processAllReason" x-cloak class="text-xs text-secondary mb-2" role="status" x-text="processAllReason"></p>
                         <p class="text-xs text-secondary mb-2">Recordings of the same release and output format share album gain and ReplayGain. Album groups finish on the server; keep this page open to start the remaining groups.</p>
                         <div x-show="batchSummary && !batchProcessing" role="status" class="mb-3 p-2 rounded-lg text-sm text-primary" style="background-color: #F0EFEB;">
                             <p x-text="batchSummary ? `${batchSummary.completed} complete · ${batchSummary.failed} failed${batchSummary.uncertain ? ' · export status unknown' : ''}${batchSummary.notStarted ? ` · ${batchSummary.notStarted} not started` : ''}` : ''"></p>
@@ -725,7 +726,7 @@
                                                x-text="queueLabel(file)"></p>
                                             <p x-show="queueReason(file)" class="text-xs text-secondary" x-text="queueReason(file)"></p>
                                         </div>
-                                        <button @click.stop="removeFile(file.id)" :disabled="batchProcessing || ['processing', 'uncertain'].includes(file.status) || (file.album_job_status && file.album_job_status !== 'complete') || (file.id === currentFileId && analyzing)" aria-label="Remove recording from queue" class="ml-2 btn-danger hover:opacity-80 px-2 py-1 rounded text-xs">✕</button>
+                                        <button @click.stop="removeFile(file.id)" :disabled="isLocked(file.id) || (file.id === currentFileId && analyzing)" :title="isLocked(file.id) ? 'Can\'t remove while exporting or waiting to export' : ''" aria-label="Remove recording from queue" class="ml-2 btn-danger hover:opacity-80 px-2 py-1 rounded text-xs">✕</button>
                                     </div>
                                     <template x-if="file.progress > 0">
                                         <div class="mt-1">
@@ -750,7 +751,7 @@
 
                         <!-- Skip Discogs: silence-only detection (secondary action) -->
                         <template x-if="!detectedTracks.length && currentFile">
-                            <button @click="analyzeFile()" :disabled="analyzing || exportBusy" class="mt-3 px-3 py-1.5 rounded-lg text-xs text-secondary hover:bg-page" style="background-color: #F0EFEB;" :class="{'opacity-60 cursor-not-allowed': analyzing}">
+                            <button @click="analyzeFile()" :disabled="analyzing || currentLocked" class="mt-3 px-3 py-1.5 rounded-lg text-xs text-secondary hover:bg-page" style="background-color: #F0EFEB;" :class="{'opacity-60 cursor-not-allowed': analyzing}">
                                 <span x-show="!analyzing">Skip Discogs — detect tracks by silence only</span>
                                 <span x-show="analyzing" class="flex items-center gap-2">
                                     <div class="spinner"></div>
@@ -760,12 +761,12 @@
                         </template>
 
                         <button x-show="detectedTracks.length && !selectedRelease" @click="tryDiscogsAgain()"
-                                :disabled="analyzing || searchLoading || isProcessing"
+                                :disabled="analyzing || searchLoading || currentLocked"
                                 class="mt-3 px-3 py-2 rounded-lg text-sm text-primary hover:bg-page border" style="border-color: #8A8A86;">Try Discogs again</button>
 
                         <!-- Re-Analyze Button -->
                         <template x-if="detectedTracks.length > 0 && !selectedRelease">
-                            <button @click="reanalyzeFile()" :disabled="analyzing || exportBusy" class="mt-3 px-4 py-2 btn-primary rounded-lg font-semibold text-sm" :class="{'opacity-60 cursor-not-allowed': analyzing}">
+                            <button @click="reanalyzeFile()" :disabled="analyzing || currentLocked" class="mt-3 px-4 py-2 btn-primary rounded-lg font-semibold text-sm" :class="{'opacity-60 cursor-not-allowed': analyzing}">
                                 <span x-show="!analyzing">🔄 Re-Analyze Tracks</span>
                                 <span x-show="analyzing" class="flex items-center gap-2">
                                     <div class="spinner"></div>
@@ -780,7 +781,7 @@
                                 <p class="text-xs text-secondary mb-2">Wrong number of tracks? Enter how many songs the recording has and Smart Rescan will adjust detection automatically.</p>
                                 <div class="flex items-center gap-2">
                                     <input type="number" min="1" max="99" x-model="expectedTracks" placeholder="e.g. 6" class="w-20 px-3 py-2 border focus-primary rounded-lg text-sm" style="border-color: #8A8A86;" @keyup.enter="smartRescan(expectedTracks)">
-                                    <button @click="smartRescan(expectedTracks)" :disabled="analyzing || exportBusy" class="px-4 py-2 btn-primary rounded-lg font-semibold text-sm" :class="{'opacity-60 cursor-not-allowed': analyzing}">
+                                    <button @click="smartRescan(expectedTracks)" :disabled="analyzing || currentLocked" class="px-4 py-2 btn-primary rounded-lg font-semibold text-sm" :class="{'opacity-60 cursor-not-allowed': analyzing}">
                                         <span x-show="!analyzing">🎯 Smart Rescan</span>
                                         <span x-show="analyzing" class="flex items-center gap-2">
                                             <div class="spinner"></div>
@@ -796,7 +797,14 @@
             </div>
         </div>
 
-        <fieldset :disabled="batchProcessing" class="contents">
+        <div x-show="currentLocked" x-cloak role="status" class="max-w-7xl mx-auto px-4 pb-2 sm:px-6 lg:px-8">
+            <div class="rounded-lg p-3 text-sm text-primary" style="background-color: #F0EFEB;">
+                <span class="font-semibold" x-text="currentFile?.status === 'queued' ? 'Waiting to export.' : (currentFile?.status === 'uncertain' ? 'Export status unknown.' : 'Exporting.')"></span>
+                This recording is read-only until its export finishes. Pick another recording in the queue to keep working.
+                <span x-show="currentExporting && currentFile.progress > 0" x-text="`(${Math.round((currentFile?.progress || 0) * 100)}%${currentFile?.processingMessage ? ' · ' + currentFile.processingMessage : ''})`"></span>
+            </div>
+        </div>
+        <fieldset :disabled="currentLocked" class="contents">
         <!-- Discogs Search (step 1 after upload) -->
         <div id="discogs-search" x-show="currentFile && !selectedRelease" x-cloak class="max-w-7xl mx-auto px-4 pb-2 sm:px-6 lg:px-8">
             <div class="bg-card rounded-lg shadow p-6">
@@ -820,7 +828,7 @@
 
                 <!-- Shortcut: reuse the release chosen for another queued file (e.g. disc 2 of a 2xLP) -->
                 <template x-for="sc in sameReleaseShortcuts" :key="sc.fileId">
-                    <button type="button" @click="selectRelease(sc.release)" :disabled="analyzing || exportBusy"
+                    <button type="button" @click="selectRelease(sc.release)" :disabled="analyzing || currentLocked"
                             class="mb-3 mr-2 px-4 py-2 rounded-lg border-2 text-sm text-left hover:bg-page"
                             style="border-color: #E5A100; color: #3D3D3D;" :class="{'opacity-60 cursor-not-allowed': analyzing}">
                         Use same release as <span class="font-semibold" x-text="sc.filename"></span>:
@@ -888,6 +896,8 @@
             </div>
         </div>
 
+        </fieldset>
+        <!-- Player stays usable on a locked (exporting) recording; its regions are frozen in app.js -->
         <!-- Waveform Visualization - Full Bleed -->
         <div x-show="detectedTracks.length > 0" x-cloak class="bg-card shadow-lg py-8 my-8">
             <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
@@ -907,6 +917,7 @@
                 <div x-show="waveformLoading" class="text-center text-secondary py-8 text-lg">Loading waveform...</div>
                 <div x-show="!waveform && !waveformLoading" class="text-center text-muted py-8">Waveform will appear after analysis completes</div>
                 <p x-show="playerNotice" x-cloak class="mb-2 text-sm text-primary" x-text="playerNotice"></p>
+                <p x-show="playerInfo" x-cloak class="mb-2 text-xs text-muted" x-text="playerInfo"></p>
                 <p class="text-sm text-muted">💡 Tip: Drag the colored regions to adjust track boundaries, or right-click to add splits</p>
                 <p x-show="clickLegendVisible()" x-cloak class="mt-1 text-xs text-muted flex items-center gap-2" data-testid="click-legend">
                     <span class="inline-block w-3 h-1.5" style="background-color: rgba(217, 64, 50, 0.9);"></span>
@@ -919,6 +930,7 @@
             </div>
         </div>
 
+        <fieldset :disabled="currentLocked" class="contents">
         <!-- Track Controls & Additional Content -->
         <div class="max-w-7xl mx-auto px-4 py-6 sm:px-6 lg:px-8">
             <div class="space-y-6">
@@ -947,7 +959,7 @@
                         <div x-show="editBanner" x-cloak class="mb-4 p-3 rounded-lg flex flex-wrap items-center gap-3" style="background-color: rgba(229, 161, 0, 0.15); border: 1px solid #E5A100;">
                             <p class="text-sm text-primary flex-1">You've adjusted track boundaries by hand.</p>
                             <div class="flex gap-2">
-                                <button @click="snapToDiscogs()" :disabled="analyzing || exportBusy" class="px-3 py-1.5 btn-primary rounded-lg text-sm font-semibold">Snap to Discogs</button>
+                                <button @click="snapToDiscogs()" :disabled="analyzing || currentLocked" class="px-3 py-1.5 btn-primary rounded-lg text-sm font-semibold">Snap to Discogs</button>
                                 <button @click="keepMyEdits()" class="px-3 py-1.5 rounded-lg text-sm text-primary" style="background-color: #F0EFEB;">Keep my edits</button>
                             </div>
                         </div>
@@ -972,7 +984,7 @@
                                         💡 Right-click the waveform to add splits, or right-click a track region to ignore it.
                                     </p>
                                     <div class="flex flex-wrap gap-2">
-                                        <button @click="smartRescan(targetTracks.length)" :disabled="analyzing || exportBusy" class="px-3 py-1.5 btn-primary rounded-lg text-sm font-semibold" :class="{'opacity-60 cursor-not-allowed': analyzing}">
+                                        <button @click="smartRescan(targetTracks.length)" :disabled="analyzing || currentLocked" class="px-3 py-1.5 btn-primary rounded-lg text-sm font-semibold" :class="{'opacity-60 cursor-not-allowed': analyzing}">
                                             <span x-show="!analyzing" x-text="`🎯 Smart rescan for ${targetTracks.length} tracks`"></span>
                                             <span x-show="analyzing" class="flex items-center gap-2">
                                                 <div class="spinner"></div>
@@ -1064,7 +1076,7 @@
                     <div x-show="selectedRelease" x-cloak class="bg-card rounded-lg shadow p-6">
                         <div class="flex justify-between items-center mb-4">
                             <h3 class="text-lg font-semibold text-primary">💿 Release &amp; Export</h3>
-                            <button @click="changeRelease()" :disabled="analyzing || exportBusy" class="px-4 py-2 rounded-lg text-primary hover:bg-page" style="background-color: #F0EFEB;">← Change release</button>
+                            <button @click="changeRelease()" :disabled="analyzing || currentLocked" class="px-4 py-2 rounded-lg text-primary hover:bg-page" style="background-color: #F0EFEB;">← Change release</button>
                         </div>
 
                         <!-- Selected Release Info -->
@@ -1098,7 +1110,7 @@
                                             <span x-text="donorTitle(d)"></span>
                                             <span class="ml-2 text-xs text-muted" x-text="`${d.matched}/${d.total} matched`"></span>
                                         </div>
-                                        <button type="button" @click="applyDonor(d)" :disabled="analyzing || exportBusy"
+                                        <button type="button" @click="applyDonor(d)" :disabled="analyzing || currentLocked"
                                                 class="px-3 py-1.5 btn-primary rounded-lg text-sm" :class="{'opacity-60 cursor-not-allowed': analyzing}">Use these lengths</button>
                                     </div>
                                 </template>
@@ -1114,7 +1126,7 @@
                             <!-- Scope presets: full album / per disc -->
                             <div x-show="sidePresets.length > 0" class="flex flex-wrap gap-2 mb-3">
                                 <template x-for="preset in sidePresets" :key="preset.label">
-                                    <button type="button" @click="applyPreset(preset.sides)" :disabled="analyzing || exportBusy"
+                                    <button type="button" @click="applyPreset(preset.sides)" :disabled="analyzing || currentLocked"
                                             class="px-4 py-2 rounded-lg border-2 transition text-left"
                                             :style="sidesEqualSelection(preset.sides) ? 'border-color: #E5A100; color: #E5A100; background-color: rgba(229, 161, 0, 0.1);' : 'border-color: #8A8A86;'"
                                             :class="{'hover:bg-card': !sidesEqualSelection(preset.sides), 'opacity-60 cursor-not-allowed': analyzing}">
@@ -1315,13 +1327,14 @@
                         </div>
 
                         <!-- Process Button -->
-                        <button @click="processFile()" :disabled="exportBusy || analyzing || !fileReadiness(currentFileId, false).ready" class="w-full px-6 py-3 btn-primary rounded-lg font-bold text-lg">
-                            <span x-show="!isProcessing" x-text="processingComplete ? '✓ Complete' : '✓ Process & Save'"></span>
-                            <span x-show="isProcessing" class="flex items-center justify-center gap-2">
+                        <button @click="processFile()" :disabled="processDisabled" :title="processHint" class="w-full px-6 py-3 btn-primary rounded-lg font-bold text-lg">
+                            <span x-show="!currentExporting" x-text="processButtonLabel"></span>
+                            <span x-show="currentExporting" class="flex items-center justify-center gap-2">
                                 <div class="spinner"></div>
                                 Processing...
                             </span>
                         </button>
+                        <p x-show="processHint" x-cloak class="mt-2 text-sm text-secondary" role="status" x-text="processHint"></p>
 
                     </div>
 
@@ -1329,7 +1342,7 @@
                     <div x-show="successMessage" x-cloak class="rounded-lg p-6" style="background-color: rgba(229, 161, 0, 0.1); border: 2px solid #E5A100;">
                         <h3 class="text-lg font-bold text-primary mb-2">✓ Processing Complete!</h3>
                         <p class="text-secondary" x-text="successMessage"></p>
-                        <button @click="resetForNextFile()" :disabled="exportBusy" class="mt-4 px-6 py-2 btn-primary rounded-lg">
+                        <button @click="resetForNextFile()" :disabled="currentLocked" class="mt-4 px-6 py-2 btn-primary rounded-lg">
                             Process Next File
                         </button>
                     </div>
