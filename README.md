@@ -111,9 +111,18 @@ cd vinylflow
 
 ### Accessing from other devices (LAN)
 
-By default the port is published on `127.0.0.1` only, so VinylFlow is reachable just from the computer running it. To open it from a phone or another computer, add `BIND_ADDRESS=0.0.0.0` to your `.env` and run `docker compose up -d` again, then browse to `http://<your-computer's-IP>:8000`.
+By default the port is published on `127.0.0.1` only, so VinylFlow is reachable just from the computer running it. To open it from a phone or another computer, add `BIND_ADDRESS=0.0.0.0` to your `.env` and run `docker compose up -d` again, then browse to `http://<your-computer's-IP>:8000`. To reach it by a hostname instead of an IP, also add `VINYLFLOW_ALLOWED_HOSTS=<name>` (e.g. `nas.local`) to your `.env`.
 
 **Risk:** VinylFlow has no authentication, and the API can change the output folder and write files there. Anyone who can reach the port can use it, so only enable this on a trusted network.
+
+### Import from a folder (no upload)
+
+A full album recorded at 24-bit/96 kHz is about 1.5 GB, and uploading it through the browser copies it into the container. Instead, put your recordings in the `incoming/` folder next to `docker-compose.yml` (created on first start) and use the **Import from folder** tab: VinylFlow reads them where they are.
+
+- To use a folder you already have, set `IMPORT_FOLDER=/path/to/your/recordings` in `.env` and run `docker compose up -d` again.
+- The folder is mounted **read-only**: VinylFlow never modifies, moves or deletes your recordings. Removing a file from the queue (or the automatic temp clean-up) only deletes VinylFlow's own preview and analysis files.
+- Subfolders are listed (up to 3 levels). A file that was changed in the last few seconds shows as "Still copying…" until the copy finishes.
+- Desktop app: the import folder is `~/Music/VinylFlow/Incoming`, and **Choose files…** opens any WAV/AIFF on your computer in place.
 
 ## 3. First-Run Setup
 
@@ -229,6 +238,7 @@ DEFAULT_OUTPUT_DIR=~/Music/VinylFlow
 
 **Notes:**
 - The `output/` and `temp_uploads/` directories are created automatically
+- To import recordings in place instead of uploading them, add `VINYLFLOW_IMPORT_DIR=~/Music/VinylFlow/Incoming` (or any folder) to `.env`
 - You can adjust silence detection and other settings in `.env` (see [Configuration](#configuration) below)
 - To stop the server, press `Ctrl+C` in the terminal
 
@@ -236,7 +246,7 @@ DEFAULT_OUTPUT_DIR=~/Music/VinylFlow
 
 ## How It Works
 
-1. **Upload** — drag and drop your WAV or AIFF recording
+1. **Import or upload** — pick a WAV or AIFF recording from the import folder, or drag and drop it
 2. **Analyze** — VinylFlow detects track boundaries using silence detection
 3. **Search** — find your album on Discogs with visual artwork results
 4. **Map** — match detected tracks to Discogs track listings

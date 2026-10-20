@@ -78,6 +78,14 @@ class Config:
             os.getenv("DEFAULT_OUTPUT_DIR", str(Path.home() / "Music" / "new 12-inches"))
         )
 
+        # Import folder: files here are referenced in place instead of uploaded.
+        # Read-only over the API (never in ConfigUpdate): set via settings.json or env.
+        self.import_dir = (
+            json_settings.get('IMPORT_DIR') or
+            os.getenv("VINYLFLOW_IMPORT_DIR") or
+            None
+        )
+
         # Audio processing settings
         self.default_silence_threshold = float(os.getenv("DEFAULT_SILENCE_THRESHOLD", "-40"))
         self.default_min_silence_duration = float(os.getenv("DEFAULT_MIN_SILENCE_DURATION", "1.5"))

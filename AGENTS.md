@@ -1,0 +1,397 @@
+# VinylFlow — Agent Instructions
+
+This file is the single source of truth for agent conventions and project context in this
+repository. `CLAUDE.md` imports it. Add or change conventions here, never in a tool-specific
+file, so that Claude Code, Codex, and other agents read the same instructions.
+
+## Working in This Repository
+
+- Before reviewing or changing an implementation, inspect `git status` and the relevant diff
+  at the repository root.
+- Preserve all pre-existing work. Never discard, overwrite, reformat, or fold unrelated dirty
+  files into the requested change merely to simplify the diff.
+- Prefer editing existing files and following established patterns. Do not add features,
+  abstractions, dependencies, or error handling beyond what the task requires.
+- Use readable, descriptive variable names. Short loop indices and local mathematical variables
+  are fine; names for state, data, and helpers should say what they hold or do.
+- Keep implementations straightforward. Share repeated logic through existing helpers or a
+  focused utility; avoid speculative abstraction layers.
+- Give repeated or meaningful limits, preset values, and protocol strings named constants in
+  the appropriate module. Keep backend and frontend contracts consistent.
+- Keep audio processing memory bounded: full-album recordings can be about 1.5 GB. Prefer
+  chunked decoding and the existing envelope/cache machinery over loading entire recordings.
+
+## Plans and Reviews
+
+- For planned work, treat the applicable document in `docs/plans/` and its settled decisions as
+  the implementation contract. These plans are local and git-ignored; do not force-add them.
+- A checked box or implementation note is a claim to verify, not evidence of completion.
+  Trace requirements to implementation and meaningful tests before updating completion notes.
+- When reviewing another agent's work, check the plan's requirements, invariants, and known
+  traps as well as the diff. Do not rewrite acceptance criteria to make existing code pass.
+- Make implementation briefs self-contained: name the files, required behavior, invariants,
+  mistakes to avoid, test cases, and exact offline verification commands.
+- If work is delegated, pass on these instructions, the applicable plan, the no-Discogs rule,
+  the Git boundary, and the verification commands. Review the result against the plan and
+  verify it before reporting completion.
+- Choose audio thresholds and filter parameters by measurement where practical. Keep a
+  focused synthetic regression test and report the measured trade-offs.
+
+## Git Boundary
+
+- No commits or pushes unless the user asks. Merging belongs to the user unless explicitly
+  requested. A statement that work is branched, committed, or clean is status, not permission.
+- Never commit to `main`; it is the upstream mirror. New feature work starts on a feature
+  branch from `discogs-first-flow`. Preserve an existing in-progress branch and its work.
+- Stage only your own changes, by path. Never use `git add -A`, `git add .`, or `git commit -a`.
+  Leave files with pre-existing uncommitted edits unstaged and report that boundary.
+- Never rewrite history you did not create in the current task: no reset, rebase, amend,
+  force operation on pre-existing commits, or branch deletion.
+- Read-only Git inspection is allowed. Before committing code, use the verification recipe
+  in `.claude/skills/verify/SKILL.md`; documentation-only edits do not need the code suites.
+
+## Testing and Verification Expectations
+
+- For behavior changes, add focused coverage at the affected layer: pytest for backend/audio
+  logic and Node tests under `tests/frontend/` for frontend logic.
+- For bug fixes and changes to existing behavior, write the regression test first and confirm
+  it fails for the expected reason before implementing the fix. Cover relevant error and edge
+  cases, not just the happy path.
+- Do not weaken a test to make a change pass. If a requirement changed, explain why the test
+  must change. Mechanical refactors should keep existing tests green unchanged.
+- Documentation, copy, and layout-only changes do not need new automated tests. Verify the
+  affected content or layout directly; explain any verification limitations in the final report.
+- Run the relevant focused tests before reporting completion. Follow the offline commands in
+  [Testing](#testing); never substitute a live Discogs call or the user's running container.
+- Report what was verified and what could not be verified, with the reason. Passing frontend
+  logic tests does not establish that a visual layout works in the app.
+
+## Comments and Readability
+
+- Document public helpers and non-obvious contracts with concise Python docstrings or JavaScript
+  comments as appropriate. Explain intent, constraints, or surprising behavior, not obvious code.
+- Comment subtle state transitions, async/browser-event handling, security/path boundaries,
+  cache invalidation, persistence behavior, and framework or platform workarounds.
+- Explain unusual test fakes and mocks so future changes preserve the reason they exist.
+
+## Design and Accessibility
+
+- Minimize clicks for common tasks. Prefer direct navigation and inline controls; use
+  progressive disclosure for secondary features.
+- Design for desktop windows and smaller browser viewports. Use responsive Tailwind layouts
+  and avoid fixed widths that overflow on small screens.
+- Meet WCAG 2.1 AA contrast requirements: at least 4.5:1 for normal text and 3:1 for large text
+  and meaningful UI graphics. Check new color combinations with a contrast checker.
+- Keep interactive controls distinguishable in default, hover, focus, and disabled states.
+  Always provide a visible focus indicator.
+- Never rely on color alone for meaning; pair it with labels, icons, or patterns. Use muted
+  colors for decoration only when they would make meaningful text or controls hard to read.
+- Preserve the existing interaction conventions: toasts and inline notices instead of
+  `alert()`/`confirm()`, Undo for destructive actions, and Play/Pause toggles for playback.
+
+---
+
+## Project Purpose
+Desktop app to digitize vinyl records: upload a WAV/AIFF recording of a vinyl side, detect track boundaries via silence analysis, search Discogs for metadata, and export split + tagged FLAC/MP3/AIFF files.
+
+---
+
+## Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Frontend | Alpine.js + Tailwind CSS + WaveSurfer.js (no build step; libraries vendored in `backend/static/vendor/`, no CDN) |
+| Backend | FastAPI + uvicorn (Python) |
+| Desktop shell | pywebview (WKWebView on macOS, WebView2 on Windows) |
+| Audio processing | FFmpeg (via subprocess) + Mutagen (tagging) + Pillow (cover art) |
+| Discogs API | `discogs-client` Python library |
+| Bundling | PyInstaller (`VinylFlow.spec`) |
+| CI/CD | GitHub Actions (`.github/workflows/`) |
+
+---
+
+## Directory Structure
+
+```
+vinylflow/
+├── backend/
+│   ├── api.py              # FastAPI app — all REST endpoints + WebSocket
+│   ├── security.py         # Same-origin guard (Host allow-list + Origin check, ASGI middleware; no CORS)
+│   ├── sessions/           # Session store/state + Pipeline (export job) + progress events
+│   └── static/
+│       ├── index.html      # Single-page UI (Alpine.js)
+│       ├── app.js          # Main frontend logic (~3000 lines, one Alpine object)
+│       └── fonts/          # Mirano Extended font family
+├── tests/                  # pytest (backend) + frontend/ (Node logic tests, run.js)
+├── rthooks/
+│   └── rthook_vinylflow.py # PyInstaller runtime hook (runs before app code)
+├── .github/workflows/
+│   ├── windows-release.yml # Manual trigger — builds Windows .exe via PyInstaller
+│   ├── privacy-guard.yml   # Scans commits for secrets
+│   └── release-artifact-scan.yml
+├── config.py               # Config management (settings.json > .env > env vars)
+├── audio_processor.py      # Envelope, export filter chain, loudness, ffmpeg wrappers
+├── import_folder.py       # Pure import-folder path logic: listing, name resolution (no traversal/symlink escape), overlap check
+├── track_matching.py       # Pure title normalization + tracklist matching (borrowed lengths)
+├── track_boundaries.py     # Pure track-boundary math (gaps, envelope, guided/snap, refine_cuts)
+├── click_detection.py      # Click scan: residual (original - declicked) in ffmpeg, chunk planning, thresholds, cache
+├── silence_analysis.py     # Hum detector (50/60 Hz + harmonics) + surface-noise profile, from the silent stretches only
+├── metadata_handler.py     # Discogs fetch, cover art download, audio tagging
+├── desktop_launcher.py     # Entry point — sets up dirs/env vars, starts FastAPI, opens window
+├── VinylFlow.spec          # PyInstaller spec (macOS .app + Windows .exe)
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## Architecture & Data Flow
+
+```
+User browser / pywebview window
+        │ HTTP + WebSocket (localhost:8000)
+        ▼
+FastAPI (backend/api.py)
+        │
+   ┌────┴──────────────┬────────────────┬────────────────┐
+   ▼                   ▼                ▼                ▼
+audio_processor.py  metadata_handler.py  config.py    Discogs API
+(ffmpeg subprocess) (Mutagen + Pillow)  (settings)   (discogs-client)
+```
+
+**User flow (Discogs-first):**
+1. Import a WAV/AIFF from the import folder (in place, no copy) or upload it -> a background scan computes the energy envelope and the music span (lead-in/run-out trimmed); selecting the file auto-searches Discogs from the cleaned filename.
+2. Pick a release; the app suggests which side(s) the recording covers (by length, else full album). Side chips and presets ("Full album", one per disc) change that scope.
+3. Guided detection (`/api/analyze-guided`) places exactly as many tracks as the chosen sides have, snapping Discogs-length boundaries to nearby silence. Expected boundaries use a gap model (Discogs lengths exclude the silent gaps: leftover span is split evenly into n-1 gaps, each boundary at a gap centre; `MAX_GAP_S` = 8 s per gap) and fall back to proportional scaling (clamped 0.9-1.1) when the residual is negative or too large. If lengths are missing it falls back to count-based detection (Smart Rescan ladder). "Snap to Discogs" re-runs it after hand edits; hand edits ask first (banner) and snapping is undoable.
+3b. If the chosen sides lack lengths, the Release & Export card offers "Find lengths from other pressings": durations are copied (missing ones only, marked "Lengths borrowed from ...", with Undo) onto the selected release and detection re-runs; tags still come from the selected release.
+4. Merged track table: detected tracks, Discogs mapping, ignore/inline-edit times, delete. The waveform (WaveSurfer, draggable regions, dashed ghost markers = Discogs-expected breaks) has a Play/Pause toggle (Space), cut-point audition and zoom.
+5. "Audio processing" panel in the Release & Export card (rumble filter, hum removal + 50/60 Hz, click & pop removal Off/Light/Medium/Strong, hiss reduction + Light/Medium/Strong, album gain, ReplayGain tags; each saves as the default immediately and mirrors the Settings modal; hum/hiss are off by default, and a detected hum shows a muted "Hum detected at 60 Hz (−48 dBFS) — Turn on" hint), with an optional A/B test on one track (`POST /api/restoration-test` `{rumble, declick, hum_filter, hum_freq, hiss_reduction, album_gain, album_ranges?}`; legacy `restore` bool = rumble + light), then export. `POST /api/process` takes `rumble_filter`, `declick`, `hum_filter`, `hum_freq` (50|60; the old `hum_freq` field alone is ignored), `hiss_reduction` (legacy `restoration_level` 1 = rumble + light).
+6. There is no `alert()`/`confirm()`: `notify()` toasts (info/success auto-dismiss, warning/error sticky, hover pauses) and inline notices. Destructive actions run immediately with an Undo toast (file removal defers `DELETE /api/queue/{id}` ~8 s; delete track and re-analyze restore a snapshot).
+
+**Processing pipeline** (`POST /api/process` -> `backend/sessions/pipeline.py`, run in a worker thread):
+1. Fetch release from Discogs (server-side cached)
+2. Apply the user's track->position mapping (A1, B2, etc.)
+3. Create output folder: `{Artist} - {Album}/`; download + embed cover art
+4. If album gain is on: measure all active ranges once (after the clean-up filters) and derive one gain
+5. For each track: ffmpeg extract through the shared filter chain (rumble, hum notch, declick, hiss reduction, gain, dither) -> encode -> tag -> rename
+6. If ReplayGain is on: measure the final files and write track + album tags
+7. Broadcast completion via WebSocket
+
+**Upload session storage:**
+- Source file: `VINYLFLOW_UPLOAD_DIR/{file_id}/source.{ext}` (upload) or the original file in the import folder (`Session.in_place`; never inside or linked from the session dir)
+- Derived files (MP3 preview, peaks, `envelope.npy`, click/silence caches, A/B renders) always live in `VINYLFLOW_UPLOAD_DIR/{file_id}/`; all cleanup is `rmtree` of that dir only, so an in-place source is never deleted. An import dir overlapping the uploads dir is refused. A vanished in-place source gives HTTP 410
+- Output: `DEFAULT_OUTPUT_DIR/{Artist} - {Album}/{position}-{title}.{fmt}`
+
+---
+
+## Key API Endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/upload` | Upload WAV/AIFF, create session UUID, queue MP3 preview |
+| GET | `/api/import` | Import folder listing `{enabled, dir, error, files: [{name, size, mtime, stable, imported_id}]}` (recursive ≤3 levels, hidden/`._*` skipped, ≤500) |
+| POST | `/api/import` | `{names?, paths?}` -> in-place Sessions (same shape as upload + `in_place`; `skipped` with reasons). `names` must resolve inside the import dir; `paths` only if granted by the desktop file dialog |
+| POST | `/api/analyze` | Silence detection -> track boundaries (from the cached envelope) |
+| POST | `/api/rescan` | Smart Rescan: sweep detection settings to hit an expected track count |
+| POST | `/api/analyze-guided` | Guided detection: expected count + Discogs lengths -> snapped boundaries |
+| GET | `/api/scan/{file_id}` | Background scan status (music span) |
+| GET | `/api/preview/{file_id}/{track_number}` | Generate 30s MP3 preview |
+| POST | `/api/clicks/{file_id}` | Start/join a click scan `{declick}` ("off" scans at medium); cached result returns at once |
+| GET | `/api/clicks/{file_id}?declick=` | `{status: none/running/done/error, progress, strength, requested, times?}` (WebSocket `click_scan_progress` / `click_scan_complete`) |
+| GET | `/api/hum/{file_id}` | `{detected: 50\|60\|null, level_dbfs, prominence_db, harmonics, analyzed_s, noise}` — hum detector + noise profile over the silent stretches (lead-in / gaps / run-out, ≤30 s decoded); cached as `silence_analysis.json`; the frontend calls it when the scan completes |
+| POST | `/api/restoration-test` | Render one track original / processed / removed (A/B test); `album_ranges` entries are `[start, end]` or `[start, end, declick]` |
+| GET | `/api/restoration-test/{file_id}/{name}` | Serve an A/B render (`rt(orig\|proc\|diff)_<12hex>.flac`) |
+| GET | `/api/waveform-peaks/{file_id}` | Waveform data for WaveSurfer |
+| GET | `/api/audio/{file_id}` | Serve audio for playback (MP3 stream, range requests) |
+| POST | `/api/search` | Discogs search |
+| GET | `/api/release/{release_id}` | Full release + tracklist (cached) |
+| GET | `/api/release/{release_id}/length-donors` | Other pressings of the same master with matching track lengths (rate-limited, <=12 fetches, cached; progress via WS `donor_progress`) |
+| POST | `/api/process` | Start background processing job |
+| GET | `/api/process/{job_id}` | Poll job status |
+| GET/DELETE | `/api/queue`, `/api/queue/{file_id}` | Manage upload queue |
+| GET/PUT | `/api/config` | Read/write settings |
+| POST | `/api/setup/discogs-token` | Save Discogs token |
+| WS | `/ws` | Real-time progress updates |
+
+---
+
+## Environment Variables
+
+All set by `desktop_launcher.py` before starting FastAPI. **Never hardcode paths in api.py or audio_processor.py.**
+
+| Variable | Set by | Purpose |
+|----------|--------|---------|
+| `VINYLFLOW_CONFIG_DIR` | launcher | Platform config dir (AppData / Library / .config) |
+| `VINYLFLOW_UPLOAD_DIR` | launcher | Temp uploads dir |
+| `VINYLFLOW_ALLOWED_HOSTS` | user / compose | Extra comma-separated Host names (e.g. `nas.local`) beyond localhost, `*.localhost` and IP literals; read per request |
+| `VINYLFLOW_FFMPEG_PATH` | launcher | Absolute path to ffmpeg binary |
+| `DEFAULT_OUTPUT_DIR` | launcher | Default output folder |
+| `VINYLFLOW_IMPORT_DIR` | launcher / compose | Import folder read in place (desktop `~/Music/VinylFlow/Incoming`, Docker `/app/incoming` mounted `:ro`). settings.json `IMPORT_DIR` overrides; **not** settable via `PUT /api/config` (CORS is `*`). Unset = import disabled |
+| `DISCOGS_USER_TOKEN` | user / settings.json | Discogs API token |
+| `DISCOGS_USER_AGENT` | user / settings.json | Discogs API user agent |
+| `DEFAULT_SILENCE_THRESHOLD` | config | Silence detection threshold (dB) |
+| `DEFAULT_MIN_SILENCE_DURATION` | config | Min silence gap (seconds) |
+| `DEFAULT_MIN_TRACK_LENGTH` | config | Min track length (seconds) |
+| `DEFAULT_FLAC_COMPRESSION` | config | FLAC compression level 0–8 |
+| `TEMP_TTL_HOURS` | config | Temp file cleanup timeout |
+
+**Config priority (highest → lowest):** `settings.json` → `.env` → environment vars → code defaults
+
+---
+
+## PyInstaller / Bundling Rules
+
+These rules are **critical** — violating them breaks the bundled app silently.
+
+1. **Never exclude** `pythonnet`, `clr`, `clr_loader` from spec — pywebview's `edgechromium` backend needs them on Windows.
+2. **Collect** `certifi` data files in spec so `cacert.pem` is present → HTTPS to Discogs works.
+3. **Collect** `pythonnet` data files so `Python.Runtime.dll` is bundled.
+4. **UPX exclusions** — both must be in `upx_exclude`:
+   - `Python.Runtime.dll` — UPX corrupts .NET assemblies
+   - `ffmpeg.exe` — UPX-packed ffmpeg is flagged by Windows Defender
+5. **Runtime hook** `rthooks/rthook_vinylflow.py` runs before any import; sets:
+   - `PYTHONNET_RUNTIME_DLL` → bundled `Python.Runtime.dll`
+   - `SSL_CERT_FILE` + `REQUESTS_CA_BUNDLE` → bundled `cacert.pem`
+6. Bundle `backend/static/` as data files so the frontend is served correctly.
+
+---
+
+## FFmpeg Usage Rules
+
+- `audio_processor.py` **must** call `_ffmpeg()` helper (not hardcode `"ffmpeg"`) — reads `VINYLFLOW_FFMPEG_PATH`.
+- Use `encoding='utf-8', errors='replace'` on subprocess calls — **not** `text=True` (breaks on Windows with non-ASCII).
+- `desktop_launcher.py` `_bundled_ffmpeg_path()` must try **both** `ffmpeg.exe` (Windows) and `ffmpeg` (macOS/Linux).
+
+---
+
+## Frontend Notes (app.js / index.html)
+
+- **No build step, fully offline** — Alpine.js, Tailwind (v3 Play script), WaveSurfer + regions are vendored, version-pinned, in `backend/static/vendor/` (versions, SHA-256, update steps in its README). `tests/test_vendor_offline.py` fails if index.html loads anything external or a hash drifts. Don't add CDN tags.
+- All UI state lives in one Alpine.js `x-data` object (see `app.js`).
+- **WaveSurfer.js** handles waveform rendering with draggable region markers for track boundaries.
+- WebSocket (`/ws`) receives real-time progress updates during processing.
+
+### macOS Context Menu Fix (critical)
+WKWebView intercepts right-click before JavaScript sees it. Fix applied in `init()`:
+```javascript
+// Capture phase — fires before WKWebView's shadow DOM handler
+document.addEventListener('contextmenu', e => e.preventDefault(), true);
+```
+Also: guard `@click.away` with `!$event.ctrlKey` so Ctrl+click (which triggers `contextmenu` on macOS) doesn't immediately dismiss the custom context menu.
+
+---
+
+## Deployment Modes
+
+| Mode | Command | Notes |
+|------|---------|-------|
+| Docker | `docker compose up` | Recommended for self-hosting. Published on `127.0.0.1` only; LAN access is opt-in via `BIND_ADDRESS=0.0.0.0` in `.env` (no auth, so trusted networks only); LAN by IP works, by hostname needs `VINYLFLOW_ALLOWED_HOSTS` |
+| Desktop (bundled) | `VinylFlow.app` / `VinylFlow.exe` | PyInstaller build |
+| Local dev | `python desktop_launcher.py` | Opens browser or native window (binds 127.0.0.1) |
+| Backend only | `uvicorn backend.api:app --reload` | For API development; `python -m backend.api` binds `HOST` (default 127.0.0.1) |
+
+---
+
+## GitHub Actions
+
+- **`windows-release.yml`** — Manual trigger with `tag` input. Builds on `windows-latest`, installs FFmpeg via Chocolatey, runs PyInstaller, uploads `VinylFlow-windows-unsigned.zip` to the release.
+- **`privacy-guard.yml`** — Scans commits for secrets.
+- **`release-artifact-scan.yml`** — Scans release assets before publishing.
+
+---
+
+## Known Bugs Fixed (Feb 2026)
+
+| File | Bug | Fix |
+|------|-----|-----|
+| `backend/api.py` | `UPLOAD_DIR` ignored `VINYLFLOW_UPLOAD_DIR` env var (hardcoded `__file__` path) | Read env var at startup |
+| `backend/api.py` | `logger` NameError | Define logger before use |
+| `config.py` | `config.DEFAULT_SILENCE_THRESHOLD` (uppercase) | Lowercase attribute name |
+| `desktop_launcher.py` | `_bundled_ffmpeg_path()` only tried `'ffmpeg'`, not `'ffmpeg.exe'` | Try both |
+| `audio_processor.py` | Hardcoded `"ffmpeg"` instead of `_ffmpeg()` | Use helper; use `encoding='utf-8', errors='replace'` |
+| `backend/static/app.js` | Right-click opened WKWebView native menu on macOS | Capture-phase `preventDefault` in `init()` |
+| `backend/static/app.js` | Ctrl+click dismissed custom context menu immediately | Guard `@click.away` with `!$event.ctrlKey` |
+| `VinylFlow.spec` | `ffmpeg.exe` UPX-packed → blocked by Windows Defender | Add to `upx_exclude` |
+
+---
+
+## Audio Formats
+
+- **Input:** `.wav`, `.aiff`, `.aif` — minimum 60 seconds
+- **Output:** FLAC (compression 0–8), MP3 (320 kbps), AIFF (PCM, 16- or 24-bit big-endian per `bit_depth`)
+- **Filter edges:** filtered cuts (rumble/hum/declick/hiss/gain) are decoded with ~1 s of pre- and post-roll and trimmed sample-exactly afterwards (`padded_window`); unfiltered cuts are untouched (bit-exact).
+- **Tagging:** Mutagen handles all three formats; cover art embedded as bytes
+
+---
+
+## Settings (`/api/config`, `settings.json`)
+
+Besides silence detection and `track_numbering`/`output_dir`:
+
+| Setting | Values | Notes |
+|---------|--------|-------|
+| `output_format` | `flac` / `mp3` / `aiff` | Remembered default |
+| `rumble_filter` | bool, default off | `highpass=f=15` |
+| `declick` | `off` (default) / `light` / `medium` / `strong` | `adeclick` strength (`DECLICK_PRESETS`). Settings keys `RUMBLE_FILTER` / `DECLICK`; if absent, migrated from legacy `RESTORATION_LEVEL` (1 -> rumble on + light, else off). `PUT /api/config` still accepts `restoration_level` (same mapping); `GET` returns it derived |
+| `hum_filter` / `hum_freq` | bool default off / `50`\|`60` default 60 | Mains-hum notch (`HUM_FREQS`); keys `HUM_FILTER` / `HUM_FREQ` |
+| `hiss_reduction` / `hiss_strength` | `off` (default) / `light` / `medium` / `strong`; remembered strength default `light` | `afftdn` (`HISS_PRESETS` nr 6/12/20 dB). The UI toggle is off ↔ `hiss_strength`; choosing a strength sets both; `PUT` with `hiss_reduction` wins over `hiss_strength` in the same request. Keys `HISS_REDUCTION` / `HISS_STRENGTH` |
+| `album_gain` | bool, default off | One gain for the whole album |
+| `replaygain` | bool, default on | ReplayGain 2.0 tags |
+| `bit_depth` | `"source"` (default) / `"24"` | FLAC/AIFF depth. Source depth is probed at upload; unknown -> 24 (never truncates). 16-bit targets get triangular dither only when processing runs (rumble / hum / declick / hiss / gain); unprocessed 16->16 stays bit-exact. MP3 unaffected |
+
+## Detection internals
+
+- **Envelope cache:** the upload decodes the file once (mono, 8 kHz, 10 ms RMS frames) and caches it as `envelope.npy` in the session dir. Gaps at any threshold, the music span and Smart Rescan are answered in memory from it.
+- **`refine_cuts`:** detection may use a permissive threshold; cuts are then widened over audio still above the user's configured threshold so quiet fades aren't clipped.
+- **Music span:** lead-in/run-out trimmed; used for side suggestions and guided placement.
+
+## Click detection & per-track strength
+
+- **Detection** (`click_detection.py`): scan = what the remover would change. Music span (from the envelope) decoded in ~60 s chunks with 0.5 s margin each side (`plan_chunks`; events kept only in the chunk's owned span, so overlaps never duplicate), mono 44.1 kHz. One ffmpeg graph outputs `original - declicked(strength)` (residual) plus the original; impulses above `max(-50 dBFS, local RMS -20 dB, 3x local roughness)` merge within 20 ms into click times. Roughness (median |2nd difference|) is what keeps surface hiss / busy music from flooding results. Known limit: hard drum attacks that adeclick also treats as clicks are reported.
+- **Cache/jobs:** `clicks_<strength>.json` in the session dir (atomic; invalidated if the preset string or `DETECTOR_VERSION` changes). One asyncio task per (file, strength) like the envelope; cancelled with the session. Frontend derives per-track counts from the file-wide times, draws the density strip canvas on the waveform wrapper, and re-scans when the panel strength changes.
+- **Per-track override:** `track_boundaries[].declick` (optional; absent = panel setting). `extract_track` uses it per track; `measure_ranges` takes `(start, end[, declick])` and, when strengths differ, measures a seeked-input-per-range `concat` (uniform strength keeps the single `aselect` pass). The A/B test and `abSignature` use the chosen track's effective strength.
+
+## Loudness
+
+- **Rumble filter** (`highpass=f=15`), **hum removal**, **click & pop removal** (`adeclick`, strength presets chosen by measurement in `tests/test_declick_strength.py`) and **hiss reduction** are independent. No per-track loudnorm.
+- **Hum removal:** cascade of 6 `bandreject` notches (Q=20) at f0..6·f0 (60 -> 360 Hz, 50 -> 300 Hz) after `aformat=dblp` (16-bit sources would otherwise round per stage). Q/harmonics chosen by `tests/test_hum_filter.py` (≥20 dB cut at ±0.2 % mains drift, bounded bass damage). A notch's phase leaks a ghost of the music into `original − processed`, so the A/B "Removed" render uses the zero-phase form (`hum_filter(f, zero_phase=True)`: forward + `areverse` pass; buffers what it filters, hence `AudioProcessor.render_removed_flac` renders it in 40 s chunks with 3 s context, memory bounded). The rumble high-pass has the same ghost, so Removed also uses `RUMBLE_FILTER_ZERO_PHASE` (2-pole `highpass=f=7.5:w=0.515` forward + reverse, whose squared response is within ~0.9 dB of `highpass=f=15` over 5-200 Hz; `tests/test_rumble_zero_phase.py`); export and the Processed render keep the normal filters. A rumble or hum cleanup is rendered chunked. The Audio processing panel and Settings show a caution note under Hum removal (`humNoteFreqs`).
+- **Hiss reduction:** `afftdn` with the file's own noise profile (`silence_analysis.noise_profile`: white-equivalent level per afftdn custom band from the silent stretches; `nt=c:bn=…`, `nf` = noise + 6 dB), so `nr` (6/12/20 dB) means what it says on any record; without usable silence it falls back to `nr<=12 + tn=1` (noise tracking, erratic). `tests/test_hiss_reduction.py` has the measurements.
+- **Hum/noise analysis** (`silence_analysis.py`): `silent_ranges` (envelope; floor-relative so loud hum still finds its gaps) -> bounded decode (native channels, ≤30 s) -> Welch spectrum -> `detect_hum` (lines at f0·k vs the neighbouring floor, ≥2 harmonics or one ≥12 dB; 300 Hz ignored) + `noise_profile`. Bass played in the music never enters the analysis.
+- **Album gain** (optional): one gain for the album targeting -14 LUFS, capped so true peak stays <= -1 dBTP (pure gain, no limiter).
+- **ReplayGain 2.0** tags (default on): -18 LUFS reference; track and album gain/peak measured on the final files. A measurement failure skips the tags with a warning rather than failing the job.
+- **A/B test renders (3 FLACs):** `rtorig_` (source), `rtproc_` (full chain incl. album gain), `rtdiff_` ("Removed" = original − (rumble + hum + declick + hiss; no gain/dither), via `audio_processor.removed_graph`: asplit/amerge/pan difference per channel, no gain/dither, 24-bit, cached under the clean-up chain only). Response adds `removed_url` (null when no clean-up filter is on), `removed_lufs`, `removed_peak_dbfs`. Frontend: Original | Processed | Removed switch (third hidden `<audio>`); Removed plays at unity with an optional +12 dB WebAudio GainNode (`_abBoostNodes` WeakMap, one MediaElementSource per element, created lazily in the play click; no WebAudio = checkbox hidden).
+- One shared filter-chain builder (`build_export_filters(rumble, declick, gain_db, dither_to_16, hum, hiss, noise)`, order rumble -> hum notch -> declick -> hiss reduction -> volume -> dither; declick before denoise so the denoiser never smears clicks) feeds export, album-gain measurement and the A/B test. Cache keys include the full chain string, so a changed noise profile re-renders.
+
+---
+
+## Testing
+
+**No Discogs API calls during development — ever.** Tests and verification run offline with Discogs faked/seeded; never read `config/settings.json` or copy a token.
+
+```bash
+# Backend (build the image once: see .claude/skills/verify/SKILL.md)
+docker run --rm --network none -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/src:ro" \
+  --tmpfs /src/config --tmpfs /tmp -w /src vinylflow-test python -m pytest -q -p no:cacheprovider -n auto
+# Frontend logic (Node only, no deps)
+node --check backend/static/app.js && node tests/frontend/run.js
+```
+
+`--network none` plus the tmpfs over `config/` guarantees no network and hides the real token. Never touch the user's own `vinylflow` container. Frontend tests load `app.js` with fake waveform/`fetch`; visual layout still needs a manual look in the app.
+
+---
+
+## Python Dependencies (key ones)
+
+```
+fastapi, uvicorn[standard]   # API server
+pywebview                    # Desktop window
+mutagen                      # Audio tagging
+discogs-client               # Discogs API
+requests, certifi            # HTTP + SSL
+pillow                       # Cover art processing
+numpy                        # Waveform peak generation
+python-dotenv                # .env parsing
+python-multipart             # File upload parsing
+aiofiles                     # Async file I/O
+websockets                   # WebSocket support
+```
