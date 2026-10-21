@@ -60,6 +60,7 @@ import import_folder
 import silence_analysis
 from track_boundaries import (
     boundaries_from_expected_durations,
+    guided_by_alignment,
     gaps_from_envelope,
     music_span,
 )
@@ -1119,6 +1120,9 @@ async def analyze_guided(request: GuidedAnalyzeRequest):
     duration for every expected track, boundaries are laid out from those
     lengths over the music span and snapped to nearby silence gaps;
     otherwise the Smart Rescan ladder is swept in memory for the count.
+    Best-match alignment runs first (any known length, unknown ones cost
+    nothing); the gap/scale model is the fallback when every length is
+    known, and count-based detection when not.
     """
     if not 1 <= request.expected_tracks <= 99:
         raise HTTPException(status_code=422, detail="expected_tracks must be between 1 and 99")
@@ -1137,18 +1141,27 @@ async def analyze_guided(request: GuidedAnalyzeRequest):
     session.album_job_id = None
 
     durations = request.durations
-    use_durations = (
-        durations is not None
-        and len(durations) == request.expected_tracks
-        and all(d is not None and d > 0 for d in durations)
-    )
+    sized = durations is not None and len(durations) == request.expected_tracks
+    known = [d if d is not None and d > 0 else None for d in durations] if sized else []
+    all_known = sized and all(d is not None for d in known)
+    try_align = sized and request.expected_tracks >= 2 and any(d is not None for d in known)
 
     try:
         db = await get_envelope(session)
 
         def _compute():
             music_start, music_end = music_span(db, ENVELOPE_FRAME_S)
-            if use_durations:
+            result = None
+            if try_align:
+                try:
+                    result = guided_by_alignment(
+                        db, ENVELOPE_FRAME_S, music_start, music_end,
+                        [float(d) if d is not None else None for d in known],
+                        side_breaks=side_breaks,
+                    )
+                except Exception:
+                    logger.warning("Best-match alignment failed; using fallback", exc_info=True)
+            if result is None and all_known:
                 gaps = gaps_from_envelope(
                     db,
                     ENVELOPE_FRAME_S,
@@ -1156,9 +1169,11 @@ async def analyze_guided(request: GuidedAnalyzeRequest):
                     audio_processor.SMART_RESCAN_LADDER[0][1],
                 )
                 result = boundaries_from_expected_durations(
-                    gaps, music_start, music_end, [float(d) for d in durations],
+                    gaps, music_start, music_end, [float(d) for d in known],
                     side_breaks=side_breaks,
                 )
+            if result is not None:
+                # Contiguous aligned cuts touch, so only the outer edges widen.
                 refined = audio_processor.refine_tracks(db, result.tracks)
                 return refined, True, result, music_start, music_end
             tracks, info = audio_processor.tracks_for_count_from_envelope(
@@ -1187,7 +1202,7 @@ async def analyze_guided(request: GuidedAnalyzeRequest):
                 {"number": i + 1, "start": t.start, "end": t.end, "duration": t.duration}
                 for i, t in enumerate(tracks)
             ],
-            "method": "durations" if use_durations else "count",
+            "method": "durations" if guided is not None else "count",
             "matched": matched,
             "boundaries": boundaries,
             "scale": guided.scale if guided else None,

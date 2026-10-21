@@ -15,6 +15,10 @@ Envelope-based helpers (one decode, then everything in memory):
 - ``music_span``              envelope -> (music_start, music_end)
 - ``boundaries_from_expected_durations``  Gaps + music span + Discogs
   durations -> GuidedBoundaries (Tracks snapped to nearby Gaps)
+- ``guided_by_alignment``     envelope + Discogs durations (any may be
+  unknown) -> GuidedBoundaries by best-match alignment of every track
+  length to the gaps (``smooth_envelope``, ``gap_candidates``,
+  ``align_durations_to_gaps``, ``onset_cut``)
 
 A **Gap** is a ``(start, end)`` span of detected silence.  A Track occupies
 the audio *between* consecutive Gaps.  The final Gap may be **open**
@@ -30,9 +34,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 
 
 @dataclass(frozen=True)
@@ -498,6 +503,270 @@ def boundaries_from_expected_durations(
     return GuidedBoundaries(
         tracks, infos, scale, clamped and model == "scale", raw_scale, model, gap_s
     )
+
+
+# ---------------------------------------------------------------------------
+# Best-match alignment (guided placement)
+# ---------------------------------------------------------------------------
+#
+# Every Discogs length is compared with the music between two *chosen* gaps,
+# so one wrong length costs only its own track (cumulative expected positions
+# let it shift every later cut).  Gaps are read from a click-smoothed
+# envelope: a vinyl gap is surface noise broken up by clicks and run-out
+# thumps, which the raw -30 dB test fragments.  Tuned on real records by
+# ``tests/e2e/real_records_eval.py``.
+
+SMOOTH_S = 0.31  # rolling-median width: longer than a click, shorter than a gap
+ASSUMED_FLOOR_DB = 25.0  # floor below the median level when the span has no quiet 3 %
+NO_FLOOR_WITHIN_DB = 8.0  # ...i.e. its 3rd percentile is within this of the median
+QUIET_MARGIN_DB = 10.0  # candidate = smoothed level below (3rd percentile) + this
+MIN_CANDIDATE_S = 0.4
+MERGE_BUMP_S = 1.0  # quiet runs closer than this are one gap (thump inside a flip)
+CONTRAST_AROUND_S = 8.0  # music level is read this far either side of a gap
+WEAK_WINDOW_S = 5.0  # no-gap (segue) candidates: quietest 0.3 s in each window
+WEAK_WIDTH_S = 0.3
+WEAK_PENALTY = 0.6  # strength lost by a no-gap candidate (in units of GAP_STRENGTH_W)
+GAP_STRENGTH_W = 2.0  # real gaps outweigh length error: Discogs lengths are often off by seconds
+LENGTH_SIGMA_S = 3.0  # Discogs length tolerance: sigma = 3 s + 3 % of the length
+LENGTH_SIGMA_FRAC = 0.03
+MIN_ALIGNED_TRACK_S = 5.0  # two chosen gaps closer than this cannot hold a track
+
+PRE_ROLL_S = 0.3  # cut this long before the next song's onset
+MAX_TAIL_S = 4.0  # silence kept after the previous song's fade before dropping the rest
+ONSET_RISE_DB = 6.0  # onset = level clearly above the gap level, sustained
+ONSET_SUSTAIN_S = 0.05  # ...for this long on the raw envelope (a click is shorter)
+DIGITAL_SILENCE_DB = -90.0  # gaps this quiet hold nothing worth keeping: no tail
+
+
+@dataclass(frozen=True)
+class GapCandidate:
+    start: float
+    end: float
+    strength: float  # higher = likelier a real inter-track gap (may be negative)
+    strong: bool  # a real quiet run; False = quietest spot of a window (segue)
+
+
+def smooth_envelope(db: np.ndarray, frame_s: float, window_s: float = SMOOTH_S) -> np.ndarray:
+    """Rolling median of the envelope (float32), chunked so memory stays small."""
+    size = max(1, int(round(window_s / frame_s))) | 1
+    half = size // 2
+    padded = np.pad(np.asarray(db, dtype=np.float32), half, mode="edge")
+    out = np.empty(len(db), dtype=np.float32)
+    step = 1 << 16
+    for i in range(0, len(db), step):
+        j = min(len(db), i + step)
+        out[i:j] = np.median(sliding_window_view(padded[i : j + size - 1], size), axis=1)
+    return out
+
+
+def gap_candidates(
+    sm: np.ndarray, frame_s: float, start: float, end: float
+) -> List[GapCandidate]:
+    """Places a track boundary could be, inside ``[start, end]`` of a smoothed envelope.
+
+    Strong: quiet runs (below the span's floor, its 3rd percentile, + ``QUIET_MARGIN_DB``,
+    at least ``MIN_CANDIDATE_S``, bumps under ``MERGE_BUMP_S`` merged) scored by
+    length and by contrast with the music around them.  Weak: the quietest
+    0.3 s of every 5 s window not already inside a strong one, scored by
+    contrast alone and penalised, so a segue can still be cut near where its
+    length says while a real gap wins whenever one is close.
+    """
+    a, b = int(start / frame_s), min(len(sm), int(end / frame_s))
+    seg = sm[a:b]
+    if len(seg) < 2:
+        return []
+    p3, p50 = np.percentile(seg, [3, 50])
+    # Almost no gap in the span (the 3rd percentile is music): assume a floor.
+    floor = float(p50 - ASSUMED_FLOOR_DB if p3 > p50 - NO_FLOOR_WITHIN_DB else p3)
+    runs: List[List[int]] = []
+    for i, j in _runs(seg < floor + QUIET_MARGIN_DB):
+        if runs and (i - runs[-1][1]) * frame_s < MERGE_BUMP_S:
+            runs[-1][1] = j
+        else:
+            runs.append([i, j])
+
+    reach = int(CONTRAST_AROUND_S / frame_s)
+
+    def contrast(i: int, j: int) -> float:
+        around = np.concatenate([seg[max(0, i - reach) : i], seg[j : j + reach]])
+        music = float(np.percentile(around, 75)) if len(around) else floor
+        return music - float(np.median(seg[i:j]))
+
+    out: List[GapCandidate] = []
+    for i, j in runs:
+        if (j - i) * frame_s < MIN_CANDIDATE_S:
+            continue
+        strength = min((j - i) * frame_s, 4.0) / 4.0 + float(np.clip(contrast(i, j), 0, 30)) / 30.0
+        out.append(GapCandidate(start + i * frame_s, start + j * frame_s, GAP_STRENGTH_W * strength, True))
+
+    strong = [(c.start, c.end) for c in out]
+    w = max(1, int(WEAK_WIDTH_S / frame_s))
+    win = int(WEAK_WINDOW_S / frame_s)
+    csum = np.concatenate(([0.0], np.cumsum(seg, dtype=np.float64)))
+    for lo in range(0, len(seg) - win, win):
+        roll = (csum[lo + w : lo + win + 1] - csum[lo : lo + win - w + 1]) / w
+        k = lo + int(np.argmin(roll))
+        t0 = start + k * frame_s
+        if any(s - 1.0 <= t0 <= e + 1.0 for s, e in strong):
+            continue
+        strength = 0.5 * float(np.clip(contrast(k, k + w), 0, 30)) / 30.0 - WEAK_PENALTY
+        out.append(GapCandidate(t0, t0 + w * frame_s, GAP_STRENGTH_W * strength, False))
+    out.sort(key=lambda c: (c.start, c.end))
+    return out
+
+
+def _length_cost(length: np.ndarray, expected: Optional[float]) -> np.ndarray:
+    """Robust (Cauchy-like) cost of a track length against its Discogs length."""
+    if expected is None:
+        return np.zeros_like(length)
+    sigma = LENGTH_SIGMA_S + LENGTH_SIGMA_FRAC * expected
+    return np.log1p(((length - expected) / sigma) ** 2)
+
+
+def align_durations_to_gaps(
+    cands: Sequence[GapCandidate],
+    start: float,
+    end: float,
+    durations: Sequence[Optional[float]],
+    side_breaks: Sequence[int] = (),
+) -> Optional[List[GapCandidate]]:
+    """Choose ``len(durations) - 1`` candidates, in order, that best explain the lengths.
+
+    Dynamic programme minimising the sum over tracks of a robust length error
+    (the music between the chosen gaps vs that track's own Discogs length;
+    ``None`` = unknown, costs nothing) minus the strength of every chosen gap.
+    Side-change boundaries count their gap's strength twice.  Returns ``None``
+    when there are too few candidates to place the tracks.
+    """
+    n = len(durations)
+    pool = [c for c in cands if start < c.start and c.end < end]
+    m = len(pool)
+    if n < 2 or m < n - 1:
+        return None
+    gs = np.array([c.start for c in pool])
+    ge = np.array([c.end for c in pool])
+    strength = np.array([c.strength for c in pool])
+    flips = set(side_breaks)
+
+    def bonus(k: int) -> np.ndarray:  # boundary k (0-based) ends track k
+        return strength * (2.0 if (k + 1) in flips else 1.0)
+
+    inf = 1e12
+    cost = _length_cost(gs - start, durations[0]) - bonus(0)
+    cost = np.where(gs - start >= MIN_ALIGNED_TRACK_S, cost, inf)
+    back: List[np.ndarray] = []
+    length = gs[None, :] - ge[:, None]  # [previous gap, next gap]
+    feasible = length >= MIN_ALIGNED_TRACK_S
+    for k in range(1, n - 1):
+        total = cost[:, None] + _length_cost(length, durations[k])
+        total = np.where(feasible, total, inf)
+        prev = np.argmin(total, axis=0)
+        cost = total[prev, np.arange(m)] - bonus(k)
+        back.append(prev)
+    tail = end - ge
+    final = cost + np.where(tail >= MIN_ALIGNED_TRACK_S, _length_cost(tail, durations[n - 1]), inf)
+    j = int(np.argmin(final))
+    if final[j] >= inf / 2:
+        return None
+    picks = [j]
+    for prev in reversed(back):
+        j = int(prev[j])
+        picks.append(j)
+    return [pool[i] for i in reversed(picks)]
+
+
+def _onset(db: np.ndarray, sm: np.ndarray, frame_s: float, gap: GapCandidate) -> float:
+    """Where the music after ``gap`` starts: the smoothed level rises ``ONSET_RISE_DB``
+    above the gap level and stays up; then refined on the raw envelope to the first
+    frame that begins a sustained rise (a lone click is shorter than ``ONSET_SUSTAIN_S``)."""
+    n = len(sm)
+    a, b = int(gap.start / frame_s), min(n - 1, int(gap.end / frame_s))
+    level = float(np.median(sm[a : b + 1]))
+    thr = level + ONSET_RISE_DB
+    i = b
+    limit = min(n - 1, b + int(3.0 / frame_s))
+    while i < limit and sm[i] < thr:  # the quiet run can end short of a clear rise
+        i += 1
+    while i > a and sm[i - 1] >= thr:  # ...or well after the smoothed level crossed it
+        i -= 1
+    sustain = max(1, int(round(ONSET_SUSTAIN_S / frame_s)))
+    lo, hi = max(a, i - int(0.4 / frame_s)), min(n - sustain, i + int(0.4 / frame_s))
+    for j in range(lo, hi + 1):
+        if db[j : j + sustain].min() > thr:
+            return j * frame_s
+    return i * frame_s
+
+
+def onset_cut(
+    db: np.ndarray, sm: np.ndarray, frame_s: float, gap: GapCandidate, pre_roll_s: Optional[float] = None
+) -> Tuple[float, float]:
+    """``(previous_end, next_start)`` for the boundary at a chosen candidate.
+
+    A real gap: the next track starts ``pre_roll_s`` before the next song's
+    onset (never before the gap begins) and the previous track keeps the
+    silence up to there, so the cut sits right by the beginning of the next
+    song.  Silence longer than ``MAX_TAIL_S`` after the fade is not glued on
+    (side flips, run-outs): the previous track ends ``MAX_TAIL_S`` after the
+    fade and the rest is dropped; a digitally silent gap keeps no tail.
+    A weak (no-gap) candidate is cut contiguously at its quietest point.
+    """
+    if not gap.strong:
+        mid = (gap.start + gap.end) / 2
+        return mid, mid
+    onset = _onset(db, sm, frame_s, gap)
+    cut = onset - (PRE_ROLL_S if pre_roll_s is None else pre_roll_s)
+    if cut < gap.start:
+        cut = (gap.start + onset) / 2
+    a, b = int(gap.start / frame_s), max(int(gap.start / frame_s) + 1, int(gap.end / frame_s))
+    if float(np.median(sm[a:b])) < DIGITAL_SILENCE_DB:
+        return gap.start, cut
+    return min(cut, gap.start + MAX_TAIL_S), cut
+
+
+def guided_by_alignment(
+    db: np.ndarray,
+    frame_s: float,
+    music_start: float,
+    music_end: float,
+    durations: Sequence[Optional[float]],
+    side_breaks: Optional[Sequence[int]] = None,
+    sm: Optional[np.ndarray] = None,
+) -> Optional[GuidedBoundaries]:
+    """Guided placement by best-match alignment; ``None`` if it cannot place the tracks.
+
+    Always ``len(durations)`` Tracks when it returns.  ``expected`` is where a
+    track's own Discogs length puts its end given where it was started (the
+    chosen position when that length is unknown); ``snapped`` means a real gap
+    was used, not a segue spot.
+    """
+    n = len(durations)
+    if n < 2 or all(d is None for d in durations):
+        return None
+    sm = smooth_envelope(db, frame_s) if sm is None else sm
+    chosen = align_durations_to_gaps(
+        gap_candidates(sm, frame_s, music_start, music_end),
+        music_start, music_end, durations, side_breaks or (),
+    )
+    if chosen is None:
+        return None
+
+    starts, ends, infos = [music_start], [], []
+    for k, cand in enumerate(chosen):
+        prev_end, next_start = onset_cut(db, sm, frame_s, cand)
+        prev_end = max(prev_end, starts[-1])
+        d = durations[k]
+        expected = starts[-1] + d if d is not None else (prev_end + next_start) / 2
+        ends.append(prev_end)
+        starts.append(max(next_start, prev_end))
+        infos.append(BoundaryInfo(
+            k + 1, expected, cand.strong,
+            Gap(cand.start, cand.end) if cand.strong else None, (prev_end + next_start) / 2,
+        ))
+    ends.append(music_end)
+    tracks = [Track(i, s, max(s, e)) for i, (s, e) in enumerate(zip(starts, ends), start=1)]
+    known = sum(d for d in durations if d is not None)
+    raw = (music_end - music_start) / known if known > 0 else 1.0
+    return GuidedBoundaries(tracks, infos, 1.0, False, raw, "align", 0.0)
 
 
 def refine_cuts(

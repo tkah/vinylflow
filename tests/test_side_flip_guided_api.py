@@ -33,9 +33,15 @@ def test_guided_endpoint_uses_side_hint_for_guides_and_cuts(recording):
     })
     assert response.status_code == 200, response.text
     body = response.json()
-    assert [b['expected'] for b in body['boundaries']] == pytest.approx([101.5, 233, 364.5])
-    assert body['tracks'][1]['end'] == pytest.approx(203)
-    assert body['tracks'][2]['start'] == pytest.approx(263)
+    assert body['model'] == 'align'
+    # Best-match alignment: each guide is the track's own length from where it started.
+    assert [b['expected'] for b in body['boundaries']] == pytest.approx([100, 202.7, 362.7], abs=0.1)
+    assert [b['snapped'] for b in body['boundaries']] == [True, True, True]
+    # Contiguous cuts just before the next song; the 60 s flip is not glued on.
+    assert body['tracks'][0]['end'] == pytest.approx(body['tracks'][1]['start'], abs=0.01)
+    assert body['tracks'][0]['end'] == pytest.approx(102.7, abs=0.1)
+    assert body['tracks'][1]['end'] == pytest.approx(207, abs=0.1)
+    assert body['tracks'][2]['start'] == pytest.approx(262.7, abs=0.1)
 
 
 @pytest.mark.parametrize('breaks', [[0], [4], [2, 2], [3, 1]])
