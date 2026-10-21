@@ -22,18 +22,44 @@ Turn your vinyl recordings into perfectly tagged, organized digital files in min
 
 ## What's different in this fork
 
+**Finding the tracks**
+
 - **Discogs first:** search starts as soon as a file is added; results show whether they have track
   lengths and how well they fit your recording (lead-in/run-out silence excluded).
 - **Whole albums or single sides:** side picker with Full album / Disc presets, auto-suggested from the
   recording length; multi-disc sets recorded one file per disc share a release.
-- **Guided track detection:** Discogs lengths place the splits (snapped to real silences), shown as
-  dashed guides on the waveform; borrow lengths from another pressing when yours has none.
-- **One track table and one player:** mapping, lengths and differences in one place; Play/Pause in the
-  waveform, cut-point auditions, manual edits protected with Snap to Discogs + Undo.
+- **Best-match splits:** the Discogs track lengths are matched against all the pauses in the recording
+  at once, so one wrong or missing length doesn't throw off the other splits. Gaps are found after
+  smoothing out clicks and surface noise, and a long pause while you flip the record is recognised
+  as the side change. Each cut lands just before the next song starts, so fade-outs stay whole.
+  Partial tracklists work too; you can also borrow lengths from another pressing.
+- **One track table and one player:** mapping, lengths and differences in one place; dashed guides on
+  the waveform show where Discogs expects each break; Play/Pause, cut-point auditions, a detailed
+  waveform that plays the original WAV for precise editing, and manual edits protected with Snap to
+  Discogs + Undo.
+
+**Sound**
+
 - **Audio processing panel:** rumble filter, click & pop removal (with detection and per-track
   strength), hum removal, hiss reduction, optional album gain, ReplayGain tags, and a one-track A/B
   test including "hear what was removed".
 - **Bit depth:** exports match the source (24-bit stays 24-bit, including AIFF) or 24-bit on request.
+
+**Working through a stack of records**
+
+- **Import from a folder:** recordings are read where they are (no 1.5 GB browser uploads), from a
+  read-only folder VinylFlow never modifies. See [Import from a folder](#import-from-a-folder-no-upload).
+- **Every recording keeps its own work:** release, cuts, mapping and settings stay with each file when
+  you switch, and survive a page refresh (**Pick up where you left off**).
+- **Process all ready:** the queue shows what is ready and what needs attention; export them all in
+  one go. Discs of the same release share album loudness and ReplayGain album tags.
+- **Keep working during exports:** only the recording being exported is locked. Prepare the next one
+  meanwhile; **Process & Save** queues it to start when the current export finishes.
+
+**Safety**
+
+- **Offline and local by default:** the interface works without internet (no CDN), Docker listens on
+  this computer only, and requests from other websites are refused.
 - **No pop-ups:** notices with Undo instead of `alert()`/`confirm()`.
 
 ---
@@ -208,7 +234,7 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
 # 4. Start the server
-python -m uvicorn backend.api:app --host 0.0.0.0 --port 8000
+python -m uvicorn backend.api:app --host 127.0.0.1 --port 8000
 ```
 
 Open **http://localhost:8000** in your browser.
@@ -247,9 +273,11 @@ DEFAULT_OUTPUT_DIR=~/Music/VinylFlow
 ## How It Works
 
 1. **Import or upload** — pick a WAV or AIFF recording from the import folder, or drag and drop it
-2. **Analyze** — VinylFlow detects track boundaries using silence detection
-3. **Search** — find your album on Discogs with visual artwork results
-4. **Map** — match detected tracks to Discogs track listings
+2. **Pick the release** — VinylFlow searches Discogs from the file name; choose the release and which
+   sides the recording covers (suggested from its length)
+3. **Check the splits** — the Discogs track lengths place the splits; drag any that need it, audition
+   cut points, and fix the track mapping in the table (no release? detect by silence only)
+4. **Clean up (optional)** — rumble, clicks, hum and hiss, tried on one track before the whole album
 5. **Choose format** — FLAC, MP3, or AIFF output
 6. **Process** — tracks are split, converted, tagged, and saved with cover art
 
@@ -261,6 +289,10 @@ Prepare each recording's release, cuts, position mapping, and output settings. S
 recordings keeps those edits. The queue shows **Ready** or **Needs attention**, with the reason;
 ignored tracks do not need mappings. Conflicting positions for the same release and output format
 need correcting before export.
+
+Only a recording that is exporting (or waiting to export) is read-only, so you can keep preparing
+the others. **Process & Save** while another export runs queues that recording; exports always run
+one at a time.
 
 Click **Process all ready** to export the prepared recordings sequentially. Recordings with the
 same Discogs release and output format are exported together, at the first matching entry in the
@@ -388,7 +420,7 @@ Make sure the `output/` directory exists and has write permissions: `chmod -R 75
 Your API token might be invalid or revoked. Click the Settings (⚙️) button and update your token, or generate a new one at [discogs.com/settings/developers](https://www.discogs.com/settings/developers)
 
 **Tracks not splitting correctly?**
-Try adjusting silence detection in Settings (⚙️), or pick a Discogs release and use Snap to Discogs to place boundaries from its track lengths.
+Pick the Discogs release first: its track lengths place the splits, and **Snap to Discogs** re-places them after hand edits. Songs that run straight into each other (common on classical records) have no pause to find, so those breaks land only near the right spot. Drag them into place and audition the cut. Without a release, adjust silence detection in Settings (⚙️) or use Smart Rescan with the number of songs.
 
 ---
 
@@ -421,10 +453,18 @@ Try adjusting silence detection in Settings (⚙️), or pick a Discogs release 
 - Docker one-command setup
 - **Web-based first-run setup** — no more hidden `.env` files!
 
+### Added in this fork
+- Discogs-first flow with side/disc picker and best-match splits from track lengths
+- Import recordings in place from a folder
+- Click & pop removal, rumble filter, hum removal, hiss reduction, with a one-track A/B test
+- Optional album gain and ReplayGain tags, shared across the discs of a release
+- Per-recording workspaces, Process all ready, and queued exports
+- Source bit depth kept on export (24-bit stays 24-bit)
+- Fully offline interface, localhost-only by default
+
 ### Planned
 - BPM and key detection
 - Rekordbox / Traktor export
-- Click and pop removal
 - MusicBrainz integration
 - Cloud-hosted option
 
