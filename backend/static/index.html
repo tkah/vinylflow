@@ -896,6 +896,99 @@
             </div>
         </div>
 
+        <!-- Release: chosen here, where it was searched for; Change release swaps back to the search -->
+        <div id="release-card" x-show="currentFile && selectedRelease" x-cloak class="max-w-7xl mx-auto px-4 pb-2 sm:px-6 lg:px-8">
+            <div class="bg-card rounded-lg shadow p-6">
+                <div class="flex justify-between items-center mb-4">
+                    <h3 class="text-lg font-semibold text-primary">💿 Release</h3>
+                    <button @click="changeRelease()" :disabled="analyzing || currentLocked" class="px-4 py-2 rounded-lg text-primary hover:bg-page" style="background-color: #F0EFEB;">← Change release</button>
+                </div>
+
+                <!-- Selected Release Info -->
+                <div class="mb-4 p-4 rounded-lg" style="background-color: rgba(229, 161, 0, 0.1);">
+                    <p class="font-bold text-primary" x-text="selectedRelease ? `${selectedRelease.artist} - ${selectedRelease.title}` : ''"></p>
+                    <p class="text-sm text-secondary" x-text="selectedRelease ? `${selectedRelease.year} • ${selectedRelease.label}` : ''"></p>
+                    <p x-show="lengthsBorrowedFrom" x-cloak class="mt-1 text-xs text-muted">
+                        Lengths borrowed from <span x-text="borrowedLabel(lengthsBorrowedFrom)"></span>
+                        (<a :href="lengthsBorrowedFrom ? `https://www.discogs.com/release/${lengthsBorrowedFrom.release_id}` : '#'" target="_blank" rel="noopener" class="underline">view on Discogs</a>)
+                    </p>
+                </div>
+
+                <!-- Borrow track lengths from another pressing -->
+                <div x-show="showBorrowLengths" x-cloak class="mb-4 p-4 bg-page rounded-lg">
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                        <p class="text-sm text-secondary" x-text="borrowLengthsMessage"></p>
+                        <button type="button" @click="findLengthDonors()" :disabled="donors.status === 'searching' || analyzing"
+                                class="px-4 py-2 rounded-lg border-2 text-sm hover:bg-card"
+                                style="border-color: #E5A100; color: #3D3D3D;"
+                                :class="{'opacity-60 cursor-not-allowed': donors.status === 'searching' || analyzing}">Find lengths from other pressings</button>
+                    </div>
+                    <p x-show="donors.status === 'searching'" x-cloak class="mt-2 text-sm text-secondary flex items-center gap-2" role="status">
+                        <span class="spinner"></span> <span x-text="donorProgressText"></span>
+                    </p>
+                    <p x-show="donors.status === 'error'" x-cloak class="mt-2 text-sm" style="color: #B3261E;" role="alert" x-text="donors.error"></p>
+                    <p x-show="donors.status === 'done' && donors.list.length === 0" x-cloak class="mt-2 text-sm text-muted">No other pressing with matching track lengths found</p>
+                    <div x-show="donors.status === 'done' && donors.list.length > 0" x-cloak class="mt-2 space-y-2">
+                        <template x-for="d in donors.list" :key="d.release_id">
+                            <div class="flex flex-wrap items-center justify-between gap-2 p-2 rounded-lg bg-card">
+                                <div class="text-sm">
+                                    <span x-text="donorTitle(d)"></span>
+                                    <span class="ml-2 text-xs text-muted" x-text="`${d.matched}/${d.total} matched`"></span>
+                                </div>
+                                <button type="button" @click="applyDonor(d)" :disabled="analyzing || currentLocked"
+                                        class="px-3 py-1.5 btn-primary rounded-lg text-sm" :class="{'opacity-60 cursor-not-allowed': analyzing}">Use these lengths</button>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+
+                <!-- Side selection -->
+                <div class="mb-4 p-4 bg-page rounded-lg">
+                    <div class="flex flex-wrap justify-between items-baseline gap-2 mb-2">
+                        <label class="block text-sm font-medium text-secondary" x-text="sideChips.length > 1 ? 'What does this recording contain?' : 'Tracks on this release'"></label>
+                        <span class="text-xs text-muted" x-text="`Recording: ${formatDuration(currentFile?.duration)}` + (currentFile?.musicDuration > 0 ? ` (music ${formatDuration(currentFile.musicDuration)})` : '')"></span>
+                    </div>
+                    <!-- Scope presets: full album / per disc -->
+                    <div x-show="sidePresets.length > 0" class="flex flex-wrap gap-2 mb-3">
+                        <template x-for="preset in sidePresets" :key="preset.label">
+                            <button type="button" @click="applyPreset(preset.sides)" :disabled="analyzing || currentLocked"
+                                    class="px-4 py-2 rounded-lg border-2 transition text-left"
+                                    :style="sidesEqualSelection(preset.sides) ? 'border-color: #E5A100; color: #E5A100; background-color: rgba(229, 161, 0, 0.1);' : 'border-color: #8A8A86;'"
+                                    :class="{'hover:bg-card': !sidesEqualSelection(preset.sides), 'opacity-60 cursor-not-allowed': analyzing}">
+                                <span class="text-sm font-semibold" x-text="preset.label"></span>
+                                <span class="text-xs ml-1" x-text="`${preset.trackCount} tracks • ${preset.totalSeconds !== null ? formatDuration(preset.totalSeconds) : 'length unknown'}`"></span>
+                                <span x-show="isMatchedScope(preset.sides)" class="block text-xs" style="color: #10B981;">✓ matches recording length</span>
+                            </button>
+                        </template>
+                    </div>
+                    <p x-show="defaultScopeNote" x-cloak class="mb-3 text-xs text-muted" x-text="defaultScopeNote"></p>
+                    <p x-show="sideChips.length > 1" class="mb-2 text-xs text-muted">Fine-tune by side:</p>
+                    <div class="flex flex-wrap gap-2">
+                        <template x-for="g in sideChips" :key="g.side">
+                            <button type="button" @click="toggleSide(g.side)" :disabled="analyzing || sideChips.length <= 1"
+                                    class="px-4 py-2 rounded-lg border-2 transition text-left"
+                                    :style="selectedSides.includes(g.side) ? 'border-color: #E5A100; color: #E5A100;' : 'border-color: #8A8A86;'"
+                                    :class="{'hover:bg-card': !selectedSides.includes(g.side), 'opacity-60 cursor-not-allowed': analyzing}">
+                                <span class="text-sm font-semibold" x-text="sideLabel(g.side)"></span>
+                                <span class="text-xs ml-1" x-text="`${g.tracks.length} tracks • ${g.totalSeconds !== null ? formatDuration(g.totalSeconds) : 'length unknown'}`"></span>
+                                <span x-show="isMatchedScope([g.side]) && sideChips.length > 1" class="block text-xs" style="color: #10B981;">✓ matches recording length</span>
+                                <span x-show="sidesUsedByOthers(selectedRelease)[g.side]" class="block text-xs text-muted" x-text="`in ${shortFilename(sidesUsedByOthers(selectedRelease)[g.side])}`"></span>
+                            </button>
+                        </template>
+                    </div>
+                    <p x-show="sideChips.length > 1" class="mt-2 text-xs text-muted">Select more than one side if the recording covers them. Changing sides re-runs track detection.</p>
+                </div>
+                <!-- Release or sides changed after hand edits: ask before re-placing the cuts -->
+                <div x-show="editBanner" x-cloak class="mt-4 p-3 rounded-lg flex flex-wrap items-center gap-3" style="background-color: rgba(229, 161, 0, 0.15); border: 1px solid #E5A100;">
+                    <p class="text-sm text-primary flex-1">You've adjusted the track boundaries by hand. Snap them to this release's track lengths, or keep your edits?</p>
+                    <div class="flex gap-2">
+                        <button @click="snapToDiscogs()" :disabled="analyzing || currentLocked" class="px-3 py-1.5 btn-primary rounded-lg text-sm font-semibold">Snap to Discogs</button>
+                        <button @click="keepMyEdits()" class="px-3 py-1.5 rounded-lg text-sm text-primary" style="background-color: #F0EFEB;">Keep my edits</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         </fieldset>
         <!-- Player stays usable on a locked (exporting) recording; its regions are frozen in app.js -->
         <!-- Waveform Visualization - Full Bleed -->
@@ -952,15 +1045,6 @@
                                         class="px-3 py-1.5 btn-primary rounded-lg text-sm font-semibold"
                                         :class="{'opacity-50 cursor-not-allowed': analyzing || !selectedRelease || targetTracks.length < 1}"
                                         title="Place boundaries using the Discogs track lengths">🧲 Snap to Discogs</button>
-                            </div>
-                        </div>
-
-                        <!-- Hand-edited boundaries: ask before re-detecting -->
-                        <div x-show="editBanner" x-cloak class="mb-4 p-3 rounded-lg flex flex-wrap items-center gap-3" style="background-color: rgba(229, 161, 0, 0.15); border: 1px solid #E5A100;">
-                            <p class="text-sm text-primary flex-1">You've adjusted track boundaries by hand.</p>
-                            <div class="flex gap-2">
-                                <button @click="snapToDiscogs()" :disabled="analyzing || currentLocked" class="px-3 py-1.5 btn-primary rounded-lg text-sm font-semibold">Snap to Discogs</button>
-                                <button @click="keepMyEdits()" class="px-3 py-1.5 rounded-lg text-sm text-primary" style="background-color: #F0EFEB;">Keep my edits</button>
                             </div>
                         </div>
 
@@ -1072,86 +1156,11 @@
                         </div>
                     </div>
 
-                    <!-- Release & export -->
+                    <!-- Export (the release itself is chosen above the waveform) -->
                     <div x-show="selectedRelease" x-cloak class="bg-card rounded-lg shadow p-6">
                         <div class="flex justify-between items-center mb-4">
-                            <h3 class="text-lg font-semibold text-primary">💿 Release &amp; Export</h3>
-                            <button @click="changeRelease()" :disabled="analyzing || currentLocked" class="px-4 py-2 rounded-lg text-primary hover:bg-page" style="background-color: #F0EFEB;">← Change release</button>
-                        </div>
-
-                        <!-- Selected Release Info -->
-                        <div class="mb-4 p-4 rounded-lg" style="background-color: rgba(229, 161, 0, 0.1);">
-                            <p class="font-bold text-primary" x-text="selectedRelease ? `${selectedRelease.artist} - ${selectedRelease.title}` : ''"></p>
-                            <p class="text-sm text-secondary" x-text="selectedRelease ? `${selectedRelease.year} • ${selectedRelease.label}` : ''"></p>
-                            <p x-show="lengthsBorrowedFrom" x-cloak class="mt-1 text-xs text-muted">
-                                Lengths borrowed from <span x-text="borrowedLabel(lengthsBorrowedFrom)"></span>
-                                (<a :href="lengthsBorrowedFrom ? `https://www.discogs.com/release/${lengthsBorrowedFrom.release_id}` : '#'" target="_blank" rel="noopener" class="underline">view on Discogs</a>)
-                            </p>
-                        </div>
-
-                        <!-- Borrow track lengths from another pressing -->
-                        <div x-show="showBorrowLengths" x-cloak class="mb-4 p-4 bg-page rounded-lg">
-                            <div class="flex flex-wrap items-center justify-between gap-2">
-                                <p class="text-sm text-secondary" x-text="borrowLengthsMessage"></p>
-                                <button type="button" @click="findLengthDonors()" :disabled="donors.status === 'searching' || analyzing"
-                                        class="px-4 py-2 rounded-lg border-2 text-sm hover:bg-card"
-                                        style="border-color: #E5A100; color: #3D3D3D;"
-                                        :class="{'opacity-60 cursor-not-allowed': donors.status === 'searching' || analyzing}">Find lengths from other pressings</button>
-                            </div>
-                            <p x-show="donors.status === 'searching'" x-cloak class="mt-2 text-sm text-secondary flex items-center gap-2" role="status">
-                                <span class="spinner"></span> <span x-text="donorProgressText"></span>
-                            </p>
-                            <p x-show="donors.status === 'error'" x-cloak class="mt-2 text-sm" style="color: #B3261E;" role="alert" x-text="donors.error"></p>
-                            <p x-show="donors.status === 'done' && donors.list.length === 0" x-cloak class="mt-2 text-sm text-muted">No other pressing with matching track lengths found</p>
-                            <div x-show="donors.status === 'done' && donors.list.length > 0" x-cloak class="mt-2 space-y-2">
-                                <template x-for="d in donors.list" :key="d.release_id">
-                                    <div class="flex flex-wrap items-center justify-between gap-2 p-2 rounded-lg bg-card">
-                                        <div class="text-sm">
-                                            <span x-text="donorTitle(d)"></span>
-                                            <span class="ml-2 text-xs text-muted" x-text="`${d.matched}/${d.total} matched`"></span>
-                                        </div>
-                                        <button type="button" @click="applyDonor(d)" :disabled="analyzing || currentLocked"
-                                                class="px-3 py-1.5 btn-primary rounded-lg text-sm" :class="{'opacity-60 cursor-not-allowed': analyzing}">Use these lengths</button>
-                                    </div>
-                                </template>
-                            </div>
-                        </div>
-
-                        <!-- Side selection -->
-                        <div class="mb-4 p-4 bg-page rounded-lg">
-                            <div class="flex flex-wrap justify-between items-baseline gap-2 mb-2">
-                                <label class="block text-sm font-medium text-secondary" x-text="sideChips.length > 1 ? 'What does this recording contain?' : 'Tracks on this release'"></label>
-                                <span class="text-xs text-muted" x-text="`Recording: ${formatDuration(currentFile?.duration)}` + (currentFile?.musicDuration > 0 ? ` (music ${formatDuration(currentFile.musicDuration)})` : '')"></span>
-                            </div>
-                            <!-- Scope presets: full album / per disc -->
-                            <div x-show="sidePresets.length > 0" class="flex flex-wrap gap-2 mb-3">
-                                <template x-for="preset in sidePresets" :key="preset.label">
-                                    <button type="button" @click="applyPreset(preset.sides)" :disabled="analyzing || currentLocked"
-                                            class="px-4 py-2 rounded-lg border-2 transition text-left"
-                                            :style="sidesEqualSelection(preset.sides) ? 'border-color: #E5A100; color: #E5A100; background-color: rgba(229, 161, 0, 0.1);' : 'border-color: #8A8A86;'"
-                                            :class="{'hover:bg-card': !sidesEqualSelection(preset.sides), 'opacity-60 cursor-not-allowed': analyzing}">
-                                        <span class="text-sm font-semibold" x-text="preset.label"></span>
-                                        <span class="text-xs ml-1" x-text="`${preset.trackCount} tracks • ${preset.totalSeconds !== null ? formatDuration(preset.totalSeconds) : 'length unknown'}`"></span>
-                                        <span x-show="isMatchedScope(preset.sides)" class="block text-xs" style="color: #10B981;">✓ matches recording length</span>
-                                    </button>
-                                </template>
-                            </div>
-                            <p x-show="defaultScopeNote" x-cloak class="mb-3 text-xs text-muted" x-text="defaultScopeNote"></p>
-                            <p x-show="sideChips.length > 1" class="mb-2 text-xs text-muted">Fine-tune by side:</p>
-                            <div class="flex flex-wrap gap-2">
-                                <template x-for="g in sideChips" :key="g.side">
-                                    <button type="button" @click="toggleSide(g.side)" :disabled="analyzing || sideChips.length <= 1"
-                                            class="px-4 py-2 rounded-lg border-2 transition text-left"
-                                            :style="selectedSides.includes(g.side) ? 'border-color: #E5A100; color: #E5A100;' : 'border-color: #8A8A86;'"
-                                            :class="{'hover:bg-card': !selectedSides.includes(g.side), 'opacity-60 cursor-not-allowed': analyzing}">
-                                        <span class="text-sm font-semibold" x-text="sideLabel(g.side)"></span>
-                                        <span class="text-xs ml-1" x-text="`${g.tracks.length} tracks • ${g.totalSeconds !== null ? formatDuration(g.totalSeconds) : 'length unknown'}`"></span>
-                                        <span x-show="isMatchedScope([g.side]) && sideChips.length > 1" class="block text-xs" style="color: #10B981;">✓ matches recording length</span>
-                                        <span x-show="sidesUsedByOthers(selectedRelease)[g.side]" class="block text-xs text-muted" x-text="`in ${shortFilename(sidesUsedByOthers(selectedRelease)[g.side])}`"></span>
-                                    </button>
-                                </template>
-                            </div>
-                            <p x-show="sideChips.length > 1" class="mt-2 text-xs text-muted">Select more than one side if the recording covers them. Changing sides re-runs track detection.</p>
+                            <h3 class="text-lg font-semibold text-primary">📦 Export</h3>
+                            <span class="text-sm text-secondary truncate ml-4" x-text="selectedRelease ? `${selectedRelease.artist} - ${selectedRelease.title}` : ''"></span>
                         </div>
 
                         <!-- Output Format Selector -->
