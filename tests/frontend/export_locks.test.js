@@ -217,6 +217,11 @@ async function startWaveform(options) {
     return { instance, wave };
 }
 
+test('WaveSurfer objects stay out of Alpine reactivity (proxied regions could not be removed)', async () => {
+    const { instance, wave } = await startWaveform();
+    assert.strictEqual(wave.__v_skip, true); assert.strictEqual(instance.waveformRegions.__v_skip, true);
+    assert.ok(!Object.keys(wave).includes('__v_skip'), 'non-enumerable: never serialised or iterated');
+});
 test('a browser that cannot play WAV loads the MP3 preview from the start', async () => {
     const { instance, wave } = await startWaveform({ canPlay: '' });
     assert.strictEqual(wave.loads.length, 1); assert.strictEqual(wave.loads[0].url, '/api/audio/one');

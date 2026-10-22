@@ -39,6 +39,17 @@ const WORKSPACE_FIELDS = [
     'hissReduction', 'hissStrength', 'albumGain', 'playTime', ...Object.keys(WORKSPACE_ADDITIONS)
 ];
 
+// Keep WaveSurfer objects out of Alpine's reactive proxies. Through a proxy,
+// WaveSurfer's identity checks fail (a removed region compares proxy vs raw and
+// stays in the plugin's list, so the next remove() throws and aborts the caller).
+function markRaw(obj) {
+    if (obj && typeof obj === 'object') {
+        Object.defineProperty(obj, '__v_skip', { value: true, configurable: true });
+    }
+    return obj;
+}
+
+
 // ---- Click detection helpers (pure; exposed on the app object for tests) ----
 
 /** Number of sorted click times t with start <= t < end (binary search). */
@@ -3148,7 +3159,7 @@ function vinylApp() {
                 // have a fixed CSS height (see index.html) — a min-height
                 // floor lets the canvas/container feedback loop grow the
                 // waveform forever on fractional-DPI Windows displays (#63).
-                this.waveform = WaveSurfer.create({
+                this.waveform = markRaw(WaveSurfer.create({
                     container: '#waveform',
                     waveColor: '#93c5fd',
                     progressColor: '#1d4ed8',
@@ -3157,7 +3168,7 @@ function vinylApp() {
                     normalize: true,
                     barWidth: 2,
                     barGap: 1
-                });
+                }));
 
                 const waveform = this.waveform;
                 let uiBound = false;
@@ -3207,7 +3218,7 @@ function vinylApp() {
                     for (const [event, listener] of Object.entries(mediaListeners)) media.removeEventListener(event, listener);
                 });
 
-                this.waveformRegions = this.waveform.registerPlugin(WaveSurfer.Regions.create());
+                this.waveformRegions = markRaw(this.waveform.registerPlugin(WaveSurfer.Regions.create()));
 
                 const peaksResponse = await fetch(`/api/waveform-peaks/${this.currentFileId}`);
                 if (waveform !== this.waveform) return;
