@@ -3643,6 +3643,7 @@ function vinylApp() {
                 });
 
                 this.waveformRegions = markRaw(this.waveform.registerPlugin(WaveSurfer.Regions.create()));
+                this.tameRegionDragScroll(waveform, this.waveformRegions);
                 this.bindWaveScrollbar(waveform);
 
                 const peaksResponse = await fetch(`/api/waveform-peaks/${this.currentFileId}`);
@@ -3778,6 +3779,22 @@ function vinylApp() {
                 this.notifyError('Failed to load waveform', error);
                 this.waveformLoading = false;
             }
+        },
+
+        /**
+         * WaveSurfer scrolls a dragged region into view on every pointer move: its start when
+         * that is off-screen, else its end.  A region wider than the view always has one of them
+         * off-screen, so a whole-region drag while zoomed in flipped the view between the two
+         * (thousands of px per move).  Wider regions now leave the view alone.
+         */
+        tameRegionDragScroll(waveform, regions) {
+            const follow = regions.adjustScroll?.bind(regions);
+            if (!follow) return;
+            regions.adjustScroll = region => {
+                const view = waveform.getWrapper?.()?.parentElement;
+                const width = region?.element?.getBoundingClientRect?.().width || 0;
+                if (!view || width <= view.clientWidth) follow(region);
+            };
         },
 
         /** Track WaveSurfer's scroll position (its scroll element wraps the waveform wrapper). */
