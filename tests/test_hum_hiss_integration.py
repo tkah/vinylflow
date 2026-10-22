@@ -346,7 +346,7 @@ class _Meta:
     def tag_file(self, *a, **k):
         pass
 
-    def create_track_filename(self, track, release, fmt):
+    def create_track_filename(self, track, release, fmt, job_positions=None):
         return f"{track.vinyl_number}.{fmt}"
 
 

@@ -2987,6 +2987,78 @@ function vinylApp() {
         },
 
         /**
+         * Index tracks (suites, classical works) of the selected release: one entry
+         * per work, folded (one umbrella track carrying `parts`) or unfolded (its
+         * parts as separate tracks, each remembering its `umbrella`).
+         */
+        get indexTracks() {
+            const out = [];
+            (this.selectedRelease?.tracks || []).forEach((t, index) => {
+                if (t.parts?.length) {
+                    out.push({ umbrella: t, unfolded: false, index, count: t.parts.length });
+                } else if (t.umbrella) {
+                    const last = out[out.length - 1];
+                    if (last?.unfolded && last.umbrella.position === t.umbrella.position &&
+                        last.umbrella.title === t.umbrella.title) last.count++;
+                    else out.push({ umbrella: t.umbrella, unfolded: true, index, count: 1 });
+                }
+            });
+            return out.map(e => {
+                const parts = e.umbrella.parts;
+                const first = parts[0].position, last = parts[parts.length - 1].position;
+                return { ...e, title: e.umbrella.title, range: first === last ? first : `${first}\u2013${last}` };
+            });
+        },
+
+        /**
+         * Replace an index track by its parts (or the parts by the index track),
+         * re-detect for the new track count (or ask first after hand edits), offer Undo.
+         * Mutates the release in place like applyDonor.
+         */
+        setIndexUnfolded(entry, unfold) {
+            const release = this.selectedRelease;
+            if (!release || !entry || this.analyzing || this.currentLocked || entry.unfolded === unfold) return;
+            const snapshot = {
+                tracks: JSON.parse(JSON.stringify(release.tracks)),
+                sides: [...this.selectedSides],
+                all: this.selectedSides.length === this.sideChips.length
+            };
+            const umbrella = JSON.parse(JSON.stringify(entry.umbrella));
+            const replacement = unfold
+                ? umbrella.parts.map(p => ({ position: p.position, title: p.title, duration: p.duration, umbrella }))
+                : [umbrella];
+            release.tracks.splice(entry.index, unfold ? 1 : entry.count, ...replacement);
+            this.afterIndexChange(release.id, snapshot.all);
+
+            this.notify(unfold
+                ? `${umbrella.title}: split into ${umbrella.parts.length} parts.`
+                : `${umbrella.title}: kept as one track.`, {
+                type: 'success',
+                timeout: 8000,
+                action: {
+                    label: 'Undo',
+                    fn: () => {
+                        if (this.selectedRelease !== release) return;
+                        release.tracks.splice(0, release.tracks.length, ...snapshot.tracks);
+                        this.selectedSides = snapshot.sides;
+                        this.afterIndexChange(release.id, false);
+                    }
+                }
+            });
+        },
+
+        /** Tracks changed shape: keep only sides that still exist, remap, re-detect. */
+        afterIndexChange(releaseId, all) {
+            this.resetDonors();
+            const sides = this.sideChips.map(g => g.side);
+            const kept = this.selectedSides.filter(side => sides.includes(side));
+            this.selectedSides = all || !kept.length ? sides : kept;
+            this.rememberChoice();
+            this.resetMappingToTargets();
+            if (this.selectedRelease?.id === releaseId) this.afterTargetsChanged();
+        },
+
+        /**
          * Drop the selected release but keep search results and the current
          * detection/waveform so another release can be picked.
          */

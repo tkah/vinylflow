@@ -929,6 +929,25 @@
                     </p>
                 </div>
 
+                <!-- Index tracks (suites / classical works): keep as one track or split into parts -->
+                <div x-show="indexTracks.length > 0" x-cloak class="mb-4 space-y-2" data-testid="index-tracks">
+                    <template x-for="entry in indexTracks" :key="entry.umbrella.position + entry.umbrella.title">
+                        <div class="flex flex-wrap items-center justify-between gap-2 px-4 py-2 bg-page rounded-lg">
+                            <div class="text-sm min-w-0">
+                                <span aria-hidden="true">🎼</span>
+                                <span class="ml-1 text-xs text-muted" x-text="entry.range"></span>
+                                <span class="ml-2 font-medium text-primary" x-text="entry.title"></span>
+                                <span class="ml-2 text-xs text-muted" x-text="`${entry.umbrella.parts.length} parts`"></span>
+                            </div>
+                            <button type="button" @click="setIndexUnfolded(entry, !entry.unfolded)" :disabled="analyzing || currentLocked"
+                                    class="px-3 py-1.5 rounded-lg border-2 text-sm hover:bg-card"
+                                    style="border-color: #E5A100; color: #3D3D3D;"
+                                    :class="{'opacity-60 cursor-not-allowed': analyzing || currentLocked}"
+                                    x-text="entry.unfolded ? 'Keep as one track' : 'Split into parts'"></button>
+                        </div>
+                    </template>
+                </div>
+
                 <!-- Borrow track lengths from another pressing -->
                 <div x-show="showBorrowLengths" x-cloak class="mb-4 p-4 bg-page rounded-lg">
                     <div class="flex flex-wrap items-center justify-between gap-2">

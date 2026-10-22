@@ -134,14 +134,17 @@ def run(
                 bit_depth=bit_depth,
             )
 
+            # Every position this export covers (an album job's members included): numbering,
+            # and which split (index) track parts are exported, depend on all of them.
+            job_positions = list(spec.job_positions) or [t.vinyl_number for t in tracks]
             metadata_handler.tag_file(
                 temp_output, track, release, cover_data, spec.output_format,
                 track_numbering=spec.track_numbering,
-                job_positions=list(spec.job_positions) or [t.vinyl_number for t in tracks],
+                job_positions=job_positions,
             )
 
             final_filename = metadata_handler.create_track_filename(
-                track, release, spec.output_format
+                track, release, spec.output_format, job_positions
             )
             final_path = album_folder / final_filename
             temp_output.replace(final_path)

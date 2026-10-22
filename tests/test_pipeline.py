@@ -56,7 +56,7 @@ class FakeMetadata:
                  job_positions=None):
         self.tag_calls.append((file_path, track.vinyl_number, output_format))
 
-    def create_track_filename(self, track, release, output_format) -> str:
+    def create_track_filename(self, track, release, output_format, job_positions=None) -> str:
         return f"{track.vinyl_number}-track.{output_format}"
 
 

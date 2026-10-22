@@ -20,7 +20,7 @@ import discogs_client
 from mutagen.flac import FLAC, Picture
 from mutagen.mp3 import MP3
 from mutagen.id3 import (
-    ID3, TIT2, TPE1, TPE2, TPE3, TALB, TDRC, TRCK, TPOS, TPUB, TCMP, TCOM, TMCL, COMM, APIC, TXXX,
+    ID3, TIT1, TIT2, TPE1, TPE2, TPE3, TALB, TDRC, TRCK, TPOS, TPUB, TCMP, TCOM, TMCL, COMM, APIC, TXXX,
 )
 from mutagen.aiff import AIFF
 from PIL import Image
@@ -71,6 +71,8 @@ class TagSet:
     disc_total: Optional[str] = None
     album_artist: Optional[str] = None
     compilation: bool = False
+    # Umbrella (index track) title when the file is one of its parts.
+    work: Optional[str] = None
     # Classical releases only (empty tuples otherwise).
     composers: Tuple[str, ...] = ()
     conductors: Tuple[str, ...] = ()
@@ -106,6 +108,7 @@ class DiscogsTrack:
         """
         self.position = position
         self.parts = list(parts or [])
+        self.work: Optional[str] = None
         self.raw_position = raw_position or position
         self.artist = artist
         self.credits = list(credits or [])
@@ -695,11 +698,41 @@ class MetadataHandler:
             print(f"Unsupported output format for tagging: {output_format}")
             return False
 
-    def _find_discogs_track(self, track, release):
-        """Find the Discogs track matching a vinyl_number."""
+    @staticmethod
+    def _part_title(umbrella_title: str, part_title: str) -> str:
+        """"Work: Movement" unless the part already starts with the work's title."""
+        if not umbrella_title or part_title.lower().startswith(umbrella_title.lower()):
+            return part_title or umbrella_title
+        return f"{umbrella_title}: {part_title}" if part_title else umbrella_title
+
+    def _find_discogs_track(self, track, release, job_positions=None):
+        """Find the Discogs track matching a vinyl_number.
+
+        A position inside an umbrella (index) track's parts resolves to a
+        DiscogsTrack for that part ("Work: Movement"; artist and credits are the
+        umbrella's, ``work`` names the umbrella).  The umbrella shares its first
+        part's position, so when the job also exports another of its parts (the
+        user split it, as ``_release_positions`` counts it) that position is the part.
+        """
+        exported = set(job_positions or [])
         for dt in release.tracks:
             if dt.position == track.vinyl_number:
-                return dt
+                parts = [p.get("position") for p in getattr(dt, "parts", None) or []]
+                if not any(p in exported and p != dt.position for p in parts):
+                    return dt
+                break
+        for dt in release.tracks:
+            for part in getattr(dt, "parts", None) or []:
+                if part.get("position") == track.vinyl_number:
+                    found = DiscogsTrack(
+                        part["position"],
+                        self._part_title(dt.title, part.get("title", "")),
+                        part.get("duration", ""),
+                        artist=dt.artist,
+                        credits=dt.credits,
+                    )
+                    found.work = dt.title
+                    return found
         print(f"Warning: No Discogs track found for {track.vinyl_number}")
         return None
 
@@ -728,6 +761,18 @@ class MetadataHandler:
         return str(disc_num), str(seq)
 
     @staticmethod
+    def _release_positions(release, processed_positions) -> List[str]:
+        """The release's positions for numbering; an umbrella (index) track counts as
+        its parts when the job exports any of them (unfolded), else as itself."""
+        exported = set(processed_positions or [])
+        found = []
+        for t in release.tracks:
+            parts = [p["position"] for p in getattr(t, "parts", None) or [] if p.get("position")]
+            unfolded = any(p in exported and p != t.position for p in parts)
+            found += parts if unfolded else [t.position]
+        return found
+
+    @staticmethod
     def _disc_of(position: str) -> Optional[int]:
         """LP number of a vinyl position: A,B→1  C,D→2  E,F→3 …; None if unrecognised."""
         m = re.match(r'^([A-Z]+)\d+', position or "")
@@ -748,7 +793,11 @@ class MetadataHandler:
     def _classical_tags(self, discogs_track, release, various: bool) -> dict:
         """Composer / conductor / ensemble / performers for one track of a
         classical release (see ``release_credits``); ``performer_names`` feeds ARTIST."""
-        positions = [(getattr(t, "raw_position", t.position), t.position) for t in release.tracks]
+        positions = []
+        for t in release.tracks:
+            positions.append((getattr(t, "raw_position", t.position), t.position))
+            positions += [(p["position"], p["position"]) for p in getattr(t, "parts", None) or []
+                          if p.get("position") and p["position"] != t.position]
         credits = credits_for_track(
             getattr(release, "credits", []), getattr(discogs_track, "credits", []), discogs_track.position, positions,
         )
@@ -776,7 +825,7 @@ class MetadataHandler:
     ) -> Optional[TagSet]:
         """Compute the TagSet for one track.  Returns None if the Discogs
         track lookup fails — caller treats that as a tag-write failure."""
-        discogs_track = self._find_discogs_track(track, release)
+        discogs_track = self._find_discogs_track(track, release, processed_positions)
         if discogs_track is None:
             return None
 
@@ -786,7 +835,7 @@ class MetadataHandler:
             # a side recorded and exported on its own still continues where side A ends; a
             # track left out leaves a gap rather than two files claiming the same number.
             positions = self._sort_positions(
-                list(processed_positions or []) + [t.position for t in release.tracks]
+                list(processed_positions or []) + self._release_positions(release, processed_positions)
             )
             disc_str, track_str = self._sequential_disc_per_lp(track.vinyl_number, positions)
             if disc_str is None:
@@ -828,6 +877,7 @@ class MetadataHandler:
             disc_total=disc_total,
             album_artist=album_artist,
             compilation=various,
+            work=getattr(discogs_track, "work", None),
             **classical,
         )
 
@@ -849,6 +899,8 @@ class MetadataHandler:
             audio["VINYLPOSITION"] = tags.vinyl_position
         if tags.compilation:
             audio["COMPILATION"] = "1"
+        if tags.work:
+            audio["WORK"] = tags.work
         if tags.composers:
             audio["COMPOSER"] = list(tags.composers)
         if tags.conductors:
@@ -889,6 +941,8 @@ class MetadataHandler:
             )
         if tags.compilation:
             audio.tags["TCMP"] = TCMP(encoding=3, text="1")
+        if tags.work:
+            audio.tags["TIT1"] = TIT1(encoding=3, text=tags.work)
         if tags.composers:
             audio.tags["TCOM"] = TCOM(encoding=3, text=list(tags.composers))
         if tags.conductors:
@@ -1041,7 +1095,8 @@ class MetadataHandler:
         return f"{artist} - {title}"
 
     def create_track_filename(
-        self, track: "Track", release: DiscogsRelease, output_format: str = "flac"
+        self, track: "Track", release: DiscogsRelease, output_format: str = "flac",
+        job_positions: Optional[List[str]] = None,
     ) -> str:
         """
         Create filename for track.
@@ -1059,7 +1114,7 @@ class MetadataHandler:
         format_config = OUTPUT_FORMATS.get(output_format, OUTPUT_FORMATS["flac"])
         ext = format_config["extension"]
 
-        discogs_track = self._find_discogs_track(track, release)
+        discogs_track = self._find_discogs_track(track, release, job_positions)
         if not discogs_track:
             return f"{track.vinyl_number}-Unknown{ext}"
 

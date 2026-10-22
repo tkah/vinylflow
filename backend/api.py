@@ -1730,11 +1730,18 @@ def _serialize_release(release) -> dict:
         "format": release.format,
         "cover_url": release.cover_url,
         "uri": release.uri,
-        "tracks": [
-            {"position": t.position, "title": t.title, "duration": t.duration_str}
-            for t in release.tracks
-        ],
+        "tracks": [_serialize_track(t) for t in release.tracks],
     }
+
+
+def _serialize_track(t) -> dict:
+    out = {"position": t.position, "title": t.title, "duration": t.duration_str}
+    parts = getattr(t, "parts", None)
+    if parts:  # umbrella (index) track: the parts it can be unfolded into
+        out["parts"] = [
+            {"position": p["position"], "title": p["title"], "duration": p["duration"]} for p in parts
+        ]
+    return out
 
 
 @app.post("/api/search")
