@@ -26,7 +26,10 @@ class OutputSpec:
     shared_gain_db: Optional[float] = None
     defer_completion: bool = False  # group finalization writes shared tags before Session completion
     replaygain: bool = True
-    track_numbering: str = "vinyl"
+    track_numbering: str = "sequential_disc_per_lp"
+    # Vinyl positions exported by the whole job (an album job: every recording), so
+    # sequential numbering and totals span them; () = just this file's tracks.
+    job_positions: tuple[str, ...] = ()
     bit_depth: str = "source"  # "source" | "24"
 
 

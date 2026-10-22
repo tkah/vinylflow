@@ -16,7 +16,10 @@ from metadata_handler import MetadataHandler, TagSet
 class FakeDiscogsTrack:
     def __init__(self, position: str, title: str):
         self.position = position
+        self.raw_position = position
         self.title = title
+        self.artist = ""
+        self.credits = []
 
 
 class FakeRelease:
@@ -35,6 +38,9 @@ class FakeRelease:
         self.year = year
         self.label = label
         self.tracks = tracks
+        self.various_artists = False
+        self.genres = []
+        self.credits = []
 
 
 class FakeTrack:
@@ -159,7 +165,7 @@ def test_apply_vorbis_omits_label_when_none():
     assert audio.pictures == []
 
 
-def test_apply_vorbis_writes_empty_date_when_year_missing():
+def test_apply_vorbis_omits_date_when_year_missing():
     handler = make_handler()
     audio = FakeFlacAudio()
     tags = TagSet(
@@ -169,7 +175,7 @@ def test_apply_vorbis_writes_empty_date_when_year_missing():
 
     handler._apply_vorbis(audio, tags)
 
-    assert audio.values["DATE"] == ""
+    assert "DATE" not in audio.values
 
 
 class FakeId3Audio:

@@ -137,6 +137,7 @@ vinylflow/
 ├── click_detection.py      # Click scan: residual (original - declicked) in ffmpeg, chunk planning, thresholds, cache
 ├── silence_analysis.py     # Hum detector (50/60 Hz + harmonics) + surface-noise profile, from the silent stretches only
 ├── metadata_handler.py     # Discogs fetch, cover art download, audio tagging
+├── release_credits.py      # Pure Discogs artist names, join strings, credit roles (allowlist) and track ranges
 ├── desktop_launcher.py     # Entry point — sets up dirs/env vars, starts FastAPI, opens window
 ├── VinylFlow.spec          # PyInstaller spec (macOS .app + Windows .exe)
 ├── requirements.txt
@@ -346,6 +347,14 @@ Besides silence detection and `track_numbering`/`output_dir`:
 | `album_gain` | bool, default off | One gain for the whole album |
 | `replaygain` | bool, default on | ReplayGain 2.0 tags |
 | `bit_depth` | `"source"` (default) / `"24"` | FLAC/AIFF depth. Source depth is probed at upload; unknown -> 24 (never truncates). 16-bit targets get triangular dither only when processing runs (rumble / hum / declick / hiss / gain); unprocessed 16->16 stays bit-exact. MP3 unaffected |
+
+## Tags
+
+- Built once per file (`MetadataHandler._build_tag_set` -> `TagSet`), written by `_apply_vorbis` (FLAC) / `_apply_id3` (MP3, AIFF). Unknown values are omitted, never written empty.
+- Artist names: Discogs join strings ("&", ","; fallback ", "), disambiguation suffix stripped ("Nirvana (2)" -> "Nirvana"; also the album folder name). ALBUMARTIST/TPE2 always (release artist, or "Various Artists").
+- Default numbering is `sequential_disc_per_lp`: DISCNUMBER + TRACKNUMBER with `TRACKTOTAL`/`DISCTOTAL` (ID3 `n/total`). Numbering follows the release tracklist plus the exported positions (`OutputSpec.job_positions`), so a side exported on its own continues after side A; a skipped track leaves a gap. DISCTOTAL = LPs in the release. `vinyl` mode writes no totals.
+- Compilations (release artist Various): ARTIST = the track's own Discogs artist(s), ALBUMARTIST "Various Artists", `COMPILATION=1` / `TCMP`.
+- Classical (release genre "Classical"): COMPOSER/TCOM from composer credits (else release artist), ARTIST = soloists, then ensembles, then conductor credited on the track (else release artist), CONDUCTOR/TPE3, ENSEMBLE (TXXX), `PERFORMER=Name (Instrument)` / TMCL. Only the allowlisted performing roles in `release_credits.py` are tagged; credit track ranges ("A1 to A3", "B1, B2") are honoured, unresolvable ones cover nothing.
 
 ## Detection internals
 

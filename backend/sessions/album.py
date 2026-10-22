@@ -55,6 +55,9 @@ class AlbumJob:
                     self.gain_db = None
                 if self.gain_db is None:
                     self.warnings.append('Shared album gain skipped: the complete programme could not be measured.')
+            # Sequential track numbers and totals span every recording of the release.
+            job_positions = tuple(sorted({track.vinyl_number for member in self.members
+                                          for track in pipeline._build_tracks(member.session)}))
             for member in self.members:
                 session = member.session
                 item = self.files[session.id]
@@ -64,7 +67,7 @@ class AlbumJob:
                     if event.message.startswith('Warning:'):
                         self.warnings.append(event.message)
                 spec = replace(member.spec, shared_album=True, shared_gain_db=self.gain_db,
-                               replaygain=False, defer_completion=True)
+                               replaygain=False, defer_completion=True, job_positions=job_positions)
                 try:
                     pipeline.run(session, spec, member.release_id, audio, metadata, progress)
                     successful.append(member)

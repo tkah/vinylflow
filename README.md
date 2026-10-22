@@ -364,8 +364,8 @@ DEFAULT_FLAC_COMPRESSION=8
 **Config Priority**: `config/settings.json` (UI-editable) → `.env` (manual) → environment variables (Docker)
 
 **Track Numbering**: Configurable via Settings (⚙️) or by setting `TRACK_NUMBERING` in `config/settings.json`:
-- `vinyl` *(default)* — writes the vinyl position (e.g. `A1`, `B2`) directly as `TRACKNUMBER`. Preserves vinyl notation but some players (Jellyfin, Roon) may mis-sort tracks.
-- `sequential_disc_per_lp` — writes integer `DISCNUMBER` (A+B = disc 1, C+D = disc 2) and sequential `TRACKNUMBER` across both sides of each LP, with the original vinyl position preserved in a `VINYLPOSITION` tag. Single LPs appear as one disc; 2-LP sets appear as two. Recommended for correct playback order in media servers.
+- `sequential_disc_per_lp` *(default)* — writes integer `DISCNUMBER` (A+B = disc 1, C+D = disc 2) and sequential `TRACKNUMBER` across both sides of each LP, with track/disc totals (`TRACKTOTAL`/`DISCTOTAL`, or `n/total` in ID3) and the original vinyl position preserved in a `VINYLPOSITION` tag. Single LPs appear as one disc; 2-LP sets appear as two. When several recordings of one release are exported together, numbering and totals span all of them.
+- `vinyl` — writes the vinyl position (e.g. `A1`, `B2`) directly as `TRACKNUMBER`, without totals. Preserves vinyl notation but some players (Jellyfin, Roon) may mis-sort tracks.
 
 ### Silence Detection Tips
 
@@ -460,6 +460,7 @@ Pick the Discogs release first: its track lengths place the splits, and **Snap t
 - Optional album gain and ReplayGain tags, shared across the discs of a release
 - Per-recording workspaces, Process all ready, and queued exports
 - Source bit depth kept on export (24-bit stays 24-bit)
+- Richer tags: album artist, track/disc totals, compilation flag and per-track artists, classical composer/conductor/ensemble/performers
 - Fully offline interface, localhost-only by default
 
 ### Planned

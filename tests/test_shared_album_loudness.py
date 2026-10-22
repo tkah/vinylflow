@@ -12,7 +12,7 @@ from backend.sessions.album import AlbumJob, AlbumMember
 from metadata_handler import MetadataHandler
 
 
-def make_job(tmp_path, gain=True, replaygain=True, rates=(44100, 48000)):
+def make_job(tmp_path, gain=True, replaygain=True, rates=(44100, 48000), positions=('A1', 'C1')):
     """Two independent recordings of one release, with an 8 dB intentional level difference."""
     store = SessionStore()
     members = []
@@ -24,13 +24,13 @@ def make_job(tmp_path, gain=True, replaygain=True, rates=(44100, 48000)):
         assert result.returncode == 0, result.stderr
         session = store.create(str(index), path, path.name, 6, path.stat().st_size, 24)
         session.set_boundaries([SimpleNamespace(number=1, start=0.0, end=6.0, declick=None)])
-        session.set_mappings({1: ['A1', 'C1'][index]})
+        session.set_mappings({1: positions[index]})
         spec = OutputSpec('flac', tmp_path / 'output', album_gain=gain, replaygain=replaygain)
         members.append(AlbumMember(session, spec, 99))
     handler = MetadataHandler(discogs_token='', user_agent='')
     handler._release_cache[99] = SimpleNamespace(id=99, artist='Test Artist', title='Double LP',
         year=1990, label='Test', cover_url=None, various_artists=False,
-        tracks=[SimpleNamespace(position='A1', title='Loud'), SimpleNamespace(position='C1', title='Quiet')])
+        tracks=[SimpleNamespace(position=positions[0], title='Loud'), SimpleNamespace(position=positions[1], title='Quiet')])
     return AlbumJob('test-album', members), handler
 
 
@@ -64,6 +64,15 @@ def test_shared_gain_preserves_relative_levels_and_album_tags(tmp_path, output_f
     assert tag(files[0], 'replaygain_album_peak') == tag(files[1], 'replaygain_album_peak')
     assert tag(files[0], 'replaygain_track_gain') != tag(files[1], 'replaygain_track_gain')
     assert float(tag(files[0], 'replaygain_album_gain')[0].split()[0]) == pytest.approx(-18-combined.integrated, abs=.11)
+
+
+def test_sides_recorded_separately_are_numbered_as_one_disc(tmp_path):
+    """One file per side: B1 continues after A1 (TRACKNUMBER 2 of 2), not a second track 1."""
+    job, handler = make_job(tmp_path, gain=False, replaygain=False, positions=('A1', 'B1'))
+    job.run(AudioProcessor(), handler)
+    first, second = (FLAC(path) for path in output_paths(job))
+    assert (first['tracknumber'], first['tracktotal'], first['discnumber'], first['disctotal']) == (['1'], ['2'], ['1'], ['1'])
+    assert (second['tracknumber'], second['tracktotal']) == (['2'], ['2'])
 
 
 def test_measurement_failure_skips_gain_for_every_disc(tmp_path, monkeypatch):

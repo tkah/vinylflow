@@ -52,7 +52,8 @@ class FakeMetadata:
     def prepare_cover_for_embedding(self, path: Path) -> bytes:
         return b"fake-cover-bytes"
 
-    def tag_file(self, file_path, track, release, cover_data, output_format, track_numbering="vinyl"):
+    def tag_file(self, file_path, track, release, cover_data, output_format, track_numbering="vinyl",
+                 job_positions=None):
         self.tag_calls.append((file_path, track.vinyl_number, output_format))
 
     def create_track_filename(self, track, release, output_format) -> str:

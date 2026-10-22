@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 #                            is sequential across both sides of each LP. Single LP
 #                            appears as 1 disc. VINYLPOSITION custom tag preserved.
 # "vinyl"                  — TRACKNUMBER="A1" (legacy behaviour, no DISCNUMBER written).
-DEFAULT_TRACK_NUMBERING = "vinyl"
+DEFAULT_TRACK_NUMBERING = "sequential_disc_per_lp"
 OUTPUT_FORMATS = ("flac", "mp3", "aiff")
 BIT_DEPTHS = ("source", "24")
 DECLICK_LEVELS = ("off", "light", "medium", "strong")
