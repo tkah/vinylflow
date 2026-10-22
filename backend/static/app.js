@@ -34,6 +34,8 @@ const WHEEL_ZOOM_RATE = 0.003;
 // Custom tracks (must match CustomTrack in backend/api.py): new positions are A1/B12; titles <= 200 chars.
 const CUSTOM_POSITION_RE = /^[A-Z]+\d+$/;
 const CUSTOM_TITLE_MAX = 200;
+// Dragging a track wider than the view keeps its leading edge this far (fraction of the view) in from the screen edge
+const DRAG_EDGE_MARGIN = 0.15;
 const REGION_EDGE_HIT_PX = 6;
 const REGION_SHARED_EDGE_PX = 1;
 const WORKSPACE_FIELDS = [
@@ -3784,16 +3786,33 @@ function vinylApp() {
         /**
          * WaveSurfer scrolls a dragged region into view on every pointer move: its start when
          * that is off-screen, else its end.  A region wider than the view always has one of them
-         * off-screen, so a whole-region drag while zoomed in flipped the view between the two
-         * (thousands of px per move).  Wider regions now leave the view alone.
+         * off-screen, so a whole-region drag while zoomed in flipped the view between the two.
+         * Wider regions now follow their leading edge instead: the edge the drag moves towards
+         * (start when dragging left, end when dragging right, fixed for the whole drag) is kept
+         * DRAG_EDGE_MARGIN of the view in from the screen edge, so what lies ahead of the track
+         * (e.g. the previous track it is being moved up to) scrolls into sight.
          */
         tameRegionDragScroll(waveform, regions) {
             const follow = regions.adjustScroll?.bind(regions);
             if (!follow) return;
+            const drags = new WeakMap();   // region -> { start, dir } for the drag in progress
+            // Where the region was when the pointer went down, so the first move knows its direction
+            regions.on?.('region-created', region => region.element?.addEventListener('pointerdown',
+                () => drags.set(region, { start: region.start, dir: 0 })));
+            regions.on?.('region-updated', region => drags.delete(region));   // drag ended
             regions.adjustScroll = region => {
                 const view = waveform.getWrapper?.()?.parentElement;
                 const width = region?.element?.getBoundingClientRect?.().width || 0;
-                if (!view || width <= view.clientWidth) follow(region);
+                if (!view || width <= view.clientWidth) { follow(region); return; }
+                const drag = drags.get(region) || { start: region.start, dir: 0 };
+                if (!drag.dir && region.start !== drag.start) drag.dir = region.start < drag.start ? -1 : 1;
+                drags.set(region, drag);
+                if (!drag.dir) return;
+                const pxPerSec = view.scrollWidth / (waveform.getDuration?.() || 1);
+                const margin = view.clientWidth * DRAG_EDGE_MARGIN;
+                view.scrollLeft = drag.dir < 0
+                    ? region.start * pxPerSec - margin
+                    : region.end * pxPerSec - (view.clientWidth - margin);
             };
         },
 
