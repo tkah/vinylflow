@@ -210,7 +210,8 @@ for o, freq in zip(outs, (440, 660, 880)):
     spec = np.abs(np.fft.rfft(x))
     peak = np.fft.rfftfreq(len(x), 1 / a.info.sample_rate)[spec.argmax()]
     tags = {k: a.get(k, [None])[0] for k in ("title", "tracknumber", "replaygain_track_gain", "replaygain_album_gain")}
-    check(f"{o.name}", abs(dur - 40.0) < 0.6 and abs(peak - freq) < 3 and a.info.bits_per_sample == 16
+    # 40 s tone; tracks after the first also carry PRE_ROLL_S (0.8 s) of the gap before their onset
+    check(f"{o.name}", -0.6 < dur - 40.0 < 0.6 + 0.8 and abs(peak - freq) < 3 and a.info.bits_per_sample == 16
           and tags["title"] and tags["replaygain_track_gain"] and tags["replaygain_album_gain"],
           f"{dur:.2f}s {peak:.0f}Hz {a.info.bits_per_sample}-bit title={tags['title']!r} "
           f"RG track={tags['replaygain_track_gain']} album={tags['replaygain_album_gain']} pictures={len(a.pictures)}")

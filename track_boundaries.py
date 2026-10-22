@@ -531,10 +531,21 @@ LENGTH_SIGMA_S = 3.0  # Discogs length tolerance: sigma = 3 s + 3 % of the lengt
 LENGTH_SIGMA_FRAC = 0.03
 MIN_ALIGNED_TRACK_S = 5.0  # two chosen gaps closer than this cannot hold a track
 
-PRE_ROLL_S = 0.3  # cut this long before the next song's onset
+PRE_ROLL_S = 0.8  # cut this long before the next song's onset (user: >= 0.5 s more than the 0.3 s it was)
+POST_ROLL_S = 0.5  # silence the previous track keeps at least, when the gap allows both
+EDGE_PAD_S = 0.5  # lead-in / run-out silence kept before the first and after the last track
 MAX_TAIL_S = 4.0  # silence kept after the previous song's fade before dropping the rest
 ONSET_RISE_DB = 6.0  # onset = level clearly above the gap level, sustained
 ONSET_SUSTAIN_S = 0.05  # ...for this long on the raw envelope (a click is shorter)
+ONSET_LONG_QUIET_S = 1.0  # the song starts after the gap's last quiet run this long (rests in a soft intro are shorter)
+ONSET_FLIP_RISE_DB = 10.0  # rise needed inside a side-flip-length gap (needle-drop noise over near-digital silence)
+# Needle drop after a side flip: arm-up silence, a thump, then lead-in groove crackle before the music.
+ARM_UP_DB = -68.0  # quieter than any surface noise: the needle was lifted (observed -75..-83 dB)
+LEAD_IN_SETTLE_S = 0.75  # the thump is over by then
+LEAD_IN_MAX_S = 20.0  # longest lead-in searched
+LEAD_IN_AFTER_S = 5.0  # the music is judged on this much audio after the step
+LEAD_IN_MIN_SCORE_DB = 5.0  # music median over the loudest (p90) of the crackle before it
+LEAD_IN_MIN_STEP_DB = 8.0  # music median over the crackle median
 DIGITAL_SILENCE_DB = -90.0  # gaps this quiet hold nothing worth keeping: no tail
 
 
@@ -676,26 +687,73 @@ def align_durations_to_gaps(
 
 
 def _onset(db: np.ndarray, sm: np.ndarray, frame_s: float, gap: GapCandidate) -> float:
-    """Where the music after ``gap`` starts: the smoothed level rises ``ONSET_RISE_DB``
-    above the gap level and stays up; then refined on the raw envelope to the first
-    frame that begins a sustained rise (a lone click is shorter than ``ONSET_SUSTAIN_S``)."""
+    """Where the music after ``gap`` starts.
+
+    A candidate can be several quiet runs merged across short bumps, and those bumps
+    can be the first notes of a soft intro (or run-out thumps before a side flip).
+    So the music is taken to start after the candidate's *last* quiet run of at
+    least ``ONSET_LONG_QUIET_S`` (rests inside an intro are shorter; the silence
+    before a song is not): the first point where the smoothed level rises
+    ``ONSET_RISE_DB`` above that run's own level (``ONSET_FLIP_RISE_DB`` in a
+    side-flip-length gap, whose needle-drop noise sits above near-digital silence),
+    refined on the raw envelope to a sustained rise (a lone click is shorter than
+    ``ONSET_SUSTAIN_S``).  Without such a run: the first clear rise after the candidate.
+    """
     n = len(sm)
     a, b = int(gap.start / frame_s), min(n - 1, int(gap.end / frame_s))
-    level = float(np.median(sm[a : b + 1]))
+    seg = sm[a : b + 1]
+    level = float(np.median(seg))
     thr = level + ONSET_RISE_DB
-    i = b
     limit = min(n - 1, b + int(3.0 / frame_s))
+    long_runs = [r for r in _runs(seg < thr) if (r[1] - r[0]) * frame_s >= ONSET_LONG_QUIET_S]
+    if long_runs:
+        r0, r1 = long_runs[-1]
+        rise = ONSET_FLIP_RISE_DB if gap.end - gap.start >= SIDE_FLIP_MIN_GAP_S else ONSET_RISE_DB
+        thr = float(np.median(seg[r0:r1])) + rise
+        first = i = a + r1
+    else:
+        first, i = a, b
     while i < limit and sm[i] < thr:  # the quiet run can end short of a clear rise
         i += 1
-    while i > a and sm[i - 1] >= thr:  # ...or well after the smoothed level crossed it
+    while i > first and sm[i - 1] >= thr:  # ...or after the smoothed level crossed it
         i -= 1
     sustain = max(1, int(round(ONSET_SUSTAIN_S / frame_s)))
     lo, hi = max(a, i - int(0.4 / frame_s)), min(n - sustain, i + int(0.4 / frame_s))
-    for j in range(lo, hi + 1):
-        if db[j : j + sustain].min() > thr:
-            return j * frame_s
-    return i * frame_s
+    onset = next((j for j in range(lo, hi + 1) if db[j : j + sustain].min() > thr), i)
+    return _after_needle_drop(db, sm, frame_s, onset) * frame_s
 
+
+def _after_needle_drop(db: np.ndarray, sm: np.ndarray, frame_s: float, i: int) -> int:
+    """If the sound at frame ``i`` is a needle drop (arm-up silence before it, then lead-in
+    crackle and a clear step up into the music), the frame where the music starts;
+    otherwise ``i``.  Side A's lead-in is already outside the music span; this is side B's.
+
+    The step is the change point maximising (music median) - (90th percentile of the crackle
+    before it), so a lead-in whose crackle wanders or swells still gives way to the music,
+    while a song that starts right after the thump (no clear step) is left untouched, and so
+    is a very quiet opening that barely rises above the crackle.
+    """
+    n = len(sm)
+    before = sm[max(0, i - int(1.0 / frame_s)) : i]
+    if not len(before) or float(np.median(before)) > ARM_UP_DB:
+        return i
+    a = i + int(LEAD_IN_SETTLE_S / frame_s)
+    after = int(LEAD_IN_AFTER_S / frame_s)
+    best, best_t = -np.inf, None
+    for t in range(a + int(0.5 / frame_s), min(n - after, i + int(LEAD_IN_MAX_S / frame_s)), int(0.1 / frame_s)):
+        score = float(np.median(sm[t : t + after]) - np.percentile(sm[a:t], 90))
+        if score > best:
+            best, best_t = score, t
+    if best_t is None or best < LEAD_IN_MIN_SCORE_DB:
+        return i
+    crackle = float(np.median(sm[a:best_t]))
+    if float(np.median(sm[best_t : best_t + after])) - crackle < LEAD_IN_MIN_STEP_DB:
+        return i
+    # The music's first sound: a raw rise over the crackle that lasts longer than a click.
+    level = crackle + ONSET_RISE_DB
+    sustain = max(1, int(round(ONSET_SUSTAIN_S / frame_s)))
+    return next((k for k in range(max(a, best_t - int(1.0 / frame_s)), best_t + int(0.5 / frame_s))
+                 if db[k : k + sustain].min() > level), best_t)
 
 def onset_cut(
     db: np.ndarray, sm: np.ndarray, frame_s: float, gap: GapCandidate, pre_roll_s: Optional[float] = None
@@ -714,9 +772,13 @@ def onset_cut(
         mid = (gap.start + gap.end) / 2
         return mid, mid
     onset = _onset(db, sm, frame_s, gap)
-    cut = onset - (PRE_ROLL_S if pre_roll_s is None else pre_roll_s)
-    if cut < gap.start:
-        cut = (gap.start + onset) / 2
+    pre = PRE_ROLL_S if pre_roll_s is None else pre_roll_s
+    cut = onset - pre
+    if cut < gap.start + POST_ROLL_S:
+        # Too short for both paddings: share the silence in proportion, so
+        # neither song's audio crosses into the other track.
+        quiet = max(0.0, onset - gap.start)
+        cut = gap.start + quiet * POST_ROLL_S / (pre + POST_ROLL_S)
     a, b = int(gap.start / frame_s), max(int(gap.start / frame_s) + 1, int(gap.end / frame_s))
     if float(np.median(sm[a:b])) < DIGITAL_SILENCE_DB:
         return gap.start, cut
@@ -751,18 +813,23 @@ def guided_by_alignment(
         return None
 
     starts, ends, infos = [music_start], [], []
+    music_from = music_start  # where this track's music begins (guides ignore the padding)
     for k, cand in enumerate(chosen):
         prev_end, next_start = onset_cut(db, sm, frame_s, cand)
         prev_end = max(prev_end, starts[-1])
         d = durations[k]
-        expected = starts[-1] + d if d is not None else (prev_end + next_start) / 2
+        expected = music_from + d if d is not None else (prev_end + next_start) / 2
         ends.append(prev_end)
         starts.append(max(next_start, prev_end))
+        music_from = max(starts[-1], _onset(db, sm, frame_s, cand)) if cand.strong else starts[-1]
         infos.append(BoundaryInfo(
             k + 1, expected, cand.strong,
             Gap(cand.start, cand.end) if cand.strong else None, (prev_end + next_start) / 2,
         ))
     ends.append(music_end)
+    # Breathing room from the lead-in / run-out silence (never past the recording).
+    starts[0] = max(0.0, music_start - EDGE_PAD_S)
+    ends[-1] = min(len(db) * frame_s, music_end + EDGE_PAD_S)
     tracks = [Track(i, s, max(s, e)) for i, (s, e) in enumerate(zip(starts, ends), start=1)]
     known = sum(d for d in durations if d is not None)
     raw = (music_end - music_start) / known if known > 0 else 1.0

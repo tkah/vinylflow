@@ -45,6 +45,7 @@ SCENARIOS = [
 ]
 REGION_MARGIN_DB = 12.0
 RIGHT_TOLERANCE_S = 0.25
+CLIP_TOLERANCE_S = 0.05  # a track starting this far after the true onset counts as clipped
 
 
 def ncc(signal, template):
@@ -79,6 +80,9 @@ def collect_cases(records_dir, output_dir, work):
     envs = {}
     for rec in sorted(records_dir.glob("*.wav")):
         envs[rec.name] = load_envelope(ap, rec, work)
+    # Records processed and removed since still count: their cached envelopes are enough.
+    for cached in sorted(work.glob("*.npy")):
+        envs.setdefault(cached.stem + ".wav", np.load(cached))
     cases = []
     for folder in sorted(p for p in output_dir.iterdir() if p.is_dir()):
         flacs = sorted(folder.glob("*.flac"), key=position_key)
@@ -231,7 +235,10 @@ def main():
             old = f"{pct(acc['old']):6.1f}%" if acc["old"] else "   n/a "
             dist = (f"{np.median([o[0] for o in onset]):+.2f} s / {max(abs(o[0]) for o in onset):.2f} s"
                     f"   (vs export start {np.median([o[1] for o in onset]):+.2f} s)") if onset else "-"
-            print(f"{name[:16]:16} {scen[0]:36} {old} {pct(acc['new']):6.1f}%   {dist}")
+            # A track starting after the true onset loses music; "inside the gap" alone can't see that.
+            clipped = [o[0] for o in onset if o[0] > CLIP_TOLERANCE_S]
+            clip = f"   clipped {100 * len(clipped) / len(onset):4.1f}% (max {max(clipped, default=0):.2f} s)" if onset else ""
+            print(f"{name[:16]:16} {scen[0]:36} {old} {pct(acc['new']):6.1f}%   {dist}{clip}")
     for name, rec, tracks in cases:
         print(f"\n{name} <- {rec}: {len(tracks)} tracks, min corr {min(t['corr'] for t in tracks):.3f}")
 

@@ -117,9 +117,19 @@ def test_contiguous_cut_lands_pre_roll_before_the_next_onset():
     for k, span in enumerate(spans):
         assert g.tracks[k].end == g.tracks[k + 1].start
         assert g.tracks[k + 1].start == pytest.approx(span[1] - tb.PRE_ROLL_S, abs=0.2)
-    # expected = this track's own length from where it started
+    # expected = this track's own length from where its music starts (not its padded cut)
     assert g.boundaries[0].expected == pytest.approx(ms + 60.0)
-    assert g.boundaries[1].expected == pytest.approx(g.tracks[1].start + 50.0)
+    assert g.boundaries[1].expected == pytest.approx(spans[0][1] + 50.0, abs=0.2)
+
+
+def test_short_gap_is_shared_so_both_tracks_keep_some_silence():
+    db, spans, ms, me = album([60, 50], gaps=0.9)   # shorter than PRE_ROLL_S + POST_ROLL_S
+    g = place(db, (ms, me), [60.0, 50.0])
+    cut, (quiet_from, onset) = g.tracks[0].end, spans[0]
+    assert g.tracks[1].start == cut
+    assert quiet_from < cut < onset
+    share = tb.POST_ROLL_S / (tb.PRE_ROLL_S + tb.POST_ROLL_S)
+    assert cut == pytest.approx(quiet_from + (onset - quiet_from) * share, abs=0.2)
 
 
 def test_a_click_just_before_the_onset_is_not_the_onset():
@@ -158,7 +168,9 @@ def test_always_exactly_n_ordered_tracks(durations):
     db, _, ms, me = album([60, 50, 70, 40, 55, 45])
     g = place(db, (ms, me), durations)
     assert len(g.tracks) == 6 and len(g.boundaries) == 5 and g.model == "align"
-    assert g.tracks[0].start == ms and g.tracks[-1].end == me
+    # Lead-in / run-out padding: EDGE_PAD_S of silence before the first and after the last track.
+    assert g.tracks[0].start == pytest.approx(max(0.0, ms - tb.EDGE_PAD_S))
+    assert g.tracks[-1].end == pytest.approx(min(len(db) * F, me + tb.EDGE_PAD_S))
     for a, b in zip(g.tracks, g.tracks[1:]):
         assert a.start < a.end <= b.start < b.end
 
@@ -203,3 +215,64 @@ def test_guided_endpoint_falls_back_to_the_gap_model(monkeypatch, tmp_path):
     body = r.json()
     assert r.status_code == 200 and body["method"] == "durations" and body["model"] == "gap"
     assert len(body["tracks"]) == 3
+
+
+def test_a_soft_intro_merged_into_the_gap_is_not_clipped():
+    """Short quiet notes (rests < 1 s) after the silence merge into one gap candidate; the
+    song starts at the first of them, not after the merged candidate (was clipped ~3 s)."""
+    db, spans, ms, me = album([60, 50], gaps=3.0)
+    intro = spans[0][1]
+    for k in range(3):   # three 0.3 s notes at -35 dB, 0.6 s rests, then the song proper
+        a = int((intro + k * 0.9) / F)
+        db[a:a + 30] = -35.0
+        db[a + 30:a + 90] = -60.0
+    db[int((intro + 2.7) / F):int((intro + 50) / F)] = -20.0
+    g = place(db, (ms, me), [60.0, 50.0])
+    assert g.tracks[1].start == pytest.approx(intro - tb.PRE_ROLL_S, abs=0.2)
+
+
+def test_run_out_thumps_in_a_side_flip_are_not_the_next_song():
+    """Once-per-revolution thumps (0.9 s every 1.8 s) after side A's last song, then the
+    flip's near-digital silence: side B starts at its music, not at a thump."""
+    db, spans, ms, me = album([60, 60], gaps=40.0)
+    flip_start, flip_end = spans[0]
+    t = flip_start + 2.0
+    while t < flip_start + 20.0:
+        db[int(t / F):int((t + 0.9) / F)] = -48.0
+        t += 1.8
+    db[int((flip_start + 21.0) / F):int(flip_end / F)] = -85.0
+    g = place(db, (ms, me), [60.0, 60.0], side_breaks=[1])
+    assert g.tracks[1].start == pytest.approx(flip_end - tb.PRE_ROLL_S, abs=0.2)
+
+
+def _side_flip(lead_in_s, music_db=-18.0, crackle_db=-35.0, seed=3):
+    """Two 60 s sides; the flip: fade gap, arm-up silence, needle-drop thump, lead-in crackle."""
+    db, spans, ms, me = album([60, 60], gaps=40.0, seed=seed)
+    rng = np.random.default_rng(seed)
+    flip_start, flip_end = spans[0]
+    drop = flip_end - lead_in_s - 0.4
+    db[int((flip_start + 3) / F):int(drop / F)] = -80.0                       # needle lifted
+    db[int(drop / F):int((drop + 0.4) / F)] = -10.0                           # the thump
+    n = int(flip_end / F) - int((drop + 0.4) / F)
+    db[int((drop + 0.4) / F):int(flip_end / F)] = crackle_db + rng.normal(0, 1.5, n)
+    db[int(flip_end / F):int((flip_end + 60) / F)] = music_db + rng.normal(0, 2, int(60 / F))
+    return db, ms, me, drop, flip_end
+
+
+def test_side_b_starts_after_the_needle_drop_and_lead_in():
+    db, ms, me, drop, music = _side_flip(lead_in_s=6.0)
+    g = place(db, (ms, me), [60.0, 60.0], side_breaks=[1])
+    assert g.tracks[1].start == pytest.approx(music - tb.PRE_ROLL_S, abs=0.2)
+
+
+def test_a_song_starting_right_after_the_thump_keeps_its_start():
+    db, ms, me, drop, music = _side_flip(lead_in_s=0.0)
+    g = place(db, (ms, me), [60.0, 60.0], side_breaks=[1])
+    assert g.tracks[1].start == pytest.approx(drop - tb.PRE_ROLL_S, abs=0.3)
+
+
+def test_a_quiet_opening_barely_above_the_crackle_is_not_skipped():
+    """A 6 dB step could be soft music: keep the needle drop rather than risk clipping."""
+    db, ms, me, drop, music = _side_flip(lead_in_s=6.0, music_db=-29.0)
+    g = place(db, (ms, me), [60.0, 60.0], side_breaks=[1])
+    assert g.tracks[1].start < music - 3.0
