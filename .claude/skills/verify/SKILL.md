@@ -122,7 +122,14 @@ Manual steps:
    respectively (proves seek accuracy), 16-bit for a 16-bit source under `bit_depth: source`,
    title tags + ReplayGain track/album tags (no picture — the seeded release has no cover).
 
-## Drive the UI (only if a browser can reach a server; not possible with `--network none`)
+## Drive the UI in a real browser
+
+`tests/e2e/browser/` runs headless Firefox (WebDriver BiDi, no npm deps) against the real backend
+in a `--network none` container, bridged by `proxy.mjs` over `docker exec`; Discogs faked, throwaway
+Firefox profile. See its README. Use it for anything visual or WaveSurfer/Alpine-specific (the Node
+frontend tests fake both); screenshots are full-page PNGs.
+
+## Drive the UI (other browser tooling, if available)
 
 - `$B goto http://localhost:8000`, `$B upload 'input[type="file"]' <wav>`
 - Discogs search runs automatically on file select (needs a stubbed `search_basic`); picking a
