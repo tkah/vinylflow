@@ -33,7 +33,7 @@ Turn your vinyl recordings into perfectly tagged, organized digital files in min
   at once, so one wrong or missing length doesn't throw off the other splits. Gaps are found after
   smoothing out clicks and surface noise, and a long pause while you flip the record is recognised
   as the side change. Each cut lands just before the next song starts, so fade-outs stay whole.
-  Partial tracklists work too; you can also borrow lengths from another pressing, and split a suite or symphony (a Discogs index track) into its parts.
+  Partial tracklists work too; you can also borrow lengths from another pressing, split a suite or symphony (a Discogs index track) into its parts, and add a track the pressing is missing or fix a wrong title right in the track table.
 - **One track table and one player:** mapping, lengths and differences in one place; dashed guides on
   the waveform show where Discogs expects each break; Play/Pause, cut-point auditions, a detailed
   waveform that plays the original WAV for precise editing, and manual edits protected with Snap to

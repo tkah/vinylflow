@@ -31,6 +31,9 @@ const PREVIEW_AUDIO_NOTICE = "Playing the preview \u2014 this browser can't play
 const WORKSPACE_ADDITIONS = { searchResults: [], onlyWithLengths: false, detailsSettled: false, currentZoom: 50 };
 // Wheel/pinch zoom speed: zoom factor = exp(-deltaY * rate); one 100 px wheel notch ≈ x1.35
 const WHEEL_ZOOM_RATE = 0.003;
+// Custom tracks (must match CustomTrack in backend/api.py): new positions are A1/B12; titles <= 200 chars.
+const CUSTOM_POSITION_RE = /^[A-Z]+\d+$/;
+const CUSTOM_TITLE_MAX = 200;
 const REGION_EDGE_HIT_PX = 6;
 const REGION_SHARED_EDGE_PX = 1;
 const WORKSPACE_FIELDS = [
@@ -196,6 +199,7 @@ function vinylApp() {
         selectedRelease: null,
         trackMappingReversed: false,
         customMapping: [],
+        trackForm: null,          // Inline custom-track / rename form under a row: {fileId, idx, mode: 'add'|'edit', position, title, error}
         expectedBoundaries: [],   // Seconds where Discogs lengths put each break (ghost markers)
         boundariesEdited: false,  // True once the user hand-edits boundaries (until detection replaces them)
         editBanner: false,        // Show "You've adjusted boundaries by hand" choice
@@ -826,7 +830,8 @@ function vinylApp() {
                     duration: track.end - track.start, declick: track.declick || undefined })),
                 output_format: state.outputFormat, rumble_filter: state.rumbleFilter, declick: state.declick,
                 hum_filter: state.humFilter, hum_freq: state.humFreq, hiss_reduction: state.hissReduction,
-                album_gain: state.albumGain, replaygain: state.replaygain !== false, bit_depth: state.bitDepth
+                album_gain: state.albumGain, replaygain: state.replaygain !== false, bit_depth: state.bitDepth,
+                custom_tracks: this.customTracksPayload(state.selectedRelease)
             };
         },
 
@@ -1676,6 +1681,7 @@ function vinylApp() {
             this.searchResults = [];
             this.detailsSettled = false;
             this.selectedRelease = null;
+            this.trackForm = null;
             this.resetDonors();
             this.selectedSides = [];
             this.suggestedSides = [];
@@ -3069,6 +3075,7 @@ function vinylApp() {
         changeRelease() {
             if (this.currentLocked) return;
             this.selectedRelease = null;
+            this.trackForm = null;
             this.resetDonors();
             this.selectedSides = [];
             this.trackMappingReversed = false;
@@ -3118,6 +3125,247 @@ function vinylApp() {
             this.customMapping = mapping;
             this.trackMappingReversed = false;
             this.refreshRegionLabels();
+        },
+
+        /* ---- Custom tracks and renames ----
+         * The user's own tracks and renamed titles live in selectedRelease.tracks (flagged `custom` /
+         * `renamed`), so they persist with the workspace and ride along in the export request.
+         * Every edit swaps in a modified deep copy: the release object may be shared with another
+         * recording's workspace. Cuts and detection are never touched. */
+
+        /** Sort key of a vinyl position: [side, number, sub-track]; mirrors position_sort_key in metadata_handler.py. */
+        positionKey(position) {
+            const m = /^([A-Z]+)(\d+)(?:[.\-](\d+))?/.exec(String(position || ''));
+            return m ? [m[1], Number(m[2]), Number(m[3] || 0)] : [String(position || ''), 0, 0];
+        },
+
+        comparePositionKeys(a, b) {
+            return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : (a[1] - b[1]) || (a[2] - b[2]);
+        },
+
+        /** Every position the release uses, index-track parts included. */
+        releasePositions(release = this.selectedRelease) {
+            const used = new Set();
+            for (const t of release?.tracks || []) {
+                used.add(t.position);
+                for (const part of t.parts || []) used.add(part.position);
+            }
+            return used;
+        },
+
+        /** Next free position on the side of the row above (else this row's own track): B5 after B4. */
+        suggestCustomPosition(idx) {
+            const anchor = this.mappedTrack(idx - 1) || this.mappedTrack(idx) || this.selectedRelease?.tracks?.[0];
+            const m = /^([A-Z]+)(\d+)/.exec(anchor?.position || '');
+            const side = m ? m[1] : 'A';
+            const used = this.releasePositions();
+            let next = (m ? Number(m[2]) : 0) + 1;
+            while (used.has(`${side}${next}`)) next++;
+            return `${side}${next}`;
+        },
+
+        /** Mapping dropdown handler: "Custom track..." opens the form, anything else maps the row. */
+        onMappingSelect(idx, select) {
+            if (select.value !== 'custom') return this.setMapping(idx, select.value);
+            select.value = String(this.customMapping[idx]);
+            this.openTrackForm(idx, 'add');
+        },
+
+        /** Open the inline form for row idx: 'add' a custom track, or 'edit' (rename / remove) the mapped one. */
+        openTrackForm(idx, mode) {
+            if (!this.selectedRelease || this.currentLocked) return;
+            if (this.trackForm && this.trackForm.idx === idx && this.trackForm.mode === mode &&
+                this.trackForm.fileId === this.currentFileId) { this.trackForm = null; return; }
+            const mapped = this.mappedTrack(idx);
+            if (mode === 'edit' && !mapped) return;
+            this.trackForm = {
+                fileId: this.currentFileId, idx, mode, error: '',
+                position: mode === 'add' ? this.suggestCustomPosition(idx) : mapped.position,
+                title: mode === 'add' ? '' : mapped.title
+            };
+        },
+
+        closeTrackForm() { this.trackForm = null; },
+
+        /** True when the form belongs to row idx of the file in the editor. */
+        trackFormShown(idx) {
+            return !!this.trackForm && this.trackForm.idx === idx && this.trackForm.fileId === this.currentFileId;
+        },
+
+        /** Form Add / Save button. */
+        submitTrackForm() {
+            const form = this.trackForm;
+            if (!form) return;
+            const error = form.mode === 'add'
+                ? this.addCustomTrack(form.idx, form.position, form.title)
+                : this.renameTrack(Number(this.customMapping[form.idx]), form.title);
+            form.error = error;
+            if (!error) this.trackForm = null;
+        },
+
+        /** Reset the mapped track's title to the Discogs one (edit form). */
+        resetTrackTitle() {
+            const form = this.trackForm;
+            if (!form) return;
+            const error = this.resetRenamedTrack(Number(this.customMapping[form.idx]));
+            form.error = error;
+            if (!error) this.trackForm = null;
+        },
+
+        /** Remove the custom track mapped to the form's row (edit form). */
+        removeFormTrack() {
+            const form = this.trackForm;
+            if (!form) return;
+            const error = this.removeCustomTrack(Number(this.customMapping[form.idx]), form.idx);
+            form.error = error;
+            if (!error) this.trackForm = null;
+        },
+
+        /** Swap in a modified deep copy of the release (never mutate the possibly shared object). */
+        editReleaseCopy(change) {
+            const edited = JSON.parse(JSON.stringify(this.selectedRelease));
+            change(edited);
+            this.selectedRelease = edited;
+            this.resetDonors();   // borrowed-length donors are keyed by track index
+            this.saveWorkspace();
+        },
+
+        /** Undo toast for a release edit: puts back the previous release and mapping if nothing replaced the edit since. */
+        offerTrackUndo(message, before, after) {
+            this.notify(message, {
+                type: 'success', timeout: 8000,
+                action: {
+                    label: 'Undo',
+                    fn: () => {
+                        if (this.currentFileId !== before.fileId || this.selectedRelease !== after) {
+                            this.notify('Switch back to that recording to undo.', { type: 'warning', timeout: 6000 });
+                            return;
+                        }
+                        this.selectedRelease = before.release;
+                        this.customMapping = before.mapping;
+                        this.selectedSides = before.sides;
+                        this.trackForm = null;
+                        this.resetDonors();
+                        this.afterReleaseEdit();
+                    }
+                }
+            });
+        },
+
+        /** Targets changed shape without re-detecting: refresh the count flag and labels. */
+        afterReleaseEdit() {
+            this.trackCountMismatch = !!this.selectedRelease && this.activeTrackCount !== this.targetTracks.length;
+            this.refreshRegionLabels();
+            this.saveWorkspace();
+        },
+
+        /** Returns an error message, or '' when row idx now maps to the new custom track. */
+        addCustomTrack(idx, positionText, titleText) {
+            if (!this.selectedRelease || this.currentLocked) return 'Not available right now.';
+            const position = String(positionText || '').trim().toUpperCase();
+            const title = String(titleText || '').trim();
+            if (!CUSTOM_POSITION_RE.test(position)) return 'Position needs a side letter and a number, like B5.';
+            if (this.releasePositions().has(position)) return `${position} is already on this release.`;
+            if (!title) return 'Enter a title.';
+            if (title.length > CUSTOM_TITLE_MAX) return `Keep the title under ${CUSTOM_TITLE_MAX} characters.`;
+
+            const before = { fileId: this.currentFileId, release: this.selectedRelease,
+                mapping: [...this.customMapping], sides: [...this.selectedSides] };
+            const key = this.positionKey(position);
+            let at = 0;
+            this.selectedRelease.tracks.forEach((t, i) => {
+                if (this.comparePositionKeys(this.positionKey(t.position), key) <= 0) at = i + 1;
+            });
+            this.editReleaseCopy(release => release.tracks.splice(at, 0, { position, title, duration: '', custom: true }));
+            const mapping = this.customMapping.map(m => (Number(m) >= at ? Number(m) + 1 : Number(m)));
+            mapping[idx] = at;
+            this.customMapping = mapping;
+            this.trackMappingReversed = false;
+            if (!this.selectedSides.includes(key[0]) && this.sideChips.some(g => g.side === key[0])) {
+                this.selectedSides = [...this.selectedSides, key[0]];
+            }
+            this.afterReleaseEdit();
+            this.offerTrackUndo(`Added ${position} \u00b7 ${title}.`, before, this.selectedRelease);
+            return '';
+        },
+
+        /** Give release track releaseIdx a new title (or reset it when it equals the Discogs one). */
+        renameTrack(releaseIdx, titleText) {
+            const track = this.selectedRelease?.tracks?.[releaseIdx];
+            if (!track || this.currentLocked) return 'Not available right now.';
+            const title = String(titleText || '').trim();
+            if (!title) return 'Enter a title.';
+            if (title.length > CUSTOM_TITLE_MAX) return `Keep the title under ${CUSTOM_TITLE_MAX} characters.`;
+            if (title === track.title) return '';
+            const before = { fileId: this.currentFileId, release: this.selectedRelease,
+                mapping: [...this.customMapping], sides: [...this.selectedSides] };
+            this.editReleaseCopy(release => {
+                const entry = release.tracks[releaseIdx];
+                if (!entry.custom) {
+                    entry.originalTitle = entry.originalTitle ?? entry.title;
+                    if (title !== entry.originalTitle) entry.renamed = true;
+                    else { delete entry.renamed; delete entry.originalTitle; }
+                }
+                entry.title = title;
+            });
+            this.refreshRegionLabels();
+            this.offerTrackUndo(`Renamed ${track.position} to \u201c${title}\u201d.`, before, this.selectedRelease);
+            return '';
+        },
+
+        /** Put a renamed Discogs track's title back. */
+        resetRenamedTrack(releaseIdx) {
+            const track = this.selectedRelease?.tracks?.[releaseIdx];
+            if (!track?.renamed || this.currentLocked) return 'Not available right now.';
+            const before = { fileId: this.currentFileId, release: this.selectedRelease,
+                mapping: [...this.customMapping], sides: [...this.selectedSides] };
+            this.editReleaseCopy(release => {
+                const entry = release.tracks[releaseIdx];
+                entry.title = entry.originalTitle;
+                delete entry.originalTitle;
+                delete entry.renamed;
+            });
+            this.refreshRegionLabels();
+            this.offerTrackUndo(`${track.position} is back to \u201c${track.originalTitle}\u201d.`, before, this.selectedRelease);
+            return '';
+        },
+
+        /** Remove a custom track no other row maps to; row idx falls back to the track before it. */
+        removeCustomTrack(releaseIdx, idx) {
+            const track = this.selectedRelease?.tracks?.[releaseIdx];
+            if (!track?.custom || this.currentLocked) return 'Not available right now.';
+            const others = this.customMapping.some((m, i) => i !== idx && Number(m) === releaseIdx &&
+                !this.detectedTracks[i]?.ignored);
+            if (others) return `Another track is mapped to ${track.position}. Map it elsewhere first.`;
+            const before = { fileId: this.currentFileId, release: this.selectedRelease,
+                mapping: [...this.customMapping], sides: [...this.selectedSides] };
+            this.editReleaseCopy(release => release.tracks.splice(releaseIdx, 1));
+            this.customMapping = this.customMapping.map(m =>
+                Number(m) === releaseIdx ? Math.max(releaseIdx - 1, 0) : Number(m) > releaseIdx ? Number(m) - 1 : Number(m));
+            const sides = this.sideChips.map(g => g.side);
+            const kept = this.selectedSides.filter(side => sides.includes(side));
+            this.selectedSides = kept.length ? kept : sides;
+            this.afterReleaseEdit();
+            this.offerTrackUndo(`Removed ${track.position} \u00b7 ${track.title}.`, before, this.selectedRelease);
+            return '';
+        },
+
+        /** What the export needs to rebuild the custom and renamed entries: [{position, title}], one per position. */
+        customTracksPayload(release) {
+            const seen = new Set();
+            const out = [];
+            for (const t of release?.tracks || []) {
+                if ((t.custom || t.renamed) && !seen.has(t.position)) {
+                    seen.add(t.position);
+                    out.push({ position: t.position, title: t.title });
+                }
+            }
+            return out;
+        },
+
+        /** Label for the mapping dropdown: "B5 · Title", marked when custom or renamed. */
+        trackOptionLabel(dt) {
+            return `${dt.position} \u00b7 ${dt.title}${dt.custom ? ' \u00b7 custom' : dt.renamed ? ' \u00b7 renamed' : ''}`;
         },
 
         /**

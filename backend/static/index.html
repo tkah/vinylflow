@@ -411,7 +411,8 @@
 
         <!-- Settings Modal -->
         <div x-show="showSettings" x-cloak @keydown.escape.window="showSettings = false" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-            <div @click.away="showSettings = false" class="bg-card rounded-lg p-6 max-w-md w-full mx-4">
+            <!-- Taller than a laptop window: scroll inside, Save/Cancel pinned to the bottom -->
+            <div @click.away="showSettings = false" class="bg-card rounded-lg p-6 pb-0 max-w-md w-full mx-4 overflow-y-auto" style="max-height: 90vh;">
                 <h2 class="text-2xl font-bold text-primary mb-4">Settings</h2>
                 <div class="space-y-4">
                     <div>
@@ -425,7 +426,7 @@
                     <div>
                         <label class="block text-sm font-medium text-secondary mb-1">Output Folder</label>
                         <div class="flex gap-2">
-                            <input type="text" x-model="config.output_dir" class="flex-1 px-3 py-2 border focus-primary rounded-md" style="border-color: #8A8A86;" placeholder="/Users/you/Music/VinylFlow">
+                            <input type="text" x-model="config.output_dir" class="flex-1 min-w-0 px-3 py-2 border focus-primary rounded-md" style="border-color: #8A8A86;" placeholder="/Users/you/Music/VinylFlow">
                             <button @click="chooseOutputFolder()" type="button" class="px-3 py-2 rounded-md text-primary hover:bg-page" style="background-color: #F0EFEB;">Browse</button>
                         </div>
                     </div>
@@ -521,7 +522,7 @@
                                         type="password"
                                         x-model="setupToken"
                                         :placeholder="discogsConfigured ? '••••••••••••••••' : 'Paste token'"
-                                        class="flex-1 px-3 py-2 border focus-primary rounded-md text-sm"
+                                        class="flex-1 min-w-0 px-3 py-2 border focus-primary rounded-md text-sm"
                                         style="border-color: #8A8A86;"
                                     >
                                     <button
@@ -539,7 +540,7 @@
                         </div>
                     </div>
 
-                    <div class="flex gap-2">
+                    <div class="flex gap-2 sticky bottom-0 bg-card py-4 border-t" style="border-color: #F0EFEB;">
                         <button @click="saveConfig()" class="flex-1 px-4 py-2 btn-primary rounded-lg">Save</button>
                         <button @click="showSettings = false" class="flex-1 px-4 py-2 text-primary rounded-lg hover:bg-page" style="background-color: #F0EFEB;">Cancel</button>
                     </div>
@@ -1164,11 +1165,19 @@
                                         <div class="font-medium text-primary" :class="{ 'line-through text-muted': track.ignored }" x-text="track.number"></div>
                                         <div>
                                             <template x-if="selectedRelease">
-                                                <select @change="setMapping(idx, $event.target.value)" class="w-full px-2 py-1.5 border focus-primary rounded-md text-sm" style="border-color: #8A8A86;">
-                                                    <template x-for="(dt, dtIdx) in (selectedRelease?.tracks || [])" :key="dtIdx">
-                                                        <option :value="dtIdx" :selected="dtIdx === Number(customMapping[idx])" x-text="`${dt.position} · ${dt.title}`"></option>
-                                                    </template>
-                                                </select>
+                                                <div class="flex items-center gap-1">
+                                                    <select @change="onMappingSelect(idx, $event.target)" :title="mappedTrack(idx) ? trackOptionLabel(mappedTrack(idx)) : ''" class="w-full min-w-0 px-2 py-1.5 border focus-primary rounded-md text-sm" style="border-color: #8A8A86;">
+                                                        <template x-for="(dt, dtIdx) in (selectedRelease?.tracks || [])" :key="dtIdx">
+                                                            <option :value="dtIdx" :selected="dtIdx === Number(customMapping[idx])" x-text="trackOptionLabel(dt)"></option>
+                                                        </template>
+                                                        <option value="custom" :disabled="currentLocked">➕ Custom track…</option>
+                                                    </select>
+                                                    <button type="button" @click="openTrackForm(idx, 'edit')" :disabled="currentLocked || !mappedTrack(idx)"
+                                                            class="px-2 py-1 rounded text-xs text-primary shrink-0" style="background-color: #F0EFEB;"
+                                                            :class="{'opacity-50 cursor-not-allowed': currentLocked}"
+                                                            :aria-expanded="trackFormShown(idx) && trackForm.mode === 'edit'"
+                                                            data-testid="rename-track" title="Rename this track (or remove a custom one)" aria-label="Rename this track">✏️</button>
+                                                </div>
                                             </template>
                                             <span x-show="!selectedRelease" class="text-muted">—</span>
                                         </div>
@@ -1203,6 +1212,38 @@
                                             <button @click="deleteTrack(track.number)" class="px-2 py-1 btn-danger rounded text-xs" title="Delete this track">🗑️</button>
                                         </div>
                                     </div>
+                                    <form x-show="trackFormShown(idx)" x-cloak @submit.prevent="submitTrackForm()" @keydown.escape="closeTrackForm()"
+                                          class="mt-2 p-3 bg-page rounded-lg" style="max-width: 640px;" data-testid="track-form">
+                                        <template x-if="trackFormShown(idx)">
+                                            <div>
+                                                <p class="text-xs text-secondary mb-2" x-text="trackForm.mode === 'add'
+                                                    ? 'Add a track that is not on this Discogs release. It is tagged and numbered with the others; no cut moves.'
+                                                    : 'Change the title this track is tagged and named with. Cuts do not move.'"></p>
+                                                <div class="grid gap-3" style="grid-template-columns: 7rem 1fr;">
+                                                    <div>
+                                                        <label class="block text-xs font-medium text-secondary mb-1" :for="`tf-pos-${idx}`">Position</label>
+                                                        <input :id="`tf-pos-${idx}`" type="text" x-model="trackForm.position" :disabled="trackForm.mode === 'edit'" maxlength="8" autocomplete="off"
+                                                               class="w-full px-3 py-2 border focus-primary rounded-md text-sm" style="border-color: #8A8A86;" data-testid="track-form-position">
+                                                    </div>
+                                                    <div>
+                                                        <label class="block text-xs font-medium text-secondary mb-1" :for="`tf-title-${idx}`">Title</label>
+                                                        <input :id="`tf-title-${idx}`" type="text" x-model="trackForm.title" maxlength="200" autocomplete="off"
+                                                               class="w-full px-3 py-2 border focus-primary rounded-md text-sm" style="border-color: #8A8A86;" data-testid="track-form-title">
+                                                    </div>
+                                                </div>
+                                                <p x-show="trackForm.error" x-cloak role="alert" class="mt-2 text-sm" style="color: #B3261E;" x-text="trackForm.error" data-testid="track-form-error"></p>
+                                                <div class="mt-3 flex flex-wrap gap-2">
+                                                    <button type="submit" class="px-3 py-1.5 btn-primary rounded-lg text-sm font-semibold" x-text="trackForm.mode === 'add' ? 'Add' : 'Save'"></button>
+                                                    <button type="button" @click="closeTrackForm()" class="px-3 py-1.5 rounded-lg text-sm text-primary" style="background-color: #F0EFEB;">Cancel</button>
+                                                    <button type="button" x-show="trackForm.mode === 'edit' && mappedTrack(idx)?.renamed" @click="resetTrackTitle()"
+                                                            class="px-3 py-1.5 rounded-lg text-sm text-primary" style="background-color: #F0EFEB;"
+                                                            x-text="`Reset to “${mappedTrack(idx)?.originalTitle}”`"></button>
+                                                    <button type="button" x-show="trackForm.mode === 'edit' && mappedTrack(idx)?.custom" @click="removeFormTrack()"
+                                                            class="px-3 py-1.5 btn-danger rounded-lg text-sm">Remove custom track</button>
+                                                </div>
+                                            </div>
+                                        </template>
+                                    </form>
                                     <div x-show="track.editing" x-cloak class="grid grid-cols-2 gap-4 mt-2" style="max-width: 520px;">
                                         <div>
                                             <label class="block text-xs font-medium text-secondary mb-1">Start Time (seconds)</label>

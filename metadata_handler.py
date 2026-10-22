@@ -5,6 +5,7 @@ Handles Discogs API integration, metadata tagging, and cover art embedding.
 Manages release searches, track mapping, and file tagging for FLAC, MP3, and AIFF.
 """
 
+import copy
 import itertools
 import re
 import threading
@@ -298,6 +299,50 @@ class DiscogsRelease:
 
     def __repr__(self):
         return f"DiscogsRelease({self.artist} - {self.title}, {len(self.tracks)} tracks)"
+
+
+def position_sort_key(position: str):
+    """Sort key for vinyl positions: side, track number, sub-track (B6.1 after B5, before B6.2)."""
+    m = re.match(r'^([A-Z]+)(\d+)(?:[.\-](\d+))?', position or "")
+    if not m:
+        return (position or "", 0, 0)
+    return (m.group(1), int(m.group(2)), int(m.group(3) or 0))
+
+
+def with_custom_tracks(release: DiscogsRelease, custom_tracks) -> DiscogsRelease:
+    """A per-job copy of ``release`` with the user's own tracks and renames applied.
+
+    ``custom_tracks`` is ``[(position, title), ...]``.  A position the release already has
+    gets the new title (duration, credits, artist and parts are kept; a part of an index
+    track is renamed inside a copy of its umbrella); any other position becomes a new
+    ``DiscogsTrack`` inserted in side/number order, credited to the release artist.
+    The release is cached and shared between jobs, so it is never mutated.
+    """
+    result = copy.copy(release)
+    tracks = list(release.tracks)
+    for position, title in custom_tracks:
+        top = next((i for i, t in enumerate(tracks) if t.position == position), None)
+        part_owner = None
+        if top is None:
+            part_owner = next((i for i, t in enumerate(tracks)
+                               if any(p.get("position") == position for p in t.parts)), None)
+        if top is not None:
+            tracks[top] = copy.copy(tracks[top])
+            tracks[top].title = title
+        elif part_owner is not None:
+            renamed = copy.copy(tracks[part_owner])
+            renamed.parts = [{**p, "title": title} if p.get("position") == position else p
+                             for p in renamed.parts]
+            tracks[part_owner] = renamed
+        else:
+            key = position_sort_key(position)
+            at = 0
+            for i, t in enumerate(tracks):
+                if position_sort_key(t.position) <= key:
+                    at = i + 1
+            tracks.insert(at, DiscogsTrack(position, title, artist=release.artist))
+    result.tracks = tracks
+    return result
 
 
 class MetadataHandler:
@@ -783,12 +828,7 @@ class MetadataHandler:
     @staticmethod
     def _sort_positions(positions) -> List[str]:
         """Unique vinyl positions in side/track order (B6.1 after B5, before B6.2)."""
-        def key(position):
-            m = re.match(r'^([A-Z]+)(\d+)(?:[.\-](\d+))?', position or "")
-            if not m:
-                return (position or "", 0, 0)
-            return (m.group(1), int(m.group(2)), int(m.group(3) or 0))
-        return sorted(set(positions), key=key)
+        return sorted(set(positions), key=position_sort_key)
 
     def _classical_tags(self, discogs_track, release, various: bool) -> dict:
         """Composer / conductor / ensemble / performers for one track of a

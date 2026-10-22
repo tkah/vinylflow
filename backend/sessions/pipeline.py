@@ -40,7 +40,7 @@ from audio_processor import (
     format_replaygain_peak,
     replaygain_gain_db,
 )
-from metadata_handler import MetadataHandler
+from metadata_handler import MetadataHandler, with_custom_tracks
 
 from .events import OutputSpec, ProcessingRun, ProgressEvent
 from .session import Session, SessionState
@@ -73,6 +73,8 @@ def run(
         release = metadata_handler.get_release_by_id(release_id)
         if not release:
             raise RuntimeError("Failed to fetch Discogs release")
+        if spec.custom_tracks:
+            release = with_custom_tracks(release, spec.custom_tracks)
 
         session.link_release(release)
         session.mark_processing(run_record)

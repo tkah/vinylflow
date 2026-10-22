@@ -26,7 +26,8 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, WebSocket, WebSock
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
 from backend.security import SameOriginMiddleware
-from pydantic import BaseModel
+from dataclasses import replace
+from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -317,6 +318,25 @@ class TrackBoundary(BaseModel):
     declick: Optional[str] = None  # per-track override; None = the panel setting
 
 
+CUSTOM_TRACK_POSITION = r"^[A-Z]+\d+(?:[.\-]\d+)?$"  # A1, B12, or a Discogs sub-track like B6.1
+MAX_CUSTOM_TRACKS = 99
+MAX_CUSTOM_TITLE = 200
+
+
+class CustomTrack(BaseModel):
+    """A track the user added to the release, or a renamed Discogs track (same position)."""
+    position: str = Field(pattern=CUSTOM_TRACK_POSITION)
+    title: str = Field(max_length=MAX_CUSTOM_TITLE)
+
+    @field_validator("title")
+    @classmethod
+    def _title_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("title must not be blank")
+        return value
+
+
 def _legacy_restore(level: Optional[int]) -> tuple:
     """Map the legacy ``restoration_level`` (0/1) to (rumble, declick)."""
     if level not in (0, 1):
@@ -362,6 +382,7 @@ class ProcessRequest(BaseModel):
     album_gain: bool = False     # one gain for the whole album to -14 LUFS
     replaygain: bool = True      # write ReplayGain 2.0 track + album tags
     bit_depth: Optional[str] = None  # per-workspace depth; omitted uses the server default
+    custom_tracks: Optional[List[CustomTrack]] = Field(default=None, max_length=MAX_CUSTOM_TRACKS)  # user-added tracks / renamed Discogs titles
 
 
 class ConfigUpdate(BaseModel):
@@ -1843,6 +1864,10 @@ def _validate_process_options(request: ProcessRequest) -> None:
         if boundary.declick is not None:
             _check_declick(boundary.declick)
 
+    custom = request.custom_tracks or []
+    if len({entry.position for entry in custom}) != len(custom):
+        raise HTTPException(status_code=400, detail="Custom track positions must be unique.")
+
 
 def _output_spec(request: ProcessRequest, noise_profile=None) -> OutputSpec:
     """Capture server defaults and request overrides into an immutable export specification."""
@@ -1860,6 +1885,7 @@ def _output_spec(request: ProcessRequest, noise_profile=None) -> OutputSpec:
         replaygain=request.replaygain,
         track_numbering=config.track_numbering,
         bit_depth=request.bit_depth or config.bit_depth,
+        custom_tracks=tuple((entry.position, entry.title) for entry in request.custom_tracks or []),
     )
 
 
@@ -1883,6 +1909,13 @@ async def process_album(request: AlbumProcessRequest):
             raise HTTPException(status_code=409, detail="This album job id belongs to different export inputs.")
         return existing.view()
     reference = request.files[0]
+    # One release, one set of custom tracks: numbering and totals must agree across recordings.
+    merged_custom: dict = {}
+    for item in request.files:
+        for entry in item.custom_tracks or []:
+            if merged_custom.setdefault(entry.position, entry.title) != entry.title:
+                raise HTTPException(status_code=400, detail=f"Recordings disagree on the title of {entry.position}.")
+    shared_custom = tuple(merged_custom.items())
     members = []
     positions = set()
     file_ids = set()
@@ -1914,7 +1947,7 @@ async def process_album(request: AlbumProcessRequest):
             if not position or position in positions:
                 raise HTTPException(status_code=400, detail="Album positions must be nonempty and unique across recordings.")
             positions.add(position)
-        members.append(AlbumMember(session, _output_spec(item), item.release_id))
+        members.append(AlbumMember(session, replace(_output_spec(item), custom_tracks=shared_custom), item.release_id))
     # No await before all validations/reservations: competing requests cannot split the group.
     for member, item in zip(members, request.files):
         member.session.set_boundaries(list(item.track_boundaries))

@@ -31,6 +31,9 @@ class OutputSpec:
     # sequential numbering and totals span them; () = just this file's tracks.
     job_positions: tuple[str, ...] = ()
     bit_depth: str = "source"  # "source" | "24"
+    # The user's own tracks and renames as (position, title): applied to a per-job copy of
+    # the Discogs release (metadata_handler.with_custom_tracks).
+    custom_tracks: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
