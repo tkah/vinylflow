@@ -32,12 +32,22 @@ Turn your vinyl recordings into perfectly tagged, organized digital files in min
 - **Best-match splits:** the Discogs track lengths are matched against all the pauses in the recording
   at once, so one wrong or missing length doesn't throw off the other splits. Gaps are found after
   smoothing out clicks and surface noise, and a long pause while you flip the record is recognised
-  as the side change. Each cut lands just before the next song starts, so fade-outs stay whole.
-  Partial tracklists work too; you can also borrow lengths from another pressing, split a suite or symphony (a Discogs index track) into its parts, and add a track the pressing is missing or fix a wrong title right in the track table.
-- **One track table and one player:** mapping, lengths and differences in one place; dashed guides on
-  the waveform show where Discogs expects each break; Play/Pause, cut-point auditions, a detailed
-  waveform that plays the original WAV for precise editing, and manual edits protected with Snap to
-  Discogs + Undo.
+  as the side change. Partial tracklists work too, and you can borrow lengths from another pressing.
+- **Releases without lengths:** many Discogs entries (box sets especially) list no track lengths. The
+  sides are found first, from the long silences between them, so minutes of run-out groove noise
+  never become a track; the pauses within each side then place the cuts.
+- **Clean cuts:** each track starts just under a second before its first note and keeps its whole
+  fade-out; a long flip or run-out isn't glued onto the last song of a side. Soft intros aren't
+  clipped, and the needle drop and lead-in crackle at the start of side B are skipped.
+- **Fix the tracklist in place:** split a suite or symphony (a Discogs index track) into its
+  movements, add a track your pressing has but Discogs doesn't list, or correct a title, without
+  moving any cuts. Release info, the side picker and Change release sit above the waveform.
+- **One track table and one player:** mapping, lengths and differences in one place; type a length
+  (from a streaming service, say) to set where a track ends; dashed guides on the waveform show where
+  Discogs expects each break; Play/Pause, cut-point auditions and a detailed waveform that plays the
+  original WAV for precise editing. Zoom with ⌘ + scroll or a trackpad pinch, scroll with an
+  always-visible scrollbar, and drag a track while the view follows its leading edge. Manual edits
+  are protected with Snap to Discogs + Undo.
 
 **Sound**
 
@@ -45,6 +55,17 @@ Turn your vinyl recordings into perfectly tagged, organized digital files in min
   strength), hum removal, hiss reduction, optional album gain, ReplayGain tags, and a one-track A/B
   test including "hear what was removed".
 - **Bit depth:** exports match the source (24-bit stays 24-bit, including AIFF) or 24-bit on request.
+
+**Tags**
+
+- **Numbering players understand:** tracks are numbered 1, 2, 3… per LP with track and disc totals
+  (the vinyl position, e.g. B2, is kept in its own tag); a side exported on its own still continues
+  after side A. The old A1/B1 style is one setting away.
+- **Album artist** on every file; several artists joined the way Discogs prints them, and Discogs'
+  "(2)"-style name suffixes dropped (also in folder names).
+- **Compilations:** each track gets its own artist, with "Various Artists" as album artist.
+- **Classical:** composer, conductor, ensemble and soloists (with instrument) in their own tags;
+  movements of a split work are titled "Work: Movement".
 
 **Working through a stack of records**
 
@@ -421,7 +442,7 @@ Make sure the `output/` directory exists and has write permissions: `chmod -R 75
 Your API token might be invalid or revoked. Click the Settings (⚙️) button and update your token, or generate a new one at [discogs.com/settings/developers](https://www.discogs.com/settings/developers)
 
 **Tracks not splitting correctly?**
-Pick the Discogs release first: its track lengths place the splits, and **Snap to Discogs** re-places them after hand edits. Songs that run straight into each other (common on classical records) have no pause to find, so those breaks land only near the right spot. Drag them into place and audition the cut. Without a release, adjust silence detection in Settings (⚙️) or use Smart Rescan with the number of songs.
+Pick the Discogs release first: its track lengths place the splits (a release with no lengths still works: its sides are found first and the pauses within them place the cuts), and **Snap to Discogs** re-places them after hand edits. If the pressing is missing a track, use **Custom track…** in that track's Discogs dropdown. Songs that run straight into each other (common on classical records) have no pause to find, so those breaks land only near the right spot. Drag them into place and audition the cut. Without a release, adjust silence detection in Settings (⚙️) or use Smart Rescan with the number of songs.
 
 ---
 
@@ -462,6 +483,9 @@ Pick the Discogs release first: its track lengths place the splits, and **Snap t
 - Per-recording workspaces, Process all ready, and queued exports
 - Source bit depth kept on export (24-bit stays 24-bit)
 - Richer tags: album artist, track/disc totals, compilation flag and per-track artists, classical composer/conductor/ensemble/performers
+- Guided splits for releases without track lengths (box sets), needle-drop and soft-intro handling
+- Tracklist fixes in the app: split index tracks into parts, custom tracks, renamed titles, typed lengths
+- Waveform editing: always-visible scrollbar, ⌘/pinch zoom, drag that follows the leading edge
 - Fully offline interface, localhost-only by default
 
 ### Planned
