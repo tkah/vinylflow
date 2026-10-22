@@ -204,7 +204,9 @@
         .track-table-scroll { overflow-x: auto; }
         .track-grid {
             display: grid;
-            grid-template-columns: 22px 28px minmax(200px, 2fr) 120px 64px 64px 64px 56px 128px minmax(210px, auto);
+            /* Fixed last column: each row is its own grid, so an auto-sized one (the buttons) gave the
+               header different fr widths and shifted every header after "Start – End" by a column. */
+            grid-template-columns: 22px 28px minmax(200px, 2fr) 120px 64px 64px 64px 56px 128px 300px;
             gap: 8px;
             align-items: center;
             min-width: 1050px;
@@ -1148,7 +1150,7 @@
                                 <div>#</div>
                                 <div>Discogs track</div>
                                 <div>Start – End</div>
-                                <div class="text-right">Detected</div>
+                                <div class="text-right" title="Track length. Type a length (m:ss) to set the end from the start">Length</div>
                                 <div class="text-right">Discogs</div>
                                 <div class="text-right">Δ</div>
                                 <div class="text-right" title="Detected clicks per track (use Scan for clicks)">Clicks</div>
@@ -1171,7 +1173,12 @@
                                             <span x-show="!selectedRelease" class="text-muted">—</span>
                                         </div>
                                         <div class="text-secondary"><span x-text="formatTime(track.start)"></span> – <span x-text="formatTime(track.end)"></span></div>
-                                        <div class="text-right text-secondary" x-text="formatDuration(track.duration)"></div>
+                                        <div class="text-right">
+                                            <input type="text" inputmode="decimal" :value="formatDuration(track.duration)" aria-label="Track length"
+                                                   title="Type a length (m:ss) to move the end to start + length"
+                                                   @change="setTrackLength(idx, $event.target.value, $event.target)" @keydown.enter="$event.target.blur()"
+                                                   class="w-full px-1 py-0.5 border rounded text-right text-sm text-secondary focus-primary" style="border-color: #D6D3CC;">
+                                        </div>
                                         <div class="text-right text-secondary" x-text="discogsLength(idx) !== null ? formatDuration(discogsLength(idx)) : '—'"></div>
                                         <div class="text-right font-semibold" :style="`color: ${deltaColor(trackDelta(track, idx))}`" x-text="deltaText(trackDelta(track, idx))"></div>
                                         <div class="text-right text-secondary" :title="clickTooltip(track)" data-testid="click-count" x-text="clickCountText(track)"></div>

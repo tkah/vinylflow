@@ -3192,6 +3192,47 @@ function vinylApp() {
             this.syncRegionsAround(idx);
         },
 
+        /** "3:45", "3:45.5", "1:02:03" or plain seconds -> seconds; null if unreadable. */
+        parseLengthInput(text) {
+            const s = String(text ?? '').trim();
+            if (/^\d+(\.\d+)?$/.test(s)) return parseFloat(s);
+            const m = s.match(/^(?:(\d+):)?(\d{1,2}):(\d{1,2}(?:\.\d+)?)$/);
+            if (!m) return null;
+            const secs = (m[1] ? parseInt(m[1], 10) * 3600 : 0) + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
+            return m[1] || parseFloat(m[3]) < 60 ? secs : null;
+        },
+
+        /**
+         * Typed length (e.g. from a streaming service): keep the start, end = start + length.
+         * A next track that began exactly at the old end follows the cut, so nothing falls
+         * between them; overlaps are limited exactly like dragging.
+         */
+        setTrackLength(idx, text, input = null) {
+            const track = this.detectedTracks[idx];
+            if (!track) return false;
+            const length = this.parseLengthInput(text);
+            const reset = () => { if (input) input.value = this.formatDuration(track.duration); };
+            if (!(length >= MIN_TRACK_LENGTH)) {
+                reset();
+                this.notify('Type a length like 3:45 (minutes:seconds).', { type: 'warning', timeout: 4000 });
+                return false;
+            }
+            const next = this.detectedTracks[idx + 1];
+            const touching = !!next && Math.abs(next.start - track.end) < 0.05;
+            const recording = this.playDuration || this.currentFile?.duration || Infinity;   // never past the recording
+            const changed = this.applyTrackBounds(idx, track.start, Math.min(track.start + length, recording));
+            if (changed && touching && track.end < next.start) {
+                next.start = track.end;
+                next.duration = next.end - next.start;
+            }
+            if (changed) this.syncRegionsAround(idx);
+            reset();
+            if (changed && Math.abs(track.duration - length) > 0.05) {
+                this.notify(`Track ${track.number} can only be ${this.formatDuration(track.duration)} here (the next track or the end of the recording is in the way).`, { type: 'info', timeout: 5000 });
+            }
+            return changed;
+        },
+
         /**
          * Move track idx to [start, end].  Neighbours are only pushed when
          * the regions would overlap (gaps are preserved); every track keeps
