@@ -89,6 +89,7 @@ class DiscogsTrack:
         artist: str = "",
         credits: Optional[List[Credit]] = None,
         raw_position: str = "",
+        parts: Optional[List[dict]] = None,
     ):
         """
         Initialize Discogs track.
@@ -100,8 +101,11 @@ class DiscogsTrack:
             artist: The track's own artist(s) when Discogs lists them (compilations)
             credits: Track-level credits (Discogs ``extraartists``)
             raw_position: Position as Discogs wrote it (credit track ranges use it)
+            parts: For an umbrella track (a Discogs index track such as a suite),
+                its sub-tracks as ``{position, title, duration}``
         """
         self.position = position
+        self.parts = list(parts or [])
         self.raw_position = raw_position or position
         self.artist = artist
         self.credits = list(credits or [])
@@ -186,6 +190,11 @@ class DiscogsRelease:
         sequential_tracks = []
 
         for track in tracklist:
+            # type_ and sub_tracks exist only in the raw payload (discogs_client's
+            # Track has no attributes for them); plain fakes may set attributes.
+            raw = getattr(track, "data", None)
+            raw = raw if isinstance(raw, dict) else {}
+            kind = raw.get("type_", getattr(track, "type_", "")) or ""
             position = getattr(track, "position", "")
             title = getattr(track, "title", "Unknown")
             duration = getattr(track, "duration", "")
@@ -194,8 +203,18 @@ class DiscogsRelease:
             extras = {"artist": track_artist, "credits": track_credits, "raw_position": position}
 
             # Skip Discogs side-heading entries (type_='heading').
-            if getattr(track, "type_", "") == "heading":
+            if kind == "heading":
                 continue
+
+            # An index track (a suite, e.g. "Feel The Benefit" over B4-B6) has no
+            # position itself; its parts are sub_tracks. Keep it as one umbrella
+            # track at its first part's position, lasting as long as all parts.
+            if kind == "index":
+                umbrella = self._umbrella(raw, getattr(track, "sub_tracks", None), title, duration)
+                if umbrella is None:
+                    continue
+                position, duration, parts = umbrella
+                extras.update(raw_position=position, parts=parts)
 
             # Handle vinyl positions — letter(s) followed by digits, with an optional
             # sub-track suffix such as ".1" or "-2" (e.g. "B6.1", "B6.2").
@@ -242,6 +261,29 @@ class DiscogsRelease:
             tracks.sort(key=_pos_sort_key)
 
         return tracks
+
+    @staticmethod
+    def _umbrella(raw: dict, sub_attr, title: str, duration: str):
+        """(position, duration, parts) for an index track, or None without usable parts."""
+        subs = raw.get("sub_tracks") if raw else None
+        if subs is None and sub_attr:
+            subs = [getattr(t, "data", None) or {"position": getattr(t, "position", ""),
+                    "title": getattr(t, "title", ""), "duration": getattr(t, "duration", "")} for t in sub_attr]
+        parts = [{"position": str(t.get("position") or ""), "title": str(t.get("title") or ""),
+                  "duration": str(t.get("duration") or "")} for t in subs or [] if isinstance(t, dict)]
+        positioned = [p for p in parts if p["position"]]
+        if not positioned:
+            return None
+        # "B4a" / "B4.1" parts share the base "B4"; "B4", "B5", "B6" start at "B4".
+        m = re.match(r"^([A-Z]+\d+|\d+)", positioned[0]["position"])
+        position = m.group(1) if m else positioned[0]["position"]
+        if not duration:
+            secs = [DiscogsTrack._parse_duration(None, p["duration"]) for p in parts]
+            if secs and all(secs):
+                total = int(sum(secs))
+                duration = f"{total // 60}:{total % 60:02d}" if total < 3600 else \
+                    f"{total // 3600}:{total % 3600 // 60:02d}:{total % 60:02d}"
+        return position, duration, parts
 
     def display_summary(self) -> str:
         """Get formatted summary for display."""
