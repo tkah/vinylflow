@@ -1141,9 +1141,9 @@ async def analyze_guided(request: GuidedAnalyzeRequest):
     duration for every expected track, boundaries are laid out from those
     lengths over the music span and snapped to nearby silence gaps;
     otherwise the Smart Rescan ladder is swept in memory for the count.
-    Best-match alignment runs first (any known length, unknown ones cost
-    nothing); the gap/scale model is the fallback when every length is
-    known, and count-based detection when not.
+    Best-match alignment runs first (unknown lengths cost nothing; with none
+    at all, sides and clear gaps decide); the gap/scale model is the fallback
+    when every length is known, and count-based detection when not.
     """
     if not 1 <= request.expected_tracks <= 99:
         raise HTTPException(status_code=422, detail="expected_tracks must be between 1 and 99")
@@ -1165,7 +1165,7 @@ async def analyze_guided(request: GuidedAnalyzeRequest):
     sized = durations is not None and len(durations) == request.expected_tracks
     known = [d if d is not None and d > 0 else None for d in durations] if sized else []
     all_known = sized and all(d is not None for d in known)
-    try_align = sized and request.expected_tracks >= 2 and any(d is not None for d in known)
+    try_align = sized and request.expected_tracks >= 2  # no length at all: even split between clear gaps
 
     try:
         db = await get_envelope(session)
@@ -1223,7 +1223,8 @@ async def analyze_guided(request: GuidedAnalyzeRequest):
                 {"number": i + 1, "start": t.start, "end": t.end, "duration": t.duration}
                 for i, t in enumerate(tracks)
             ],
-            "method": "durations" if guided is not None else "count",
+            # No lengths = placed by count (the UI draws no ghost markers and says so); model tells which.
+            "method": "durations" if guided is not None and guided.model != "align-even" else "count",
             "matched": matched,
             "boundaries": boundaries,
             "scale": guided.scale if guided else None,
