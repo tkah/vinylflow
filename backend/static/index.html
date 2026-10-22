@@ -181,6 +181,18 @@
             overflow-y: hidden;
         }
 
+        /* Waveform scrollbar (shown when zoomed in) */
+        .wave-scrollbar {
+            position: relative; height: 14px; margin-top: 4px;
+            background-color: #E7E5E0; border-radius: 7px; cursor: pointer; touch-action: none;
+        }
+        .wave-scrollbar-thumb {
+            position: absolute; top: 2px; bottom: 2px; min-width: 24px;
+            background-color: #8A8A86; border-radius: 5px; cursor: grab;
+        }
+        .wave-scrollbar-thumb:hover { background-color: #5E5E5A; }
+        .wave-scrollbar.dragging .wave-scrollbar-thumb { background-color: #3D3D3D; cursor: grabbing; }
+
         /* Larger waveform on desktop screens */
         @media (min-width: 768px) {
             #waveform {
@@ -270,7 +282,9 @@
     </style>
 </head>
 <body class="bg-page">
-    <div x-data="vinylApp()" x-init="init()" class="min-h-screen">
+    <div x-data="vinylApp()" x-init="init()" class="min-h-screen flex flex-col">
+    <!-- Page content grows to fill the window so the footer stays at the bottom -->
+    <div class="flex-1">
         <!-- Toasts: stacked bottom-right; info/success auto-dismiss, warnings/errors stay -->
         <div class="toast-stack" role="region" aria-label="Notifications">
             <template x-for="toast in toasts" :key="toast.id">
@@ -1039,13 +1053,20 @@
                     </div>
                 </div>
             </div>
-            <div id="waveform" class="w-full mb-6"></div>
+            <div id="waveform" class="w-full"></div>
+            <!-- Always-visible scrollbar for a zoomed waveform (WaveSurfer's own one is hidden:
+                 on macOS it only shows while scrolling). Drag the thumb or click to jump. -->
+            <div x-show="waveView.end - waveView.start < 0.999" x-cloak class="wave-scrollbar" data-testid="wave-scrollbar"
+                 @pointerdown="waveScrollbarDown($event)" title="Drag to move through the recording">
+                <div class="wave-scrollbar-thumb" :style="`left: ${waveView.start * 100}%; width: ${Math.max(1, (waveView.end - waveView.start) * 100)}%;`"></div>
+            </div>
+            <div class="mb-6"></div>
             <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
                 <div x-show="waveformLoading" class="text-center text-secondary py-8 text-lg">Loading waveform...</div>
                 <div x-show="!waveform && !waveformLoading" class="text-center text-muted py-8">Waveform will appear after analysis completes</div>
                 <p x-show="playerNotice" x-cloak class="mb-2 text-sm text-primary" x-text="playerNotice"></p>
                 <p x-show="playerInfo" x-cloak class="mb-2 text-xs text-muted" x-text="playerInfo"></p>
-                <p class="text-sm text-muted">💡 Tip: Drag the colored regions to adjust track boundaries, or right-click to add splits</p>
+                <p class="text-sm text-muted">💡 Tip: Drag the colored regions to adjust track boundaries, or right-click to add splits. Zoom with ⌘ + scroll wheel (Ctrl on Windows) or by pinching on a trackpad.</p>
                 <p x-show="clickLegendVisible()" x-cloak class="mt-1 text-xs text-muted flex items-center gap-2" data-testid="click-legend">
                     <span class="inline-block w-3 h-1.5" style="background-color: rgba(217, 64, 50, 0.9);"></span>
                     <span x-text="clickLegendText()"></span>
@@ -1393,6 +1414,7 @@
         </div>
 
         </fieldset>
+    </div>
 
         <!-- Footer -->
         <footer class="bg-header mt-12 py-6 border-t" style="border-color: #3D3D3D;">

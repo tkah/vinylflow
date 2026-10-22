@@ -29,6 +29,8 @@ const PROCESS_POLL_INTERVAL_MS = 1500;
 const PREVIEW_AUDIO_NOTICE = "Playing the preview \u2014 this browser can't play the original WAV, so cut points may be up to ~50 ms less precise.";
 // Additional workspace fields are optional when reading saves made before Plan 05.
 const WORKSPACE_ADDITIONS = { searchResults: [], onlyWithLengths: false, detailsSettled: false, currentZoom: 50 };
+// Wheel/pinch zoom speed: zoom factor = exp(-deltaY * rate); one 100 px wheel notch ≈ x1.35
+const WHEEL_ZOOM_RATE = 0.003;
 const REGION_EDGE_HIT_PX = 6;
 const REGION_SHARED_EDGE_PX = 1;
 const WORKSPACE_FIELDS = [
@@ -159,6 +161,8 @@ function vinylApp() {
         playerInfo: '',        // muted, persistent note (preview fallback); playerNotice is for errors
         _audioSource: null,    // {waveform, fileId, precise, peaks, duration, fellBack} of the loaded audio
         playerBuffering: false,
+        waveView: { start: 0, end: 1 },   // visible part of the waveform (fractions), for the scrollbar
+        _waveScroller: null,
         _pendingSeek: null,
         _auditionStop: null,   // one-shot stop time (s) for cut-point auditions
         _regionDownX: null,
@@ -3297,7 +3301,8 @@ function vinylApp() {
                     height: 'auto',
                     normalize: true,
                     barWidth: 2,
-                    barGap: 1
+                    barGap: 1,
+                    hideScrollbar: true   // our own always-visible scrollbar sits under the waveform
                 }));
 
                 const waveform = this.waveform;
@@ -3349,6 +3354,7 @@ function vinylApp() {
                 });
 
                 this.waveformRegions = markRaw(this.waveform.registerPlugin(WaveSurfer.Regions.create()));
+                this.bindWaveScrollbar(waveform);
 
                 const peaksResponse = await fetch(`/api/waveform-peaks/${this.currentFileId}`);
                 if (waveform !== this.waveform) return;
@@ -3483,6 +3489,84 @@ function vinylApp() {
                 this.notifyError('Failed to load waveform', error);
                 this.waveformLoading = false;
             }
+        },
+
+        /** Track WaveSurfer's scroll position (its scroll element wraps the waveform wrapper). */
+        bindWaveScrollbar(waveform) {
+            const scroller = waveform.getWrapper?.()?.parentElement;
+            if (!scroller) return;
+            this._waveScroller = markRaw(scroller);
+            const update = () => {
+                if (waveform !== this.waveform) return;
+                const total = scroller.scrollWidth || 1;
+                const start = Math.max(0, scroller.scrollLeft / total);
+                const end = Math.min(1, (scroller.scrollLeft + scroller.clientWidth) / total);
+                if (Math.abs(start - this.waveView.start) > 1e-4 || Math.abs(end - this.waveView.end) > 1e-4) {
+                    this.waveView = { start, end };
+                }
+            };
+            scroller.addEventListener('scroll', update, { passive: true });
+            for (const ev of ['zoom', 'redraw', 'ready']) waveform.on(ev, update);
+            // ⌘/Ctrl + wheel, and trackpad pinch (browsers send it as Ctrl + wheel), zoom the
+            // waveform around the pointer; plain wheel keeps scrolling the page.
+            const container = document.getElementById('waveform');
+            const wheel = event => {
+                if (waveform !== this.waveform || !(event.ctrlKey || event.metaKey)) return;
+                event.preventDefault();
+                this.wheelZoom(event, scroller);
+            };
+            container?.addEventListener('wheel', wheel, { passive: false });
+            waveform.on('destroy', () => {
+                scroller.removeEventListener('scroll', update);
+                container?.removeEventListener('wheel', wheel);
+            });
+        },
+
+        /** Zoom by a wheel/pinch delta, keeping the moment under the pointer in place. */
+        wheelZoom(event, scroller) {
+            const duration = this.waveform?.getDuration();
+            if (!duration) return;
+            const lines = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 400 : 1;   // lines/pages -> px
+            const dy = Math.max(-200, Math.min(200, event.deltaY * lines));
+            const fit = scroller.clientWidth / duration;            // zoomed all the way out
+            const shown = scroller.scrollWidth / duration;          // current pixels per second
+            const next = Math.max(fit, Math.min(500, shown * Math.exp(-dy * WHEEL_ZOOM_RATE)));
+            if (Math.abs(next - shown) < 1e-3) return;
+            const x = event.clientX - scroller.getBoundingClientRect().left;
+            const time = (scroller.scrollLeft + x) / shown;
+            this.currentZoom = next;
+            this.waveform.zoom(next);
+            scroller.scrollLeft = time * (scroller.scrollWidth / duration) - x;
+        },
+
+        /** Scrollbar: drag the thumb, or press the track to centre the view there. */
+        waveScrollbarDown(event) {
+            const bar = event.currentTarget, scroller = this._waveScroller;
+            if (!scroller || event.button > 0) return;
+            const rect = bar.getBoundingClientRect();
+            const span = this.waveView.end - this.waveView.start;
+            const at = (event.clientX - rect.left) / rect.width;
+            const onThumb = at >= this.waveView.start && at <= this.waveView.end;
+            const scrollTo = start => {
+                const clamped = Math.max(0, Math.min(1 - span, start));
+                scroller.scrollLeft = clamped * scroller.scrollWidth;
+            };
+            if (!onThumb) scrollTo(at - span / 2);
+            // Where in the thumb the pointer holds it (a track press grabs the thumb's middle)
+            const grab = onThumb ? at - this.waveView.start : span / 2;
+            bar.classList.add('dragging');
+            try { bar.setPointerCapture(event.pointerId); } catch { /* keep dragging without capture */ }
+            const move = e => scrollTo((e.clientX - rect.left) / rect.width - grab);
+            const up = () => {
+                bar.classList.remove('dragging');
+                bar.removeEventListener('pointermove', move);
+                bar.removeEventListener('pointerup', up);
+                bar.removeEventListener('pointercancel', up);
+            };
+            bar.addEventListener('pointermove', move);
+            bar.addEventListener('pointerup', up);
+            bar.addEventListener('pointercancel', up);
+            event.preventDefault();
         },
 
         audioUrl(fileId, precise) {
@@ -4651,6 +4735,8 @@ function vinylApp() {
             this.playerNotice = '';
             this.playerInfo = '';
             this._audioSource = null;
+            this._waveScroller = null;
+            this.waveView = { start: 0, end: 1 };
             this.playerBuffering = false;
             this._pendingSeek = null;
             this._restoreZoom = null;
