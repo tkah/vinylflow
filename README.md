@@ -26,6 +26,7 @@ Turn your vinyl recordings into perfectly tagged, organized digital files in min
 
 - **Discogs first:** search starts as soon as a file is added; results show whether they have track
   lengths and how well they fit your recording (lead-in/run-out silence excluded).
+- **Exact pressing:** paste a Discogs release link (or its number) to pick that exact version directly.
 - **Whole albums or single sides:** side picker with Full album / Disc presets, auto-suggested from the
   recording length; multi-disc sets recorded one file per disc share a release.
 - **Best-match splits:** the Discogs track lengths are matched against all the pauses in the recording

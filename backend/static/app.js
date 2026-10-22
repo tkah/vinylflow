@@ -49,6 +49,21 @@ function markRaw(obj) {
     return obj;
 }
 
+/**
+ * A Discogs release reference typed or pasted by the user: "2874426", "r2874426",
+ * "[r2874426]" or a discogs.com/release/... link (any language prefix or slug).
+ * Returns {id}, {master: id} for a master release (not one exact version), or null.
+ */
+function parseDiscogsRelease(text) {
+    const s = String(text || '').trim();
+    let m = s.match(/^\[?r?(\d{1,10})\]?$/i);
+    if (m) return { id: Number(m[1]) };
+    m = s.match(/discogs\.com\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?(?:sell\/)?(release|master)\/(\d{1,10})/i);
+    if (m) return m[1].toLowerCase() === 'release' ? { id: Number(m[2]) } : { master: Number(m[2]) };
+    m = s.match(/^\[?m(\d{1,10})\]?$/i);
+    if (m) return { master: Number(m[1]) };
+    return null;
+}
 
 // ---- Click detection helpers (pure; exposed on the app object for tests) ----
 
@@ -116,6 +131,9 @@ function vinylApp() {
         analyzing: false,
         searchLoading: false,
         searchNotice: '',
+        releaseIdInput: '',      // exact Discogs release: ID or pasted link
+        releaseIdNotice: '',
+        releaseIdLoading: false,
         trackCountMismatch: false,
         autoRetryAttempts: 0,
         maxAutoRetries: 3,
@@ -1661,6 +1679,8 @@ function vinylApp() {
             this.sidesSuggestionReason = '';
             this.customMapping = [];
             this.trackCountMismatch = false;
+            this.releaseIdNotice = '';
+            this.releaseIdInput = '';
             this.searchNotice = '';
             this.searchLoading = false;
             this.searchSeq++;
@@ -2139,6 +2159,44 @@ function vinylApp() {
                 }
             } finally {
                 result.opening = false;
+            }
+        },
+
+        parseDiscogsRelease,
+
+        /** Select the exact release the user named by ID or link, skipping search. */
+        async openReleaseById() {
+            if (this.analyzing || this.currentLocked || this.releaseIdLoading) return;
+            const ref = parseDiscogsRelease(this.releaseIdInput);
+            if (!ref) {
+                this.releaseIdNotice = 'Paste a Discogs release link (discogs.com/release/…) or type its number, e.g. 2874426.';
+                return;
+            }
+            if (ref.master) {
+                this.releaseIdNotice = `That is a master release (all versions of the album). Open it on Discogs, pick the exact pressing you own, and paste that release's link.`;
+                return;
+            }
+            this.releaseIdNotice = '';
+            this.releaseIdLoading = true;
+            try {
+                const response = await fetch(`/api/release/${ref.id}`);
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok || !Array.isArray(data.tracks)) {
+                    this.releaseIdNotice = response.status === 404
+                        ? `Discogs release ${ref.id} was not found (or Discogs is unavailable right now).`
+                        : `Couldn't load release ${ref.id}: ${data.detail || 'unknown error'}`;
+                    return;
+                }
+                if (!data.tracks.length) {
+                    this.releaseIdNotice = `Release ${ref.id} has no tracklist on Discogs, so it can't guide the splits.`;
+                    return;
+                }
+                this.releaseIdInput = '';
+                this.selectRelease({ ...data, detailStatus: 'loaded' });
+            } catch (error) {
+                this.releaseIdNotice = `Couldn't reach the server to load release ${ref.id}.`;
+            } finally {
+                this.releaseIdLoading = false;
             }
         },
 

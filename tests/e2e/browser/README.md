@@ -23,7 +23,7 @@ kill %1; docker rm -f vinylflow-browser
 ```
 
 `change_release_snap.mjs` reproduces "pick release → hand edit → Change release → pick another →
-Snap to Discogs" and must end with 3 track regions + 2 dashed markers and no error notice. Copy it
-for other flows: `bidi.mjs` exposes `goto`, `eval` (runs in the page; use
+Snap to Discogs" and must end with 3 track regions + 2 dashed markers and no error notice. `release_by_id.mjs` checks the exact-pressing field (master link explained, release link selected
+and split). Copy them for other flows: `bidi.mjs` exposes `goto`, `eval` (runs in the page; use
 `Alpine.$data(document.querySelector('[x-data]'))` for app state) and `shot` (full-page PNG).
 Alpine updates the DOM asynchronously: wait a moment after an action before a screenshot.
