@@ -947,17 +947,26 @@
                 </div>
 
                 <!-- Selected Release Info -->
-                <div class="mb-4 p-4 rounded-lg" style="background-color: rgba(229, 161, 0, 0.1);">
-                    <p class="font-bold text-primary" x-text="selectedRelease ? `${selectedRelease.artist} - ${selectedRelease.title}` : ''"></p>
-                    <p class="text-sm text-secondary" x-text="selectedRelease ? `${selectedRelease.year} • ${selectedRelease.label}` : ''"></p>
-                    <!-- #8A5F00: 4.98:1 on this amber tint (the cards' #E5A100 would be 1.96:1) -->
-                    <a x-show="selectedRelease?.id" :href="selectedRelease ? `https://www.discogs.com/release/${selectedRelease.id}` : '#'"
-                       target="_blank" rel="noopener noreferrer" data-testid="release-discogs-link"
-                       class="mt-1 inline-block text-sm underline hover:no-underline" style="color: #8A5F00;">View on Discogs ↗</a>
-                    <p x-show="lengthsBorrowedFrom" x-cloak class="mt-1 text-xs text-muted">
-                        Lengths borrowed from <span x-text="borrowedLabel(lengthsBorrowedFrom)"></span>
-                        (<a :href="lengthsBorrowedFrom ? `https://www.discogs.com/release/${lengthsBorrowedFrom.release_id}` : '#'" target="_blank" rel="noopener" class="underline">view on Discogs</a>)
-                    </p>
+                <div class="mb-4 p-4 rounded-lg flex items-start gap-4" style="background-color: rgba(229, 161, 0, 0.1);">
+                    <!-- Cover art left of all the text; hidden when the release has none or it fails to load
+                         (onload re-shows it: the same img is reused for the next release's cover) -->
+                    <template x-if="selectedRelease?.cover_url">
+                        <img :src="selectedRelease.cover_url" alt="" data-testid="release-cover"
+                             class="w-16 h-16 sm:w-24 sm:h-24 flex-shrink-0 object-cover rounded" style="background-color: #F0EFEB;"
+                             onload="this.style.display=''" onerror="this.style.display='none'">
+                    </template>
+                    <div class="flex-1 min-w-0">
+                        <p class="font-bold text-primary" x-text="selectedRelease ? `${selectedRelease.artist} - ${selectedRelease.title}` : ''"></p>
+                        <p class="text-sm text-secondary" x-text="selectedRelease ? `${selectedRelease.year} • ${selectedRelease.label}` : ''"></p>
+                        <!-- #8A5F00: 4.98:1 on this amber tint (the cards' #E5A100 would be 1.96:1) -->
+                        <a x-show="selectedRelease?.id" :href="selectedRelease ? `https://www.discogs.com/release/${selectedRelease.id}` : '#'"
+                           target="_blank" rel="noopener noreferrer" data-testid="release-discogs-link"
+                           class="mt-1 inline-block text-sm underline hover:no-underline" style="color: #8A5F00;">View on Discogs ↗</a>
+                        <p x-show="lengthsBorrowedFrom" x-cloak class="mt-1 text-xs text-muted">
+                            Lengths borrowed from <span x-text="borrowedLabel(lengthsBorrowedFrom)"></span>
+                            (<a :href="lengthsBorrowedFrom ? `https://www.discogs.com/release/${lengthsBorrowedFrom.release_id}` : '#'" target="_blank" rel="noopener" class="underline">view on Discogs</a>)
+                        </p>
+                    </div>
                 </div>
 
                 <!-- Index tracks (suites / classical works): keep as one track or split into parts -->
