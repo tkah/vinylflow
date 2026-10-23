@@ -197,7 +197,7 @@ test('unlocked recordings can be removed during an export; locked ones cannot', 
 });
 
 // ---- A1: precise playback fallback ------------------------------------------------------------
-function waveformHarness({ canPlay = 'maybe' } = {}) {
+function waveformHarness({ canPlay = 'maybe', peaks = [0.1, 0.2] } = {}) {
     const instance = app(); instance.initWaveform = vinylApp().initWaveform;   // the real method (app() stubs it)
     const wave = { handlers: {}, loads: [], media: { listeners: {}, error: null, readyState: 0, preload: '',
         canPlayType: () => canPlay, addEventListener(ev, fn) { this.listeners[ev] = fn; }, removeEventListener() {} } };
@@ -206,9 +206,9 @@ function waveformHarness({ canPlay = 'maybe' } = {}) {
         registerPlugin() { return { on() {} }; }, destroy() {}, getDuration: () => 120,
         load(url, peaks, duration) { this.loads.push({ url, peaks, duration }); return Promise.resolve(); }
     });
-    global.WaveSurfer = { create: () => wave, Regions: { create: () => ({}) } };
+    global.WaveSurfer = { create: options => { wave.options = options; return wave; }, Regions: { create: () => ({}) } };
     global.fetch = async url => { assert.strictEqual(url, '/api/waveform-peaks/one');
-        return { ok: true, json: async () => ({ peaks: [0.1, 0.2], duration: 120 }) }; };
+        return { ok: true, json: async () => ({ peaks, duration: 120 }) }; };
     return { instance, wave };
 }
 async function startWaveform(options) {
@@ -221,6 +221,14 @@ test('WaveSurfer objects stay out of Alpine reactivity (proxied regions could no
     const { instance, wave } = await startWaveform();
     assert.strictEqual(wave.__v_skip, true); assert.strictEqual(instance.waveformRegions.__v_skip, true);
     assert.ok(!Object.keys(wave).includes('__v_skip'), 'non-enumerable: never serialised or iterated');
+});
+test('peaks are scaled once to the whole recording, so a zoomed-in gap is not stretched to full height', async () => {
+    // WaveSurfer's normalize scales each screen-wide canvas to its own loudest bar.
+    const { wave } = await startWaveform({ peaks: [0.1, 0.2, 0.05] });
+    assert.ok(!wave.options.normalize, 'per-canvas normalize is off');
+    assert.deepStrictEqual(wave.loads[0].peaks, [[0.5, 1, 0.25]]);
+    const silent = await startWaveform({ peaks: [0, 0] });
+    assert.deepStrictEqual(silent.wave.loads[0].peaks, [[0, 0]], 'digital silence stays flat, never NaN');
 });
 test('a browser that cannot play WAV loads the MP3 preview from the start', async () => {
     const { instance, wave } = await startWaveform({ canPlay: '' });

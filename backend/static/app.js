@@ -108,6 +108,18 @@ function clickTickAlpha(count) {
     return count > 0 ? 0.3 + 0.7 * Math.min(1, count / 4) : 0;
 }
 
+/**
+ * Scale waveform peaks so the recording's loudest peak is full height. Replaces WaveSurfer's
+ * `normalize`, which scales each rendered canvas (one per screen width when zoomed) to its own
+ * loudest bar and so stretches the surface noise of a gap to full height. A loop, not
+ * Math.max(...peaks): an album has hundreds of thousands of peaks.
+ */
+function scalePeaksToRecording(peaks) {
+    let loudest = 0;
+    for (const peak of peaks) loudest = Math.max(loudest, Math.abs(peak));
+    return loudest > 0 ? peaks.map(peak => peak / loudest) : peaks;
+}
+
 // Density strip: a thin canvas overlaid on the bottom of the waveform wrapper.
 const CLICK_STRIP_HEIGHT = 6;
 const CLICK_STRIP_MAX_PX = 16384;   // browsers cap canvas width (~32k); CSS stretches it
@@ -3590,7 +3602,7 @@ function vinylApp() {
                     progressColor: '#1d4ed8',
                     cursorColor: '#1e40af',
                     height: 'auto',
-                    normalize: true,
+                    normalize: false,   // peaks arrive pre-scaled (scalePeaksToRecording)
                     barWidth: 2,
                     barGap: 1,
                     hideScrollbar: true   // our own always-visible scrollbar sits under the waveform
@@ -3769,10 +3781,11 @@ function vinylApp() {
                 const knownDuration = peaksData.duration > 0 ? peaksData.duration : undefined;
                 // Browsers that cannot play WAV at all go straight to the MP3 preview.
                 const preciseOk = !!(media.canPlayType && media.canPlayType('audio/wav'));
-                this._audioSource = { waveform, fileId, precise: preciseOk, peaks: [peaksData.peaks],
+                const peaks = [scalePeaksToRecording(peaksData.peaks)];
+                this._audioSource = { waveform, fileId, precise: preciseOk, peaks,
                     duration: knownDuration, fellBack: false };
                 this.playerInfo = preciseOk ? '' : PREVIEW_AUDIO_NOTICE;
-                await this.waveform.load(this.audioUrl(fileId, preciseOk), [peaksData.peaks], knownDuration);
+                await this.waveform.load(this.audioUrl(fileId, preciseOk), peaks, knownDuration);
 
             } catch (error) {
                 // A fallback reload already took over this load's failure.
