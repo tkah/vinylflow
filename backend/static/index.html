@@ -281,6 +281,7 @@
             border-radius: 50%;
             animation: spin 0.8s linear infinite;
         }
+        .spinner-lg { width: 36px; height: 36px; border-width: 4px; }
     </style>
 </head>
 <body class="bg-page">
@@ -1065,7 +1066,16 @@
                     </div>
                 </div>
             </div>
-            <div id="waveform" class="w-full"></div>
+            <!-- The loading overlay sits over the (fixed-height) waveform area, not below it -->
+            <div class="relative">
+                <div id="waveform" class="w-full"></div>
+                <div x-show="waveformLoading" x-cloak role="status" data-testid="waveform-loading"
+                     class="absolute inset-0 z-10 flex items-center justify-center gap-3 text-lg text-secondary"
+                     style="background-color: rgba(250, 249, 246, 0.85);">
+                    <div class="spinner spinner-lg"></div>
+                    <span>Loading waveform…</span>
+                </div>
+            </div>
             <!-- Always-visible scrollbar for a zoomed waveform (WaveSurfer's own one is hidden:
                  on macOS it only shows while scrolling). Drag the thumb or click to jump. -->
             <div x-show="waveView.end - waveView.start < 0.999" x-cloak class="wave-scrollbar" data-testid="wave-scrollbar"
@@ -1074,7 +1084,6 @@
             </div>
             <div class="mb-6"></div>
             <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-                <div x-show="waveformLoading" class="text-center text-secondary py-8 text-lg">Loading waveform...</div>
                 <div x-show="!waveform && !waveformLoading" class="text-center text-muted py-8">Waveform will appear after analysis completes</div>
                 <p x-show="playerNotice" x-cloak class="mb-2 text-sm text-primary" x-text="playerNotice"></p>
                 <p x-show="playerInfo" x-cloak class="mb-2 text-xs text-muted" x-text="playerInfo"></p>
