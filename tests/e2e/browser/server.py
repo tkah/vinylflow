@@ -22,5 +22,5 @@ def seed(rid, title, lens, index=None):
 
 results = [seed(424242, "Wrong Pressing", ["0:30", "0:50", "0:40"]), seed(424243, "Right Pressing", ["0:40", "0:40", "0:40"]),
            seed(424244, "Suite Pressing", ["0:40", "0:40", "0:40"], index="Suite In Two Movements")]
-api.metadata_handler.search_basic = lambda query, max_results=10: results
+api.metadata_handler.search_basic = lambda query, max_results=10, page=1: results if page == 1 else []
 uvicorn.run(api.app, host="127.0.0.1", port=8000, log_level="warning")

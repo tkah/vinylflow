@@ -206,7 +206,7 @@ audio_processor.py  metadata_handler.py  config.py    Discogs API
 | GET | `/api/restoration-test/{file_id}/{name}` | Serve an A/B render (`rt(orig\|proc\|diff)_<12hex>.flac`) |
 | GET | `/api/waveform-peaks/{file_id}` | Equal-width peaks at ≤10 ms per bin, reduced from a temporary PCM file in bounded blocks; `peaks_v2.json` replaces coarse caches |
 | GET | `/api/audio/{file_id}` | Range playback; waveform uses `?precise=true` for source WAV, AIFF keeps the pinned preview fallback |
-| POST | `/api/search` | Discogs search |
+| POST | `/api/search` | Discogs search `{query, max_results, page}` -> `{results, has_more}`; 12 per page in the UI, "Load more" up to `SEARCH_MAX_PAGES` (3) fetches per query. The page size is set on the result list, never as a `per_page` search field (the library appends its own, so Discogs got two) |
 | GET | `/api/release/{release_id}` | Full release + tracklist (cached) |
 | GET | `/api/release/{release_id}/length-donors` | Other pressings of the same master with matching track lengths (rate-limited, <=12 fetches, cached; progress via WS `donor_progress`) |
 | POST | `/api/process` | Start background processing job |

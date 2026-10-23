@@ -925,6 +925,15 @@
                         </div>
                     </template>
                 </div>
+
+                <!-- Next page of the same query (at most SEARCH_MAX_PAGES fetches per search) -->
+                <div x-show="searchResults.length > 0 && !searchLoading && (searchHasMore || searchMoreError)" x-cloak class="mt-4 flex flex-wrap items-center gap-3">
+                    <button x-show="searchHasMore" @click="loadMoreResults()" :disabled="searchMoreLoading" data-testid="load-more-results"
+                            class="px-4 py-2 rounded-lg text-primary hover:bg-page disabled:cursor-not-allowed disabled:opacity-60" style="background-color: #F0EFEB;">
+                        <span x-text="searchMoreLoading ? 'Loading more results…' : 'Load more results'"></span>
+                    </button>
+                    <p x-show="searchMoreError" class="text-sm text-primary" role="alert" x-text="searchMoreError"></p>
+                </div>
             </div>
         </div>
 

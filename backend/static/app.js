@@ -27,8 +27,14 @@ const WORKSPACE_VERSION = 1;
 const WORKSPACE_SAVE_DELAY_MS = 400;
 const PROCESS_POLL_INTERVAL_MS = 1500;
 const PREVIEW_AUDIO_NOTICE = "Playing the preview \u2014 this browser can't play the original WAV, so cut points may be up to ~50 ms less precise.";
+// Discogs results per search fetch ("Load more" fetches the next page). Each result's release page
+// is fetched for its lengths, so one fetch costs this many + 1 rate-limited Discogs calls.
+const SEARCH_PAGE_SIZE = 12;
+// Fetches per query, the first included; must match SEARCH_MAX_PAGES in backend/api.py.
+const SEARCH_MAX_PAGES = 3;
 // Additional workspace fields are optional when reading saves made before Plan 05.
-const WORKSPACE_ADDITIONS = { searchResults: [], onlyWithLengths: false, detailsSettled: false, currentZoom: 50 };
+const WORKSPACE_ADDITIONS = { searchResults: [], onlyWithLengths: false, detailsSettled: false, currentZoom: 50,
+    searchedQuery: '', searchPage: 0, searchHasMore: false };
 // Wheel/pinch zoom speed: zoom factor = exp(-deltaY * rate); one 100 px wheel notch ≈ x1.35
 const WHEEL_ZOOM_RATE = 0.003;
 // Custom tracks (must match CustomTrack in backend/api.py): new positions are A1/B12; titles <= 200 chars.
@@ -106,6 +112,11 @@ function clickDensityBins(times, duration, bins) {
 /** Tick opacity for a bin: faint for a lone click, solid once 4+ share a column. */
 function clickTickAlpha(count) {
     return count > 0 ? 0.3 + 0.7 * Math.min(1, count / 4) : 0;
+}
+
+/** A search result card; tracks: null = tracklist not loaded yet (filled in progressively). */
+function newSearchCard(result) {
+    return { ...result, tracks: result.tracks ?? null, detailStatus: 'pending', opening: false };
 }
 
 /**
@@ -228,6 +239,11 @@ function vinylApp() {
         donors: { releaseId: null, status: 'idle', checked: 0, budget: 12, list: [], error: '' },
         _donorSeq: 0,             // Guards against stale length-donor responses
         searchSeq: 0,             // Guards against stale search responses
+        searchedQuery: '',        // Query the shown results came from ("Load more" continues it, not the edited box)
+        searchPage: 0,            // Discogs result pages fetched for it
+        searchHasMore: false,     // Discogs has another page and the fetch limit allows it
+        searchMoreLoading: false,
+        searchMoreError: '',
         detailsSettled: false,    // True once every result's tracklist load finished/failed
         _detailInflight: {},      // release id -> in-flight detail fetch promise
 
@@ -1692,7 +1708,7 @@ function vinylApp() {
             this.loadCachedClicks(fileId);
             this.detectedTracks = [];
             this.resetEditState();
-            this.searchResults = [];
+            this.resetSearchResults();
             this.detailsSettled = false;
             this.selectedRelease = null;
             this.trackForm = null;
@@ -2066,19 +2082,17 @@ function vinylApp() {
             }
 
             this.searchLoading = true;
-            this.searchResults = [];
+            this.resetSearchResults();
             this.detailsSettled = false;
             this.searchNotice = '';
             const seq = ++this.searchSeq;
+            const query = this.searchQuery;
 
             try {
                 const response = await fetch('/api/search', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        query: this.searchQuery,
-                        max_results: 12
-                    })
+                    body: JSON.stringify({ query, max_results: SEARCH_PAGE_SIZE, page: 1 })
                 });
                 const data = await response.json();
                 if (seq !== this.searchSeq) return;   // a newer search/file superseded this one
@@ -2089,8 +2103,10 @@ function vinylApp() {
                     throw new Error(data.detail || 'Search failed');
                 }
 
-                // tracks: null = not loaded yet; filled in progressively below.
-                this.searchResults = data.results.map(r => ({ ...r, tracks: r.tracks ?? null, detailStatus: 'pending', opening: false }));
+                this.searchResults = data.results.map(newSearchCard);
+                this.searchedQuery = query;
+                this.searchPage = 1;
+                this.searchHasMore = !!data.has_more;
 
                 if (this.searchResults.length === 0) {
                     this.searchNotice = 'No results found. Try a different search query.';
@@ -2101,7 +2117,7 @@ function vinylApp() {
             } catch (error) {
                 if (seq !== this.searchSeq) return;
                 console.error('Search failed:', error);
-                this.searchResults = [];
+                this.resetSearchResults();
                 this.searchNotice = 'Search failed: ' + error.message;
             } finally {
                 if (seq === this.searchSeq) {
@@ -2110,13 +2126,64 @@ function vinylApp() {
             }
         },
 
+        /** Forget the shown results and their "Load more" state (not the query box). */
+        resetSearchResults() {
+            this.searchResults = [];
+            this.searchedQuery = '';
+            this.searchPage = 0;
+            this.searchHasMore = false;
+            this.searchMoreLoading = false;
+            this.searchMoreError = '';
+        },
+
         /**
-         * Fetch full tracklists for the current results in display order,
-         * two at a time (the server rate-limits Discogs anyway).  Stops as
-         * soon as searchSeq moves on (new search or file switch).
+         * "Load more": fetch the next page of the same query and append it, with its
+         * tracklists loading like the first page's. At most SEARCH_MAX_PAGES fetches.
          */
-        async loadAllReleaseDetails(seq, concurrency = 2) {
-            const ids = this.searchResults.map(r => r.id);
+        async loadMoreResults() {
+            if (!this.searchHasMore || this.searchLoading || this.searchMoreLoading || this.searchPage >= SEARCH_MAX_PAGES) return;
+            const seq = this.searchSeq;
+            const page = this.searchPage + 1;
+            this.searchMoreLoading = true;
+            this.searchMoreError = '';
+            try {
+                const response = await fetch('/api/search', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query: this.searchedQuery, max_results: SEARCH_PAGE_SIZE, page })
+                });
+                const data = await response.json();
+                if (seq !== this.searchSeq) return;   // a new search/file replaced these results
+                if (!response.ok || !Array.isArray(data.results)) {
+                    throw new Error(data.detail || 'Search failed');
+                }
+                // Discogs' order can shift between requests: never show a release twice
+                // (cards are keyed by id, and a duplicate key breaks the grid).
+                const shown = new Set(this.searchResults.map(r => r.id));
+                const added = data.results.filter(r => !shown.has(r.id)).map(newSearchCard);
+                this.searchPage = page;
+                this.searchHasMore = !!data.has_more && page < SEARCH_MAX_PAGES;
+                if (added.length) {
+                    this.detailsSettled = false;
+                    this.searchResults = [...this.searchResults, ...added];
+                    this.loadAllReleaseDetails(seq, added.map(r => r.id));
+                }
+            } catch (error) {
+                if (seq !== this.searchSeq) return;
+                console.error('Load more failed:', error);
+                this.searchMoreError = "Couldn't load more results: " + error.message;
+            } finally {
+                if (seq === this.searchSeq) this.searchMoreLoading = false;
+            }
+        },
+
+        /**
+         * Fetch full tracklists for results (default: all shown) in display order,
+         * two at a time (the server rate-limits Discogs anyway).  Stops as
+         * soon as searchSeq moves on (new search or file switch).  Settled only
+         * when no result is still pending: "Load more" can run beside the first page's loader.
+         */
+        async loadAllReleaseDetails(seq, ids = this.searchResults.map(r => r.id), concurrency = 2) {
             let next = 0;
             const worker = async () => {
                 while (seq === this.searchSeq && next < ids.length) {
@@ -2124,7 +2191,7 @@ function vinylApp() {
                 }
             };
             await Promise.all(Array.from({ length: Math.min(concurrency, ids.length) }, worker));
-            if (seq === this.searchSeq) this.detailsSettled = true;
+            if (seq === this.searchSeq && !this.searchResults.some(r => r.detailStatus === 'pending')) this.detailsSettled = true;
         },
 
         /**
@@ -5415,7 +5482,7 @@ function vinylApp() {
             this.detectedTracks = [];
             this.resetEditState();
             this.searchSeq++;
-            this.searchResults = [];
+            this.resetSearchResults();
             this.detailsSettled = false;
             this.selectedRelease = null;
             this.resetDonors();
