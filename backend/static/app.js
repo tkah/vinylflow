@@ -4748,6 +4748,11 @@ function vinylApp() {
             return `Removed audio peaks at ${Math.round(r.removed_peak_dbfs)} dBFS`;
         },
 
+        /** Any A/B element playing, whichever side is shown (the real elements, not abPlaying). */
+        abAnyPlaying() {
+            return ['original', 'processed', 'removed'].some(w => { const el = this.abEl(w); return !!el && !el.paused; });
+        },
+
         abPause() {
             for (const w of ['original', 'processed', 'removed']) {
                 const el = this.abEl(w);
@@ -4998,16 +5003,20 @@ function vinylApp() {
         onGlobalKeydown(e) {
             if (e.code !== 'Space' && e.key !== ' ') return;
             if (e.repeat || e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
-            if (!this.waveform) return;
             if (this.showSettings || this.setupRequired) return;
             const el = e.target;
             const tag = el && el.tagName ? String(el.tagName).toUpperCase() : '';
             if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || (el && el.isContentEditable)) return;
+            const abPlaying = this.abAnyPlaying();
+            if (!abPlaying && !this.waveform) return;
             e.preventDefault();
             // A focused button (e.g. ▶️ just clicked) would also "click" on
             // keyup and toggle straight back — swallow that keyup.
             this._spaceToggled = true;
-            this.togglePlay();
+            // Pause whatever is playing: Space during the A/B test used to start the
+            // waveform instead (from its playhead, often in the lead-in's surface noise).
+            if (abPlaying) this.abPause();
+            else this.togglePlay();
         },
 
         /**

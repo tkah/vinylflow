@@ -15,4 +15,19 @@ const up2 = ev('keyup', 'BUTTON'); app.onGlobalKeyup(up2);   // unrelated keyup 
 if (up2.prevented) throw new Error('stray keyup swallowed');
 const inDown = ev('keydown', 'INPUT'); app.onGlobalKeydown(inDown); app.onGlobalKeyup(ev('keyup', 'INPUT'));
 if (toggles !== 1 || inDown.prevented) throw new Error('input space');
+
+// Space while the A/B test plays pauses the test; it must not start the waveform
+// instead (which resumed from its playhead, often in the lead-in's surface noise).
+const player = paused => ({ paused, pause() { this.paused = true; } });
+const ab = { abOriginal: player(true), abProcessed: player(false), abRemoved: player(true) };
+const waveformStarts = [];
+const abApp = new Function(src + '; return vinylApp;')()();
+abApp.$refs = ab;
+abApp.waveform = { isPlaying: () => false, pause() {}, getCurrentTime: () => 12, play() { waveformStarts.push(1); } };
+abApp.onGlobalKeydown(ev('keydown', 'BUTTON'));
+if (!ab.abProcessed.paused) throw new Error('space did not pause the A/B test');
+if (waveformStarts.length) throw new Error('space started the waveform instead of pausing the A/B test');
+abApp.onGlobalKeyup(ev('keyup', 'BUTTON'));
+abApp.onGlobalKeydown(ev('keydown', 'BUTTON'));   // nothing playing now: Space plays the waveform as before
+if (waveformStarts.length !== 1) throw new Error('space no longer plays the waveform');
 console.log('space ok');
