@@ -129,7 +129,8 @@ def test_pipeline_tags_with_a_per_job_copy(tmp_path):
         def create_album_folder_name(self, rel):
             return "Album"
 
-        def tag_file(self, file_path, track, rel, cover_data, output_format, track_numbering="vinyl", job_positions=None):
+        def tag_file(self, file_path, track, rel, cover_data, output_format, track_numbering="vinyl", job_positions=None,
+                     prefix_part_titles=True):
             names[track.vinyl_number] = HANDLER._build_tag_set(track, rel, None, SEQ, job_positions).title
 
     store = SessionStore()

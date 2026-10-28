@@ -966,6 +966,10 @@
                             Lengths borrowed from <span x-text="borrowedLabel(lengthsBorrowedFrom)"></span>
                             (<a :href="lengthsBorrowedFrom ? `https://www.discogs.com/release/${lengthsBorrowedFrom.release_id}` : '#'" target="_blank" rel="noopener" class="underline">view on Discogs</a>)
                         </p>
+                        <p x-show="movementsLine" x-cloak class="mt-1 text-xs text-muted" data-testid="movements-line">
+                            <span x-text="movementsLine"></span>
+                            (<a :href="titleSource ? `https://www.discogs.com/release/${titleSource.release_id}` : '#'" target="_blank" rel="noopener" class="underline">view on Discogs</a>)
+                        </p>
                     </div>
                 </div>
 
@@ -986,6 +990,100 @@
                                     x-text="entry.unfolded ? 'Keep as one track' : 'Split into parts'"></button>
                         </div>
                     </template>
+                    <div x-show="indexTracks.some(entry => entry.unfolded)" x-cloak class="px-4 py-2 bg-page rounded-lg">
+                        <label for="prefix-part-titles" class="flex items-center gap-2 text-sm text-secondary"
+                               :class="currentLocked ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'">
+                            <input id="prefix-part-titles" type="checkbox" x-model="prefixPartTitles" @change="saveWorkspace()" :disabled="currentLocked"
+                                   class="w-4 h-4 rounded" style="accent-color: #E5A100;">
+                            Prefix part titles with the work title
+                        </label>
+                        <p class="mt-1 ml-6 text-xs text-muted" x-show="partPrefixExample" x-text="`e.g. ${partPrefixExample}`"></p>
+                    </div>
+                </div>
+
+                <!-- Movements from another release: a work whose parts the primary release does not list -->
+                <div x-show="canUseMovements" x-cloak class="mb-4 p-4 bg-page rounded-lg" data-testid="movements-card">
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                        <p class="text-sm text-secondary">Missing movement titles for a work? Borrow them from another release.</p>
+                        <button type="button" @click="movementsPanel.open ? closeMovementsPanel() : openMovementsPanel()" :disabled="analyzing"
+                                :aria-expanded="movementsPanel.open ? 'true' : 'false'" aria-controls="movements-panel"
+                                class="px-4 py-2 rounded-lg border-2 text-sm hover:bg-card"
+                                style="border-color: #E5A100; color: #3D3D3D;"
+                                :class="{'opacity-60 cursor-not-allowed': analyzing}"
+                                x-text="movementsPanel.open ? 'Cancel' : 'Use movements from another release'"></button>
+                    </div>
+                    <div id="movements-panel" x-show="movementsPanel.open" x-cloak class="mt-3 space-y-3">
+                        <form @submit.prevent="loadMovementsDonor()" class="flex flex-wrap items-center gap-2">
+                            <label for="movements-release-id" class="text-sm text-secondary">Release with the movements</label>
+                            <input id="movements-release-id" type="text" x-model="movementsPanel.input" :disabled="movementsPanel.loading"
+                                   placeholder="Discogs release link or number, e.g. 9326206"
+                                   class="flex-1 min-w-0 px-3 py-1.5 border focus-primary rounded-lg text-sm" style="border-color: #8A8A86; min-width: 14rem;">
+                            <button type="submit" :disabled="movementsPanel.loading || !movementsPanel.input.trim()"
+                                    class="px-4 py-1.5 rounded-lg text-sm font-semibold border-2" style="border-color: #E5A100; color: #3D3D3D;"
+                                    :class="{'opacity-60 cursor-not-allowed': movementsPanel.loading || !movementsPanel.input.trim()}">
+                                <span x-show="!movementsPanel.loading">Fetch</span>
+                                <span x-show="movementsPanel.loading" class="flex items-center gap-2"><span class="spinner"></span>Loading…</span>
+                            </button>
+                        </form>
+                        <p x-show="movementsPanel.error" x-cloak role="alert" class="p-2 rounded-lg text-sm text-primary" style="background-color: rgba(229, 161, 0, 0.15);" x-text="movementsPanel.error"></p>
+
+                        <div x-show="movementsPanel.donor" x-cloak class="space-y-3">
+                            <p class="text-sm text-secondary">From <span class="font-medium text-primary" x-text="movementsPanel.donor ? `${movementsPanel.donor.artist} \u2013 ${movementsPanel.donor.title}` : ''"></span></p>
+                            <div class="grid gap-3 sm:grid-cols-2">
+                                <div>
+                                    <label for="movements-replace" class="block text-sm text-secondary mb-1">Replace</label>
+                                    <select id="movements-replace" @change="movementsPanel.replacePosition = $event.target.value; onMovementsChoiceChanged('replace')"
+                                            class="w-full px-3 py-2 border focus-primary rounded-md text-sm" style="border-color: #8A8A86;">
+                                        <template x-for="option in replaceOptions" :key="option.value">
+                                            <option :value="option.value" :selected="option.value === movementsPanel.replacePosition" x-text="option.label"></option>
+                                        </template>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label for="movements-with" class="block text-sm text-secondary mb-1">With</label>
+                                    <select id="movements-with" @change="movementsPanel.donorPosition = $event.target.value; onMovementsChoiceChanged('with')"
+                                            class="w-full px-3 py-2 border focus-primary rounded-md text-sm" style="border-color: #8A8A86;">
+                                        <template x-for="option in donorMovementOptions" :key="option.value">
+                                            <option :value="option.value" :selected="option.value === movementsPanel.donorPosition" x-text="option.label"></option>
+                                        </template>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <!-- The work crosses a side change: where does the next side start? -->
+                            <div x-show="movementSides.length > 1" x-cloak class="space-y-2" data-testid="movements-split">
+                                <template x-for="(start, boundary) in movementsPanel.starts" :key="boundary">
+                                    <div>
+                                        <label :for="`movements-split-${boundary}`" class="block text-sm text-secondary mb-1" x-text="`Side ${movementSides[boundary + 1]} starts with`"></label>
+                                        <select :id="`movements-split-${boundary}`" @change="movementsPanel.starts[boundary] = Number($event.target.value)"
+                                                class="w-full px-3 py-2 border focus-primary rounded-md text-sm" style="border-color: #8A8A86;">
+                                            <template x-for="option in splitOptions(boundary)" :key="option.value">
+                                                <option :value="option.value" :selected="option.value === start" x-text="option.label"></option>
+                                            </template>
+                                        </select>
+                                    </div>
+                                </template>
+                                <p x-show="movementsPanel.splitNote" x-cloak class="text-xs text-muted" x-text="movementsPanel.splitNote"></p>
+                            </div>
+
+                            <p x-show="movementsPlan.error" x-cloak role="alert" class="p-2 rounded-lg text-sm text-primary" style="background-color: rgba(229, 161, 0, 0.15);" x-text="movementsPlan.error"></p>
+                            <div x-show="movementsPlan.ok" x-cloak data-testid="movements-preview">
+                                <p class="text-sm text-secondary mb-1" x-text="`${movementsPlan.rows.length} new track${movementsPlan.rows.length === 1 ? '' : 's'}:`"></p>
+                                <ul class="text-sm text-primary space-y-0.5">
+                                    <template x-for="(row, rowIndex) in movementsPlan.preview" :key="rowIndex">
+                                        <li class="break-words" x-text="row"></li>
+                                    </template>
+                                </ul>
+                            </div>
+                            <div class="flex flex-wrap gap-2">
+                                <button type="button" @click="applyMovements()" :disabled="!movementsPlan.ok || analyzing || currentLocked"
+                                        class="px-4 py-2 btn-primary rounded-lg text-sm font-semibold"
+                                        :class="{'opacity-60 cursor-not-allowed': !movementsPlan.ok || analyzing || currentLocked}">Apply</button>
+                                <button type="button" @click="closeMovementsPanel()"
+                                        class="px-4 py-2 rounded-lg text-sm text-primary" style="background-color: #F0EFEB;">Cancel</button>
+                            </div>
+                        </div>
+                    </div>
                 </div>
 
                 <!-- Borrow track lengths from another pressing -->
@@ -1250,10 +1348,11 @@
                                                 <p class="text-xs text-secondary mb-2" x-text="trackForm.mode === 'add'
                                                     ? 'Add a track that is not on this Discogs release. It is tagged and numbered with the others; no cut moves.'
                                                     : 'Change the title this track is tagged and named with. Cuts do not move.'"></p>
+                                                <p x-show="trackForm.sharedWith?.length" x-cloak class="text-xs text-secondary mb-2" x-text="sharedTrackNote()" data-testid="track-form-shared-note"></p>
                                                 <div class="grid gap-3" style="grid-template-columns: 7rem 1fr;">
                                                     <div>
                                                         <label class="block text-xs font-medium text-secondary mb-1" :for="`tf-pos-${idx}`">Position</label>
-                                                        <input :id="`tf-pos-${idx}`" type="text" x-model="trackForm.position" :disabled="trackForm.mode === 'edit'" maxlength="8" autocomplete="off"
+                                                        <input :id="`tf-pos-${idx}`" type="text" x-model="trackForm.position" :disabled="trackFormPositionLocked()" maxlength="8" autocomplete="off"
                                                                class="w-full px-3 py-2 border focus-primary rounded-md text-sm" style="border-color: #8A8A86;" data-testid="track-form-position">
                                                     </div>
                                                     <div>
@@ -1265,6 +1364,9 @@
                                                 <p x-show="trackForm.error" x-cloak role="alert" class="mt-2 text-sm" style="color: #B3261E;" x-text="trackForm.error" data-testid="track-form-error"></p>
                                                 <div class="mt-3 flex flex-wrap gap-2">
                                                     <button type="submit" class="px-3 py-1.5 btn-primary rounded-lg text-sm font-semibold" x-text="trackForm.mode === 'add' ? 'Add' : 'Save'"></button>
+                                                    <button type="button" x-show="trackForm.mode === 'edit' && trackForm.sharedWith?.length" @click="renameAllSharedTracks()"
+                                                            class="px-3 py-1.5 rounded-lg text-sm text-primary focus-primary" style="background-color: #F0EFEB;"
+                                                            x-text="`Rename all ${trackForm.sharedWith.length + 1}`" data-testid="rename-all-shared"></button>
                                                     <button type="button" @click="closeTrackForm()" class="px-3 py-1.5 rounded-lg text-sm text-primary" style="background-color: #F0EFEB;">Cancel</button>
                                                     <button type="button" x-show="trackForm.mode === 'edit' && mappedTrack(idx)?.renamed" @click="resetTrackTitle()"
                                                             class="px-3 py-1.5 rounded-lg text-sm text-primary" style="background-color: #F0EFEB;"

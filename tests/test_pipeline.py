@@ -53,10 +53,11 @@ class FakeMetadata:
         return b"fake-cover-bytes"
 
     def tag_file(self, file_path, track, release, cover_data, output_format, track_numbering="vinyl",
-                 job_positions=None):
+                 job_positions=None, prefix_part_titles=True):
         self.tag_calls.append((file_path, track.vinyl_number, output_format))
 
-    def create_track_filename(self, track, release, output_format, job_positions=None) -> str:
+    def create_track_filename(self, track, release, output_format, job_positions=None,
+                              prefix_part_titles=True) -> str:
         return f"{track.vinyl_number}-track.{output_format}"
 
 

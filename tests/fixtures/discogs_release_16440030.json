@@ -1,0 +1,206 @@
+{
+ "id": 16440030,
+ "title": "Gaîté Parisienne / Gayne Ballet Suite",
+ "year": 1959,
+ "genres": [
+  "Classical"
+ ],
+ "styles": [
+  "Modern",
+  "Ballet",
+  "Suite",
+  "Orchestra"
+ ],
+ "master_id": 628826,
+ "tracklist": [
+  {
+   "position": "",
+   "type_": "index",
+   "title": "Gaîté Parisienne (As Presented By The Ballet Russe De Monte Carlo)",
+   "extraartists": [
+    {
+     "name": "Jacques Offenbach",
+     "anv": "",
+     "join": "",
+     "role": "Composed By",
+     "tracks": "",
+     "id": 95540,
+     "resource_url": "https://api.discogs.com/artists/95540"
+    }
+   ],
+   "duration": "",
+   "sub_tracks": [
+    {
+     "position": "A",
+     "type_": "track",
+     "title": "Part 1",
+     "duration": ""
+    },
+    {
+     "position": "B1",
+     "type_": "track",
+     "title": "Conclusion",
+     "duration": ""
+    }
+   ]
+  },
+  {
+   "position": "",
+   "type_": "index",
+   "title": "Gayne Ballet Suite",
+   "extraartists": [
+    {
+     "name": "Aram Khachaturian",
+     "anv": "",
+     "join": "",
+     "role": "Composed By",
+     "tracks": "",
+     "id": 420559,
+     "resource_url": "https://api.discogs.com/artists/420559"
+    }
+   ],
+   "duration": "",
+   "sub_tracks": [
+    {
+     "position": "B2a",
+     "type_": "track",
+     "title": "Lesginka",
+     "duration": ""
+    },
+    {
+     "position": "B2b",
+     "type_": "track",
+     "title": "Dance Of The Rose Maidens",
+     "duration": ""
+    },
+    {
+     "position": "B2c",
+     "type_": "track",
+     "title": "Dance Of The Kurds",
+     "duration": ""
+    },
+    {
+     "position": "B2d",
+     "type_": "track",
+     "title": "Sabre Dance",
+     "duration": ""
+    }
+   ]
+  }
+ ],
+ "artists": [
+  {
+   "name": "Jacques Offenbach",
+   "anv": "Offenbach",
+   "join": "/",
+   "role": "",
+   "tracks": "",
+   "id": 95540,
+   "resource_url": "https://api.discogs.com/artists/95540",
+   "thumbnail_url": "https://i.discogs.com/pzm6MVpNJWoAFx-W2b2Ka7BAobWX23eRHJ0c1nU1-BY/rs:fit/g:sm/q:90/h:600/w:491/czM6Ly9kaXNjb2dz/LWRhdGFiYXNlLWlt/YWdlcy9BLTk1NTQw/LTExMjYzODAxNjEu/anBlZw.jpeg"
+  },
+  {
+   "name": "Aram Khachaturian",
+   "anv": "Khachaturian",
+   "join": ",",
+   "role": "",
+   "tracks": "",
+   "id": 420559,
+   "resource_url": "https://api.discogs.com/artists/420559",
+   "thumbnail_url": "https://i.discogs.com/PdoSm0OrAolAGN-QUCw7DxRvF9zyRagFAB9BFHsNJ4A/rs:fit/g:sm/q:90/h:600/w:573/czM6Ly9kaXNjb2dz/LWRhdGFiYXNlLWlt/YWdlcy9BLTQyMDU1/OS0xNzc4NzE0NDMz/LTExNDcuanBlZw.jpeg"
+  },
+  {
+   "name": "Boston Pops Orchestra",
+   "anv": "",
+   "join": ",",
+   "role": "",
+   "tracks": "",
+   "id": 392677,
+   "resource_url": "https://api.discogs.com/artists/392677",
+   "thumbnail_url": "https://i.discogs.com/cZR7y3SyDC-tjPPhZ9cVSsqgO5oruFZDzI72z2mINog/rs:fit/g:sm/q:90/h:314/w:318/czM6Ly9kaXNjb2dz/LWRhdGFiYXNlLWlt/YWdlcy9BLTM5MjY3/Ny0xNzI5OTk1OTU0/LTk2OTMucG5n.jpeg"
+  },
+  {
+   "name": "Arthur Fiedler",
+   "anv": "",
+   "join": "",
+   "role": "",
+   "tracks": "",
+   "id": 406271,
+   "resource_url": "https://api.discogs.com/artists/406271",
+   "thumbnail_url": "https://i.discogs.com/LclLNcpRcVRM3ZkjLmE_PhSK5LYA9c84SZb7yr5l1is/rs:fit/g:sm/q:90/h:504/w:279/czM6Ly9kaXNjb2dz/LWRhdGFiYXNlLWlt/YWdlcy9BLTQwNjI3/MS0xNjYzNjkwNjAw/LTUzOTYuanBlZw.jpeg"
+  }
+ ],
+ "extraartists": [
+  {
+   "name": "Richard Mohr",
+   "anv": "",
+   "join": "",
+   "role": "Directed By [Musical Director]",
+   "tracks": "",
+   "id": 884261,
+   "resource_url": "https://api.discogs.com/artists/884261"
+  },
+  {
+   "name": "John Crawford (2)",
+   "anv": "",
+   "join": "",
+   "role": "Engineer",
+   "tracks": "",
+   "id": 454884,
+   "resource_url": "https://api.discogs.com/artists/454884"
+  },
+  {
+   "name": "David B. Hecht",
+   "anv": "",
+   "join": "",
+   "role": "Photography By",
+   "tracks": "",
+   "id": 1655215,
+   "resource_url": "https://api.discogs.com/artists/1655215"
+  },
+  {
+   "name": "Gerald Goode",
+   "anv": "",
+   "join": "",
+   "role": "Sleeve Notes",
+   "tracks": "",
+   "id": 1393883,
+   "resource_url": "https://api.discogs.com/artists/1393883"
+  }
+ ],
+ "labels": [
+  {
+   "name": "RCA Victor Red Seal",
+   "catno": "LSC-2267",
+   "entity_type": "1",
+   "entity_type_name": "Label",
+   "id": 89473,
+   "resource_url": "https://api.discogs.com/labels/89473",
+   "thumbnail_url": "https://i.discogs.com/FlVV5JLm8HACqLAs_aoQtkNsflzwm__ooewiPdiyBkM/rs:fit/g:sm/q:90/h:490/w:500/czM6Ly9kaXNjb2dz/LWRhdGFiYXNlLWlt/YWdlcy9MLTg5NDcz/LTEzMzU0OTI3MDQu/anBlZw.jpeg"
+  },
+  {
+   "name": "RCA Victor Red Seal",
+   "catno": "LSC-2267 RE",
+   "entity_type": "1",
+   "entity_type_name": "Label",
+   "id": 89473,
+   "resource_url": "https://api.discogs.com/labels/89473",
+   "thumbnail_url": "https://i.discogs.com/FlVV5JLm8HACqLAs_aoQtkNsflzwm__ooewiPdiyBkM/rs:fit/g:sm/q:90/h:490/w:500/czM6Ly9kaXNjb2dz/LWRhdGFiYXNlLWlt/YWdlcy9MLTg5NDcz/LTEzMzU0OTI3MDQu/anBlZw.jpeg"
+  }
+ ],
+ "formats": [
+  {
+   "name": "Vinyl",
+   "qty": "1",
+   "descriptions": [
+    "LP",
+    "Album",
+    "Stereo",
+    "Reissue"
+   ],
+   "text": "Rockaway Pressing"
+  }
+ ],
+ "images": [],
+ "_note": "Trimmed Discogs API payload for release 16440030 (Discogs release data is CC0). Fetched once 2026-10-27 with the user's permission; tests use it offline."
+}

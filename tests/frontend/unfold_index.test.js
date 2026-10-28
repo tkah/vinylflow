@@ -97,4 +97,47 @@ a = mk();
 a.analyzing = true;
 a.setIndexUnfolded(a.indexTracks[0], true);
 assert.deepStrictEqual(positions(a), ['A1', 'A2', 'B3']);
+
+// ---- "Work: Part" display titles (mirror of MetadataHandler._part_title) ----
+a = mk();
+a.setIndexUnfolded(a.indexTracks[0], true);
+const part = a.selectedRelease.tracks[2];
+assert.strictEqual(a.prefixPartTitles, true, 'prefix is on by default');
+assert.strictEqual(a.partDisplayTitle(part), `${WORK}: II. Largo`);
+assert.strictEqual(a.partDisplayTitle({ title: 'Encore' }), 'Encore', 'a non-part track is unchanged');
+assert.strictEqual(a.partDisplayTitle({ title: `${WORK.toUpperCase()} - II`, umbrella: { title: WORK } }),
+    `${WORK.toUpperCase()} - II`, 'a part already starting with the work title (any case) is left alone');
+assert.strictEqual(a.partDisplayTitle({ title: '', umbrella: { title: WORK } }), WORK, 'empty part title falls back to the work');
+assert.strictEqual(a.partDisplayTitle({ title: 'X', umbrella: { title: '' } }), 'X');
+assert.strictEqual(a.trackOptionLabel(part), `A2 · ${WORK}: II. Largo`);
+a.detectedTracks = [1, 2, 3, 4, 5, 6].map(n => ({ number: n, start: n * 10, end: n * 10 + 9, ignored: false }));
+a.resetMappingToTargets();
+assert.ok(a.regionLabel(a.detectedTracks[2]).startsWith('A2 · Symphony No. 9'));
+const firstPart = part.umbrella.parts[0].title;
+assert.strictEqual(a.partPrefixExample, `${WORK}: ${firstPart}`, 'checkbox example: the first split part, prefixed');
+
+// the request, signature and workspace carry the toggle
+assert.strictEqual(a.buildExportRequest('f1', a.currentWorkspaceState()).prefix_part_titles, true);
+const signatureOn = a.exportSignature();
+a.prefixPartTitles = false;
+assert.strictEqual(a.buildExportRequest('f1', a.currentWorkspaceState()).prefix_part_titles, false);
+assert.notStrictEqual(a.exportSignature(), signatureOn, 'toggling allows another export');
+assert.strictEqual(a.partDisplayTitle(part), 'II. Largo');
+assert.strictEqual(a.trackOptionLabel(part), 'A2 · II. Largo');
+assert.strictEqual(a.partPrefixExample, firstPart, 'checkbox example follows the toggle');
+const restored = mk();
+Object.assign(restored, JSON.parse(JSON.stringify(a.captureWorkspace())));
+assert.strictEqual(restored.prefixPartTitles, false, 'workspace round-trip keeps the toggle');
+
+// the rename form edits the bare part title, and renames never leak the prefix
+a.prefixPartTitles = true;
+a.customMapping = [0, 2, 3, 4, 5, 6];
+a.openTrackForm(1, 'edit');
+assert.strictEqual(a.trackForm.title, 'II. Largo');
+assert.deepStrictEqual(a.customTracksPayload(a.selectedRelease), []);
+
+// choosing another release resets the toggle
+a.prefixPartTitles = false;
+a.selectRelease(mkRelease());
+assert.strictEqual(a.prefixPartTitles, true);
 console.log('unfold index ok');

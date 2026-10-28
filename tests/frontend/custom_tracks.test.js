@@ -143,6 +143,120 @@ a.addCustomTrack(4, 'B5', 'Hidden');
 a.renameTrack(4, 'Hidden Gem');
 assert.deepStrictEqual(a.selectedRelease.tracks[4], { position: 'B5', title: 'Hidden Gem', duration: '', custom: true });
 
+// ---- editing a row whose track other rows share: Save adds a new track for this row only ----
+a = mk();
+const sharedBefore = JSON.stringify(a.selectedRelease);
+a.openTrackForm(5, 'edit');                             // rows 5 and 6 both map to B6
+assert.deepStrictEqual(a.trackForm.sharedWith, [5], 'row number of the other row on B6');
+assert.strictEqual(a.trackForm.position, 'B7', 'prefilled with the next free position');
+assert.strictEqual(a.trackForm.title, 'Six');
+a.trackForm.title = 'Bonus';
+a.submitTrackForm();
+assert.strictEqual(a.trackForm, null);
+assert.deepStrictEqual(positions(a), ['A1', 'A2', 'B1', 'B4', 'B6', 'B7']);
+assert.strictEqual(a.selectedRelease.tracks[4].title, 'Six', 'the shared entry keeps its title');
+assert.deepStrictEqual(a.selectedRelease.tracks[5], { position: 'B7', title: 'Bonus', duration: '', custom: true });
+assert.deepStrictEqual(a.customMapping, [0, 1, 2, 3, 4, 5], 'only this row moved to the new track');
+assert.strictEqual(ready(a), '', 'no position is mapped twice any more');
+assert.strictEqual(a.redetects, 0);
+click(a);
+assert.strictEqual(JSON.stringify(a.selectedRelease), sharedBefore);
+assert.deepStrictEqual(a.customMapping, [0, 1, 2, 3, 4, 4]);
+
+// plural note data, and the position field is enabled for a shared entry's form
+a = mk();
+a.customMapping = [0, 1, 2, 4, 4, 4];
+a.openTrackForm(3, 'edit');
+assert.deepStrictEqual(a.trackForm.sharedWith, [5, 6]);
+assert.strictEqual(a.trackFormPositionLocked(), false);
+
+// "Rename all" keeps the old behaviour: one shared entry, every row shows the new title
+a = mk();
+a.openTrackForm(5, 'edit');
+a.trackForm.title = 'Everywhere';
+a.renameAllSharedTracks();
+assert.strictEqual(a.trackForm, null);
+assert.strictEqual(a.selectedRelease.tracks[4].title, 'Everywhere');
+assert.deepStrictEqual(a.customMapping, [0, 1, 2, 3, 4, 4]);
+assert.strictEqual(positions(a).length, 5);
+
+// a shared form refuses a taken position and stays open
+a = mk();
+a.openTrackForm(5, 'edit');
+a.trackForm.position = 'B4';
+a.submitTrackForm();
+assert.match(a.trackForm.error, /B4 is already on this release/);
+
+// not shared: unchanged (no sharedWith, position disabled, plain rename)
+a = mk();
+a.openTrackForm(0, 'edit');
+assert.deepStrictEqual(a.trackForm.sharedWith, []);
+assert.strictEqual(a.trackForm.position, 'A1');
+assert.strictEqual(a.trackFormPositionLocked(), true);
+a.trackForm.title = 'Uno';
+a.submitTrackForm();
+assert.strictEqual(a.selectedRelease.tracks[0].title, 'Uno');
+assert.strictEqual(positions(a).length, 5);
+
+// an ignored row on the same entry does not count as sharing
+a = mk();
+a.detectedTracks[4].ignored = true;
+a.openTrackForm(5, 'edit');
+assert.deepStrictEqual(a.trackForm.sharedWith, []);
+
+// ---- custom track position is editable ----
+a = mk();
+a.addCustomTrack(4, 'B5', 'Hidden');                    // tracks A1 A2 B1 B4 B5* B6; rows -> [0,1,2,3,4,5]
+const titleOfRow = i => a.mappedTrack(i).title;
+const titlesBefore = [0, 1, 2, 3, 4, 5].map(titleOfRow);
+const customJson = JSON.stringify(a.selectedRelease);
+const customMapping = [...a.customMapping];
+a.openTrackForm(4, 'edit');
+assert.strictEqual(a.trackForm.sharedWith.length, 0);
+assert.strictEqual(a.trackFormPositionLocked(), false, 'custom entries can move');
+a.trackForm.position = ' b7 ';
+a.trackForm.title = 'Moved';
+a.submitTrackForm();
+assert.strictEqual(a.trackForm, null);
+assert.deepStrictEqual(positions(a), ['A1', 'A2', 'B1', 'B4', 'B6', 'B7']);
+assert.deepStrictEqual(a.selectedRelease.tracks[5], { position: 'B7', title: 'Moved', duration: '', custom: true });
+assert.deepStrictEqual([0, 1, 2, 3, 4, 5].map(titleOfRow), titlesBefore.map(t => (t === 'Hidden' ? 'Moved' : t)),
+    'every row still points at the same track');
+assert.strictEqual(a.redetects, 0);
+click(a);
+assert.strictEqual(JSON.stringify(a.selectedRelease), customJson);
+assert.deepStrictEqual(a.customMapping, customMapping);
+
+// invalid or taken positions change nothing
+a = mk();
+a.addCustomTrack(4, 'B5', 'Hidden');
+const stable = JSON.stringify(a.selectedRelease);
+const toastCount = a.toasts.length;
+a.openTrackForm(4, 'edit');
+a.trackForm.position = '7';
+a.submitTrackForm();
+assert.match(a.trackForm.error, /side letter and a number/);
+a.trackForm.position = 'B6';
+a.submitTrackForm();
+assert.match(a.trackForm.error, /B6 is already on this release/);
+assert.strictEqual(JSON.stringify(a.selectedRelease), stable);
+assert.strictEqual(a.toasts.length, toastCount);
+a.trackForm.position = 'B5';                            // its own position and a new title: plain rename
+a.trackForm.title = 'Renamed';
+a.submitTrackForm();
+assert.strictEqual(a.selectedRelease.tracks[4].title, 'Renamed');
+assert.strictEqual(a.selectedRelease.tracks[4].position, 'B5');
+
+// moving the only track of a side adds the new side and prunes the empty one
+a = mk();
+a.selectedSides = ['A', 'B'];
+a.addCustomTrack(0, 'C1', 'Bonus');
+a.openTrackForm(0, 'edit');
+a.trackForm.position = 'B9';
+a.submitTrackForm();
+assert.ok(a.selectedSides.includes('B'));
+assert.ok(!a.selectedSides.includes('C'), 'a side with no tracks left is dropped');
+
 // ---- remove: only when no other row maps to it; undo ----
 a = mk();
 a.addCustomTrack(4, 'B5', 'Hidden');                    // row 5 -> B5 (index 4)

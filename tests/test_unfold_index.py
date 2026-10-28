@@ -112,3 +112,51 @@ def test_first_part_sharing_the_work_position_is_tagged_and_named_as_the_part():
     assert folded.title == WORK and folded.work is None
     assert handler.create_track_filename(FakeTrack("A1"), rel, "flac", ["A1"]) == \
         handler.create_track_filename(FakeTrack("A1"), rel, "flac")
+
+
+def tags_unprefixed(release, position, job):
+    return MetadataHandler(discogs_token="", user_agent="")._build_tag_set(
+        FakeTrack(position), release, None, SEQ, job, prefix_part_titles=False)
+
+
+def test_prefix_off_gives_bare_part_title_but_keeps_work_tag():
+    rel, job = tenCC(), ["B4", "B5", "B6"]
+    off = tags_unprefixed(rel, "B5", job)
+    assert off.title == "A Latin Break" and off.work == "Feel The Benefit"
+    assert off.track_number == tags(rel, "B5", job).track_number
+    assert off.artist == tags(rel, "B5", job).artist
+    # the default is unchanged
+    assert tags(rel, "B5", job).title == "Feel The Benefit: A Latin Break"
+    # a part already named like the work stays itself
+    assert tags_unprefixed(rel, "B6", job).title == "Feel The Benefit"
+
+
+def test_prefix_off_falls_back_to_work_title_for_an_empty_part_title():
+    rel = symphony()
+    rel.tracks[0].parts[1]["title"] = ""
+    got = tags_unprefixed(rel, "A2", ["A1", "A2", "B1", "B2"])
+    assert got.title == WORK and got.work == WORK
+
+
+def test_prefix_off_changes_filename_and_default_is_unchanged():
+    rel, handler, job = tenCC(), MetadataHandler(discogs_token="", user_agent=""), ["B4", "B5", "B6"]
+    prefixed = handler.create_track_filename(FakeTrack("B5"), rel, "flac", job)
+    assert prefixed.startswith("B5-Feel The Benefit") and prefixed.endswith("A Latin Break.flac")
+    bare = handler.create_track_filename(FakeTrack("B5"), rel, "flac", job, prefix_part_titles=False)
+    assert bare == "B5-A Latin Break.flac"
+
+
+def test_prefix_off_reaches_every_tagger(tmp_path):
+    seen = []
+    handler = MetadataHandler(discogs_token="", user_agent="")
+    handler._build_tag_set = lambda track, release, cover, numbering, positions, prefix: seen.append(prefix)
+    for fmt in ("flac", "mp3", "aiff"):
+        handler.tag_file(tmp_path / "x", FakeTrack("B5"), tenCC(), None, fmt, SEQ, ["B5"], prefix_part_titles=False)
+    assert seen == [False, False, False]
+
+
+def test_process_request_prefix_flag_reaches_output_spec():
+    from backend import api
+    base = dict(file_id="f", release_id=1, track_mapping=[])
+    assert api._output_spec(api.ProcessRequest(**base)).prefix_part_titles is True
+    assert api._output_spec(api.ProcessRequest(**base, prefix_part_titles=False)).prefix_part_titles is False

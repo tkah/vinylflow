@@ -206,6 +206,8 @@ function waveformHarness({ canPlay = 'maybe', peaks = [0.1, 0.2] } = {}) {
         registerPlugin() { return { on() {} }; }, destroy() {}, getDuration: () => 120,
         load(url, peaks, duration) { this.loads.push({ url, peaks, duration }); return Promise.resolve(); }
     });
+    // guardRegionDragRelease installs document-level pointer listeners; a no-op document is enough here
+    global.document = { addEventListener() {}, removeEventListener() {}, dispatchEvent() {} };
     global.WaveSurfer = { create: options => { wave.options = options; return wave; }, Regions: { create: () => ({}) } };
     global.fetch = async url => { assert.strictEqual(url, '/api/waveform-peaks/one');
         return { ok: true, json: async () => ({ peaks, duration: 120 }) }; };

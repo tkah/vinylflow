@@ -11,7 +11,7 @@ pipeline arrive in subsequent steps.
 """
 
 from . import pipeline
-from .events import OutputSpec, ProcessingRun, ProgressEvent
+from .events import OutputSpec, ProcessingRun, ProgressEvent, TitleSourceSpec
 from .session import InvalidSessionState, Session, SessionState
 from .store import SessionStore
 
@@ -23,5 +23,6 @@ __all__ = [
     "Session",
     "SessionState",
     "SessionStore",
+    "TitleSourceSpec",
     "pipeline",
 ]

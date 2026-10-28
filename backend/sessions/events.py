@@ -9,6 +9,18 @@ from typing import Any, Optional
 
 
 @dataclass(frozen=True)
+class TitleSourceSpec:
+    """Movements/titles borrowed from another Discogs release for one work of the primary
+    (see ``metadata_handler.with_borrowed_work``).  ``assignments`` is
+    ``((new_position, source_position), ...)``; ``donor_position`` None = plain donor tracks."""
+
+    release_id: int
+    replace_position: str
+    donor_position: Optional[str]
+    assignments: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
 class OutputSpec:
     """What the caller wants the Pipeline to produce."""
 
@@ -34,6 +46,11 @@ class OutputSpec:
     # The user's own tracks and renames as (position, title): applied to a per-job copy of
     # the Discogs release (metadata_handler.with_custom_tracks).
     custom_tracks: tuple[tuple[str, str], ...] = ()
+    # Movements borrowed from another release; applied before ``custom_tracks``.
+    title_source: Optional[TitleSourceSpec] = None
+    # Title split (index) track parts "Work: Movement"; False = the bare part title
+    # (WORK/TIT1 tags are written either way).
+    prefix_part_titles: bool = True
 
 
 @dataclass(frozen=True)

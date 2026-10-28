@@ -1,0 +1,276 @@
+{
+ "id": 9326206,
+ "title": "Gaîté Parisienne",
+ "year": 2015,
+ "genres": [
+  "Classical"
+ ],
+ "styles": [
+  "Romantic",
+  "Ballet",
+  "Orchestra"
+ ],
+ "master_id": 574303,
+ "tracklist": [
+  {
+   "position": "",
+   "type_": "index",
+   "title": "Gaîté Parisienne",
+   "duration": "",
+   "sub_tracks": [
+    {
+     "position": "1.1",
+     "type_": "track",
+     "title": "Allegro",
+     "duration": "2:05"
+    },
+    {
+     "position": "1.2",
+     "type_": "track",
+     "title": "Allegro Brillante",
+     "duration": "1:00"
+    },
+    {
+     "position": "1.3",
+     "type_": "track",
+     "title": "Polka",
+     "duration": "1:25"
+    },
+    {
+     "position": "1.4",
+     "type_": "track",
+     "title": "Ländler: Allegro",
+     "duration": "1:33"
+    },
+    {
+     "position": "1.5",
+     "type_": "track",
+     "title": "Mazurka",
+     "duration": "2:11"
+    },
+    {
+     "position": "1.6",
+     "type_": "track",
+     "title": "Valse",
+     "duration": "1:59"
+    },
+    {
+     "position": "1.7",
+     "type_": "track",
+     "title": "Allegro",
+     "duration": "1:03"
+    },
+    {
+     "position": "1.8",
+     "type_": "track",
+     "title": "Polka",
+     "duration": "1:19"
+    },
+    {
+     "position": "1.9",
+     "type_": "track",
+     "title": "Valse",
+     "duration": "2:51"
+    },
+    {
+     "position": "1.10",
+     "type_": "track",
+     "title": "Tempo Di Marcia",
+     "duration": "1:17"
+    },
+    {
+     "position": "1.11",
+     "type_": "track",
+     "title": "Valse",
+     "duration": "1:47"
+    },
+    {
+     "position": "1.12",
+     "type_": "track",
+     "title": "Allegro Vivo",
+     "duration": "0:11"
+    },
+    {
+     "position": "1.13",
+     "type_": "track",
+     "title": "Valse",
+     "duration": "1:52"
+    },
+    {
+     "position": "1.14",
+     "type_": "track",
+     "title": "Allegro Vivace: Misterioso",
+     "duration": "2:06"
+    },
+    {
+     "position": "1.15",
+     "type_": "track",
+     "title": "Valse",
+     "duration": "2:42"
+    },
+    {
+     "position": "1.16",
+     "type_": "track",
+     "title": "Allegro Vivo",
+     "duration": "0:25"
+    },
+    {
+     "position": "1.17",
+     "type_": "track",
+     "title": "Cancan",
+     "duration": "1:43"
+    },
+    {
+     "position": "1.18",
+     "type_": "track",
+     "title": "Quadrille",
+     "duration": "1:51"
+    },
+    {
+     "position": "1.19",
+     "type_": "track",
+     "title": "Allegro Moderato",
+     "duration": "0:42"
+    },
+    {
+     "position": "1.20",
+     "type_": "track",
+     "title": "Allegro",
+     "duration": "0:23"
+    },
+    {
+     "position": "1.21",
+     "type_": "track",
+     "title": "Vivo",
+     "duration": "0:57"
+    },
+    {
+     "position": "1.22",
+     "type_": "track",
+     "title": "Vivo",
+     "duration": "1:02"
+    },
+    {
+     "position": "1.23",
+     "type_": "track",
+     "title": "Barcarolle",
+     "duration": "3:45"
+    }
+   ]
+  }
+ ],
+ "artists": [
+  {
+   "name": "Jacques Offenbach",
+   "anv": "Offenbach",
+   "join": ",",
+   "role": "",
+   "tracks": "",
+   "id": 95540,
+   "resource_url": "https://api.discogs.com/artists/95540",
+   "thumbnail_url": "https://i.discogs.com/pzm6MVpNJWoAFx-W2b2Ka7BAobWX23eRHJ0c1nU1-BY/rs:fit/g:sm/q:90/h:600/w:491/czM6Ly9kaXNjb2dz/LWRhdGFiYXNlLWlt/YWdlcy9BLTk1NTQw/LTExMjYzODAxNjEu/anBlZw.jpeg"
+  },
+  {
+   "name": "Boston Pops Orchestra",
+   "anv": "Boston Pops",
+   "join": ",",
+   "role": "",
+   "tracks": "",
+   "id": 392677,
+   "resource_url": "https://api.discogs.com/artists/392677",
+   "thumbnail_url": "https://i.discogs.com/cZR7y3SyDC-tjPPhZ9cVSsqgO5oruFZDzI72z2mINog/rs:fit/g:sm/q:90/h:314/w:318/czM6Ly9kaXNjb2dz/LWRhdGFiYXNlLWlt/YWdlcy9BLTM5MjY3/Ny0xNzI5OTk1OTU0/LTk2OTMucG5n.jpeg"
+  },
+  {
+   "name": "Arthur Fiedler",
+   "anv": "Fiedler",
+   "join": "",
+   "role": "",
+   "tracks": "",
+   "id": 406271,
+   "resource_url": "https://api.discogs.com/artists/406271",
+   "thumbnail_url": "https://i.discogs.com/LclLNcpRcVRM3ZkjLmE_PhSK5LYA9c84SZb7yr5l1is/rs:fit/g:sm/q:90/h:504/w:279/czM6Ly9kaXNjb2dz/LWRhdGFiYXNlLWlt/YWdlcy9BLTQwNjI3/MS0xNjYzNjkwNjAw/LTUzOTYuanBlZw.jpeg"
+  }
+ ],
+ "extraartists": [
+  {
+   "name": "Jacques Offenbach",
+   "anv": "",
+   "join": "",
+   "role": "Composed By",
+   "tracks": "",
+   "id": 95540,
+   "resource_url": "https://api.discogs.com/artists/95540"
+  },
+  {
+   "name": "Arthur Fiedler",
+   "anv": "",
+   "join": "",
+   "role": "Conductor",
+   "tracks": "",
+   "id": 406271,
+   "resource_url": "https://api.discogs.com/artists/406271"
+  },
+  {
+   "name": "Boston Pops Orchestra",
+   "anv": "The Boston Pops Orchestra",
+   "join": "",
+   "role": "Orchestra",
+   "tracks": "",
+   "id": 392677,
+   "resource_url": "https://api.discogs.com/artists/392677"
+  },
+  {
+   "name": "Manuel Rosenthal",
+   "anv": "",
+   "join": "",
+   "role": "Orchestrated By",
+   "tracks": "",
+   "id": 703268,
+   "resource_url": "https://api.discogs.com/artists/703268"
+  },
+  {
+   "name": "Ryan Smith (2)",
+   "anv": "",
+   "join": "",
+   "role": "Remastered By",
+   "tracks": "",
+   "id": 463852,
+   "resource_url": "https://api.discogs.com/artists/463852"
+  }
+ ],
+ "labels": [
+  {
+   "name": "RCA Victor Red Seal",
+   "catno": "LSC-1817",
+   "entity_type": "1",
+   "entity_type_name": "Label",
+   "id": 89473,
+   "resource_url": "https://api.discogs.com/labels/89473",
+   "thumbnail_url": "https://i.discogs.com/FlVV5JLm8HACqLAs_aoQtkNsflzwm__ooewiPdiyBkM/rs:fit/g:sm/q:90/h:490/w:500/czM6Ly9kaXNjb2dz/LWRhdGFiYXNlLWlt/YWdlcy9MLTg5NDcz/LTEzMzU0OTI3MDQu/anBlZw.jpeg"
+  },
+  {
+   "name": "Analogue Productions",
+   "catno": "CAPC 1817 SA",
+   "entity_type": "1",
+   "entity_type_name": "Label",
+   "id": 57179,
+   "resource_url": "https://api.discogs.com/labels/57179",
+   "thumbnail_url": "https://i.discogs.com/9A6Vz5ia3MypUyoqfpI70y6ddY6zoYR3kfECG8_sLI4/rs:fit/g:sm/q:90/h:300/w:300/czM6Ly9kaXNjb2dz/LWRhdGFiYXNlLWlt/YWdlcy9MLTU3MTc5/LTE0OTQwOTg4Mzct/MzA2MC5qcGVn.jpeg"
+  }
+ ],
+ "formats": [
+  {
+   "name": "SACD",
+   "qty": "1",
+   "descriptions": [
+    "Hybrid",
+    "Stereo",
+    "Album",
+    "Reissue",
+    "Remastered"
+   ]
+  }
+ ],
+ "images": [],
+ "_note": "Trimmed Discogs API payload for release 9326206 (Discogs release data is CC0). Fetched once 2026-10-27 with the user's permission; tests use it offline."
+}

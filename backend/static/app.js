@@ -34,7 +34,7 @@ const SEARCH_PAGE_SIZE = 12;
 const SEARCH_MAX_PAGES = 3;
 // Additional workspace fields are optional when reading saves made before Plan 05.
 const WORKSPACE_ADDITIONS = { searchResults: [], onlyWithLengths: false, detailsSettled: false, currentZoom: 50,
-    searchedQuery: '', searchPage: 0, searchHasMore: false };
+    searchedQuery: '', searchPage: 0, searchHasMore: false, prefixPartTitles: true, titleSource: null };
 // Wheel/pinch zoom speed: zoom factor = exp(-deltaY * rate); one 100 px wheel notch ≈ x1.35
 const WHEEL_ZOOM_RATE = 0.003;
 // Custom tracks (must match CustomTrack in backend/api.py): new positions are A1/B12; titles <= 200 chars.
@@ -76,6 +76,84 @@ function parseDiscogsRelease(text) {
     m = s.match(/^\[?m(\d{1,10})\]?$/i);
     if (m) return { master: Number(m[1]) };
     return null;
+}
+
+// ---- Movements from another release (plan 14; pure helpers, exposed on the app object for tests) ----
+
+// "With" choice meaning the donor's top-level tracks instead of one of its index tracks
+// (sent as donor_position: null).
+const MOVEMENTS_ALL_DONOR_TRACKS = '__all__';
+
+/** Title key for matching works across releases: lowercase, no diacritics, parentheticals or punctuation. */
+function normalizeWorkTitle(title) {
+    return String(title || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+        .replace(/\([^)]*\)/g, ' ').replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+/** 2 = same work title, 1 = one starts with the other, 0 = no match. */
+function workTitleMatchScore(first, second) {
+    const a = normalizeWorkTitle(first), b = normalizeWorkTitle(second);
+    if (!a || !b) return 0;
+    return a === b ? 2 : (a.startsWith(b) || b.startsWith(a)) ? 1 : 0;
+}
+
+/** Slot positions grouped by consecutive side letter: ['A', 'B1'] -> [{side:'A', slots:['A']}, {side:'B', slots:['B1']}]. */
+function slotGroups(slots) {
+    const groups = [];
+    for (const slot of slots) {
+        const side = /^[A-Z]+/.exec(String(slot))?.[0] || '';
+        const last = groups[groups.length - 1];
+        if (last && last.side === side) last.slots.push(slot);
+        else groups.push({ side, slots: [slot] });
+    }
+    return groups;
+}
+
+/**
+ * New positions for borrowed movements, one flat list in order.  counts[i] movements go to group i:
+ * exactly one keeps the group's first slot position (a bare side letter "A" becomes "A1"); several
+ * give A1..An after a bare side letter, else "<slot>.<n>" ("B1" -> B1.1, B1.2, ...), which sorts
+ * before the next track (B2) in positionKey.  Mirrors the contract the backend validates.
+ */
+function borrowedPositions(slots, counts) {
+    const out = [];
+    slotGroups(slots).forEach((group, index) => {
+        const first = group.slots[0], bare = /^[A-Z]+$/.test(first), count = counts[index] || 0;
+        for (let n = 1; n <= count; n++) {
+            out.push(count === 1 ? (bare ? `${first}1` : first) : bare ? `${first}${n}` : `${first}.${n}`);
+        }
+    });
+    return out;
+}
+
+/**
+ * How many movements each position group gets.  With measured `targets` (cumulative music seconds
+ * at the end of each group but the last) every boundary takes the cut whose cumulative donor length
+ * is nearest; without them (or with an unknown length) movements are split proportionally by count.
+ * Every group keeps at least one movement; null when there are fewer movements than groups.
+ */
+function defaultMovementSplit(durationsSeconds, targets, groupCount) {
+    const total = durationsSeconds.length;
+    if (groupCount < 1 || total < groupCount) return null;
+    const useTargets = Array.isArray(targets) && targets.length === groupCount - 1 &&
+        durationsSeconds.every(Number.isFinite);
+    const cumulative = [0];
+    durationsSeconds.forEach((seconds, i) => cumulative.push(cumulative[i] + (Number(seconds) || 0)));
+    const cuts = [];
+    for (let boundary = 1; boundary < groupCount; boundary++) {
+        const lowest = (cuts[boundary - 2] || 0) + 1, highest = total - (groupCount - boundary);
+        let cut;
+        if (useTargets) {
+            cut = lowest;
+            for (let k = lowest; k <= highest; k++) {
+                if (Math.abs(cumulative[k] - targets[boundary - 1]) < Math.abs(cumulative[cut] - targets[boundary - 1])) cut = k;
+            }
+        } else {
+            cut = Math.max(lowest, Math.min(highest, Math.round(total * boundary / groupCount)));
+        }
+        cuts.push(cut);
+    }
+    return [...cuts, total].map((cut, i) => cut - (cuts[i - 1] || 0));
 }
 
 // ---- Click detection helpers (pure; exposed on the app object for tests) ----
@@ -199,6 +277,7 @@ function vinylApp() {
         waveformLoading: false,
         waveformRegions: null,
         currentZoom: 50,
+        prefixPartTitles: true,   // title split index-track parts "Work: Part" in tags/filenames and the UI
 
         // Context Menu for waveform splits
         contextMenu: {
@@ -238,6 +317,10 @@ function vinylApp() {
         // Borrow track lengths from another pressing (state for the selected release only)
         donors: { releaseId: null, status: 'idle', checked: 0, budget: 12, list: [], error: '' },
         _donorSeq: 0,             // Guards against stale length-donor responses
+        _movementsSeq: 0,         // Guards against stale side-split measurements
+        titleSource: null,        // movements borrowed from another release (workspace field; sent as title_source on export)
+        movementsPanel: { open: false, input: '', loading: false, error: '', donor: null,
+            replacePosition: '', donorPosition: '', starts: [], splitNote: '' },
         searchSeq: 0,             // Guards against stale search responses
         searchedQuery: '',        // Query the shown results came from ("Load more" continues it, not the edited box)
         searchPage: 0,            // Discogs result pages fetched for it
@@ -663,6 +746,8 @@ function vinylApp() {
                 format: state.outputFormat, rumble: state.rumbleFilter, declick: state.declick,
                 hum: state.humFilter, frequency: state.humFreq, hiss: state.hissReduction,
                 gain: state.albumGain, replaygain: state.replaygain, depth: state.bitDepth,
+                prefixPartTitles: state.prefixPartTitles !== false,
+                titleSource: state.titleSource || null,
                 outputDir: this.config.output_dir
             });
         },
@@ -861,7 +946,12 @@ function vinylApp() {
                 output_format: state.outputFormat, rumble_filter: state.rumbleFilter, declick: state.declick,
                 hum_filter: state.humFilter, hum_freq: state.humFreq, hiss_reduction: state.hissReduction,
                 album_gain: state.albumGain, replaygain: state.replaygain !== false, bit_depth: state.bitDepth,
-                custom_tracks: this.customTracksPayload(state.selectedRelease)
+                custom_tracks: this.customTracksPayload(state.selectedRelease),
+                prefix_part_titles: state.prefixPartTitles !== false,
+                // Contract: only these four keys (label/work are display-only workspace fields).
+                ...(state.titleSource ? { title_source: {
+                    release_id: state.titleSource.release_id, replace_position: state.titleSource.replace_position,
+                    donor_position: state.titleSource.donor_position, assignments: state.titleSource.assignments } } : {})
             };
         },
 
@@ -1711,6 +1801,8 @@ function vinylApp() {
             this.resetSearchResults();
             this.detailsSettled = false;
             this.selectedRelease = null;
+            this.titleSource = null;
+            this.closeMovementsPanel();
             this.trackForm = null;
             this.resetDonors();
             this.selectedSides = [];
@@ -2254,6 +2346,12 @@ function vinylApp() {
         },
 
         parseDiscogsRelease,
+        normalizeWorkTitle,
+        workTitlesMatch: (first, second) => workTitleMatchScore(first, second) > 0,
+        slotGroups,
+        borrowedPositions,
+        defaultMovementSplit,
+        ALL_DONOR_TRACKS: MOVEMENTS_ALL_DONOR_TRACKS,
 
         /** Select the exact release the user named by ID or link, skipping search. */
         async openReleaseById() {
@@ -2816,6 +2914,9 @@ function vinylApp() {
             if (this.analyzing || this.currentLocked) return;
 
             this.selectedRelease = release;
+            this.prefixPartTitles = true;  // a per-release choice
+            this.titleSource = null;       // borrowed movements belong to the previous release
+            this.closeMovementsPanel();
             this.resetDonors();
             const suggestion = this.suggestSides(
                 release,
@@ -3101,6 +3202,13 @@ function vinylApp() {
             });
         },
 
+        /** The first split work's first part as it will be titled, for the prefix checkbox; or ''. */
+        get partPrefixExample() {
+            const first = this.indexTracks.find(entry => entry.unfolded);
+            const part = first?.umbrella.parts[0];
+            return part ? this.partDisplayTitle({ title: part.title, umbrella: first.umbrella }) : '';
+        },
+
         /**
          * Replace an index track by its parts (or the parts by the index track),
          * re-detect for the new track count (or ask first after hand edits), offer Undo.
@@ -3149,6 +3257,354 @@ function vinylApp() {
             if (this.selectedRelease?.id === releaseId) this.afterTargetsChanged();
         },
 
+        /* ---- Movements from another release (plan 14) ----
+         * The primary release keeps everything release-level; one work (or plain track) of it is replaced
+         * by the movements of a work in a second release.  The tracks are ordinary release tracks (an
+         * unfolded umbrella, or plain tracks), so detection, mapping, rename and fold/unfold need nothing
+         * new; `titleSource` is what the export sends so the backend can resolve titles and credits. */
+
+        /**
+         * Offered while a release is chosen, the recording is editable and nothing is borrowed yet, and only
+         * when it can help: the release has an index track (a work), or detection disagrees with its track count.
+         */
+        get canUseMovements() {
+            return !!this.selectedRelease && !this.currentLocked && !this.titleSource &&
+                (this.indexTracks.length > 0 || this.trackCountMismatch);
+        },
+
+        openMovementsPanel() {
+            if (!this.canUseMovements) return;
+            this._movementsSeq++;
+            this.movementsPanel = { open: true, input: '', loading: false, error: '', donor: null,
+                replacePosition: '', donorPosition: '', starts: [], splitNote: '' };
+        },
+
+        closeMovementsPanel() {
+            this._movementsSeq++;
+            this.movementsPanel = { open: false, input: '', loading: false, error: '', donor: null,
+                replacePosition: '', donorPosition: '', starts: [], splitNote: '' };
+        },
+
+        /** The muted Release-card line while movements are borrowed. */
+        get movementsLine() {
+            return this.titleSource ? `Movements of ${this.titleSource.work} from ${this.titleSource.label}` : '';
+        },
+
+        /**
+         * Works of the selected release that can be replaced: index tracks (folded, or unfolded into
+         * their parts) and plain tracks, in release order.  `slots` are the positions the work occupies,
+         * `start`/`count` its entries in release.tracks.
+         */
+        replaceableWorks(release = this.selectedRelease) {
+            const works = [];
+            (release?.tracks || []).forEach((track, index) => {
+                if (track.parts?.length) {
+                    works.push({ position: track.position, title: track.title, slots: track.parts.map(part => part.position),
+                        folded: true, start: index, count: 1 });
+                } else if (track.umbrella) {
+                    const last = works[works.length - 1];
+                    if (last && !last.folded && last.position === track.umbrella.position && last.title === track.umbrella.title) last.count++;
+                    else works.push({ position: track.umbrella.position, title: track.umbrella.title,
+                        slots: track.umbrella.parts.map(part => part.position), folded: false, start: index, count: 1 });
+                } else {
+                    works.push({ position: track.position, title: track.title, slots: [track.position], folded: true, start: index, count: 1 });
+                }
+            });
+            return works;
+        },
+
+        get replaceOptions() {
+            return this.replaceableWorks().map(work => ({ value: work.position, label: `${work.position} \u00b7 ${work.title}` }));
+        },
+
+        get donorMovementOptions() {
+            const donor = this.movementsPanel.donor;
+            if (!donor) return [];
+            const umbrellas = donor.tracks.filter(track => track.parts?.length).map(track => ({
+                value: track.position,
+                label: `${track.title} \u00b7 ${track.parts.length} movement${track.parts.length === 1 ? '' : 's'}` }));
+            return [...umbrellas, { value: MOVEMENTS_ALL_DONOR_TRACKS, label: `All tracks (${donor.tracks.length})` }];
+        },
+
+        /** The donor's chosen umbrella (or null for "All tracks"). */
+        get donorUmbrella() {
+            const panel = this.movementsPanel;
+            if (!panel.donor || panel.donorPosition === MOVEMENTS_ALL_DONOR_TRACKS) return null;
+            return panel.donor.tracks.find(track => track.parts?.length && track.position === panel.donorPosition) || null;
+        },
+
+        /** Movements on offer: the umbrella's parts, or the donor's top-level tracks. */
+        get donorMovements() {
+            const panel = this.movementsPanel;
+            if (!panel.donor) return [];
+            return this.donorUmbrella ? this.donorUmbrella.parts : panel.donor.tracks;
+        },
+
+        get replacedWork() {
+            return this.replaceableWorks().find(work => work.position === this.movementsPanel.replacePosition) || null;
+        },
+
+        /** "Side B starts with" choices for boundary `boundary`: movement 2..n with its start time when known. */
+        splitOptions(boundary) {
+            const movements = this.donorMovements;
+            let clock = 0, known = true;
+            const options = [];
+            movements.forEach((movement, index) => {
+                if (index > 0) {
+                    options.push({ value: index, label: `${index + 1} \u00b7 ${movement.title}` + (known ? ` (starts ${this.formatClock(clock)})` : '') });
+                }
+                const seconds = this.parseTrackDuration(movement.duration);
+                if (seconds === null) known = false; else clock += seconds;
+            });
+            return options;
+        },
+
+        /** Sides the replaced work crosses, e.g. ['A', 'B']; the split editor shows when there are several. */
+        get movementSides() {
+            return this.replacedWork ? slotGroups(this.replacedWork.slots).map(group => group.side) : [];
+        },
+
+        /**
+         * Validated result of the current panel choices: new positions, preview rows, and an error
+         * (inline, no apply) when a side would get no movement or a new position is already taken.
+         */
+        get movementsPlan() {
+            const panel = this.movementsPanel, work = this.replacedWork, movements = this.donorMovements;
+            const none = { ok: false, error: '', rows: [], preview: [], positions: [], counts: [] };
+            if (!panel.donor || !work || !movements.length) return none;
+            const groups = slotGroups(work.slots);
+            if (movements.length < groups.length) return { ...none, error: `${work.title} spans ${groups.length} sides and needs at least ${groups.length} movements.` };
+            const bounds = [0, ...panel.starts.map(Number), movements.length];
+            const counts = bounds.slice(1).map((bound, i) => bound - bounds[i]);
+            if (counts.length !== groups.length || counts.some(count => count < 1)) {
+                return { ...none, error: 'Each side needs at least one movement, in order.' };
+            }
+            const positions = borrowedPositions(work.slots, counts);
+            const own = new Set([work.position, ...work.slots]);
+            const taken = new Set([...this.releasePositions()].filter(position => !own.has(position)));
+            const clash = positions.find(position => taken.has(position));
+            if (clash) return { ...none, error: `${clash} is already used by another track on this release.` };
+            const umbrella = this.donorUmbrella;
+            const rows = movements.map((movement, i) => ({ position: positions[i], source: movement.position, title: movement.title, duration: movement.duration || '' }));
+            const label = row => `${row.position} \u00b7 ${umbrella ? this.partDisplayTitle({ title: row.title, umbrella }) : row.title}`;
+            const preview = rows.length <= 5 ? rows.map(label) : [...rows.slice(0, 3).map(label), '\u2026', label(rows[rows.length - 1])];
+            return { ok: true, error: '', rows, preview, positions, counts };
+        },
+
+        /** Fetch the donor release by link/number and preselect the matching works. */
+        async loadMovementsDonor() {
+            const panel = this.movementsPanel;
+            if (panel.loading || !this.selectedRelease) return;
+            const ref = parseDiscogsRelease(panel.input);
+            if (!ref) {
+                panel.error = 'Paste a Discogs release link (discogs.com/release/\u2026) or type its number, e.g. 9326206.';
+                return;
+            }
+            if (ref.master) {
+                panel.error = `That is a master release (all versions of the album). Open it on Discogs, pick the exact pressing whose titles you want, and paste that release's link.`;
+                return;
+            }
+            if (ref.id === this.selectedRelease.id) {
+                panel.error = 'That is the release you already selected. Paste a different release to borrow its movements.';
+                return;
+            }
+            panel.error = '';
+            panel.loading = true;
+            try {
+                const response = await fetch(`/api/release/${ref.id}`);
+                const data = await response.json().catch(() => ({}));
+                if (this.movementsPanel !== panel) return;
+                if (!response.ok || !Array.isArray(data.tracks)) {
+                    panel.error = response.status === 404
+                        ? `Discogs release ${ref.id} was not found (or Discogs is unavailable right now).`
+                        : `Couldn't load release ${ref.id}: ${data.detail || 'unknown error'}`;
+                    return;
+                }
+                if (!data.tracks.length) {
+                    panel.error = `Release ${ref.id} has no tracklist on Discogs.`;
+                    return;
+                }
+                panel.donor = data;
+                this.preselectMovementWorks();
+                await this.refreshMovementsSplit();
+            } catch (error) {
+                if (this.movementsPanel === panel) panel.error = `Couldn't reach the server to load release ${ref.id}.`;
+            } finally {
+                panel.loading = false;
+            }
+        },
+
+        /** Best normalized-title pair of (work to replace, donor umbrella); else the first umbrella of each. */
+        preselectMovementWorks() {
+            const panel = this.movementsPanel;
+            const works = this.replaceableWorks();
+            const umbrellas = panel.donor.tracks.filter(track => track.parts?.length);
+            let best = { score: 0, work: null, umbrella: null };
+            for (const work of works) {
+                for (const umbrella of umbrellas) {
+                    const score = workTitleMatchScore(work.title, umbrella.title);
+                    if (score > best.score) best = { score, work, umbrella };
+                }
+            }
+            const work = best.work || works.find(entry => entry.slots.length > 1 || !entry.folded) || works[0];
+            panel.replacePosition = work?.position || '';
+            panel.donorPosition = (best.umbrella || umbrellas[0])?.position ?? MOVEMENTS_ALL_DONOR_TRACKS;
+        },
+
+        /** The Replace / With selects changed: keep the pairing sensible and recompute the split default. */
+        async onMovementsChoiceChanged(changed) {
+            const panel = this.movementsPanel;
+            if (changed === 'replace' && panel.donor) {
+                const work = this.replacedWork;
+                const umbrella = panel.donor.tracks.filter(track => track.parts?.length)
+                    .find(track => work && workTitleMatchScore(work.title, track.title) > 0);
+                if (umbrella) panel.donorPosition = umbrella.position;
+            }
+            await this.refreshMovementsSplit();
+        },
+
+        /**
+         * Default for the "Side B starts with" selects: measured from the recording when possible,
+         * else proportional with a muted note.
+         */
+        async refreshMovementsSplit() {
+            const panel = this.movementsPanel, work = this.replacedWork, movements = this.donorMovements;
+            const sequence = ++this._movementsSeq;
+            panel.splitNote = '';
+            const groups = work ? slotGroups(work.slots) : [];
+            if (groups.length < 2 || !movements.length) { panel.starts = []; return; }
+            const durations = movements.map(movement => this.parseTrackDuration(movement.duration));
+            const targets = durations.every(seconds => seconds !== null) ? await this.measureMovementTargets(work) : null;
+            if (sequence !== this._movementsSeq || this.movementsPanel !== panel) return;
+            const counts = defaultMovementSplit(durations, targets, groups.length);
+            panel.starts = counts ? counts.slice(0, -1).map((count, i) => counts.slice(0, i + 1).reduce((sum, n) => sum + n, 0)) : [];
+            if (!targets) {
+                const sides = groups.slice(1).map(group => group.side);
+                panel.splitNote = `Couldn't measure where side${sides.length > 1 ? 's' : ''} ${sides.join(', ')} start${sides.length > 1 ? '' : 's'} \u2014 check the split.`;
+            }
+        },
+
+        /**
+         * Cumulative music seconds at the end of each side of `work` but the last, from the recording's
+         * side changes (GET /api/scan?side_changes=N): a side's length minus the other tracks on it, summed
+         * over the work's sides so far.  null when anything needed is missing (count of side changes,
+         * a side not selected, an unknown length).
+         */
+        async measureMovementTargets(work) {
+            const groups = slotGroups(work.slots);
+            const sideCount = this.selectedSides.length - 1;
+            if (groups.length < 2 || sideCount < 1 || !this.currentFileId) return null;
+            let scan;
+            try {
+                const response = await fetch(`/api/scan/${this.currentFileId}?side_changes=${sideCount}`);
+                if (!response.ok) return null;
+                scan = await response.json();
+            } catch (error) {
+                return null;
+            }
+            const changes = scan?.side_changes;
+            if (!scan?.ready || !Array.isArray(changes) || changes.length !== sideCount ||
+                !Number.isFinite(scan.music_start) || !Number.isFinite(scan.music_end)) return null;
+            const sideLength = index => {
+                const start = index === 0 ? scan.music_start : changes[index - 1]?.[1];
+                const end = changes[index] ? changes[index][0] : scan.music_end;
+                return Number.isFinite(start) && Number.isFinite(end) && end > start ? end - start : null;
+            };
+            const entrySeconds = track => {
+                const own = this.parseTrackDuration(track.duration);
+                if (own !== null || !track.parts?.length) return own;
+                const parts = track.parts.map(part => this.parseTrackDuration(part.duration));
+                return parts.every(seconds => seconds !== null) ? parts.reduce((sum, seconds) => sum + seconds, 0) : null;
+            };
+            const tracks = this.selectedRelease.tracks;
+            const workSides = groups.map(group => group.side);
+            if (new Set(workSides).size !== workSides.length) return null;
+            let cumulative = 0;
+            const targets = [];
+            for (const group of groups.slice(0, -1)) {
+                const sideIndex = this.selectedSides.indexOf(group.side);
+                const length = sideIndex < 0 ? null : sideLength(sideIndex);
+                if (length === null) return null;
+                let others = 0;
+                tracks.forEach((track, index) => {
+                    if (index >= work.start && index < work.start + work.count) return;
+                    if ((/^[A-Z]+/.exec(String(track.position).toUpperCase())?.[0] || '') !== group.side) return;
+                    const seconds = entrySeconds(track);
+                    others = seconds === null || others === null ? null : others + seconds;
+                });
+                if (others === null) return null;
+                cumulative += length - others;
+                targets.push(cumulative);
+            }
+            return targets;
+        },
+
+        /** Sum of movement lengths as Discogs text ("36:09"), or '' when any is unknown. */
+        movementsTotalText(movements) {
+            const seconds = movements.map(movement => this.parseTrackDuration(movement.duration));
+            return seconds.length && seconds.every(value => value !== null)
+                ? this.formatClock(seconds.reduce((sum, value) => sum + value, 0)) : '';
+        },
+
+        /**
+         * Replace the chosen work by the donor's movements in one copy-on-write edit (the release object
+         * may be shared with another recording), record `titleSource`, re-detect (or ask first after hand
+         * edits, like Keep as one track) and offer Undo.
+         */
+        applyMovements() {
+            const release = this.selectedRelease, panel = this.movementsPanel, work = this.replacedWork;
+            if (!release || !panel.donor || !work || this.analyzing || this.currentLocked || this.titleSource) return;
+            const plan = this.movementsPlan;
+            if (!plan.ok) return;
+            const before = { fileId: this.currentFileId, release, sides: [...this.selectedSides], titleSource: this.titleSource };
+            const donor = panel.donor, donorUmbrella = this.donorUmbrella;
+            const umbrella = donorUmbrella ? {
+                position: plan.positions[0], title: donorUmbrella.title, duration: this.movementsTotalText(donorUmbrella.parts),
+                parts: plan.rows.map(row => ({ position: row.position, title: row.title, duration: row.duration }))
+            } : null;
+            const newTracks = plan.rows.map(row => ({ position: row.position, title: row.title, duration: row.duration,
+                ...(umbrella ? { umbrella } : {}) }));
+            this.editReleaseCopy(edited => {
+                edited.tracks.splice(work.start, work.count);
+                for (const track of newTracks) {
+                    // Sorted place, same rule as addCustomTrack: after the last track that sorts at or before it.
+                    const key = this.positionKey(track.position);
+                    let at = 0;
+                    edited.tracks.forEach((existing, i) => {
+                        if (this.comparePositionKeys(this.positionKey(existing.position), key) <= 0) at = i + 1;
+                    });
+                    edited.tracks.splice(at, 0, track);
+                }
+            });
+            const workTitle = donorUmbrella ? donorUmbrella.title : work.title;
+            this.titleSource = {
+                release_id: donor.id, label: `${donor.artist} \u2013 ${donor.title}`, work: workTitle,
+                replace_position: work.position,
+                donor_position: donorUmbrella ? donorUmbrella.position : null,
+                assignments: plan.rows.map(row => ({ position: row.position, source: row.source }))
+            };
+            const after = this.selectedRelease;
+            this.closeMovementsPanel();
+            this.afterIndexChange(after.id, false);
+            this.notify(`Movements of \u201c${workTitle}\u201d from ${donor.id}.`, {
+                type: 'success', timeout: 8000,
+                action: {
+                    label: 'Undo',
+                    fn: () => {
+                        if (this.currentFileId !== before.fileId || this.selectedRelease !== after) {
+                            this.notify('Switch back to that recording to undo.', { type: 'warning', timeout: 6000 });
+                            return;
+                        }
+                        this.selectedRelease = before.release;
+                        this.titleSource = before.titleSource;
+                        this.selectedSides = before.sides;
+                        this.trackForm = null;
+                        this.afterIndexChange(before.release.id, false);
+                    }
+                }
+            });
+        },
+
         /**
          * Drop the selected release but keep search results and the current
          * detection/waveform so another release can be picked.
@@ -3156,6 +3612,8 @@ function vinylApp() {
         changeRelease() {
             if (this.currentLocked) return;
             this.selectedRelease = null;
+            this.titleSource = null;
+            this.closeMovementsPanel();
             this.trackForm = null;
             this.resetDonors();
             this.selectedSides = [];
@@ -3259,11 +3717,41 @@ function vinylApp() {
                 this.trackForm.fileId === this.currentFileId) { this.trackForm = null; return; }
             const mapped = this.mappedTrack(idx);
             if (mode === 'edit' && !mapped) return;
+            // Rows (their detected-track numbers) that also use the entry being edited. A renamed title
+            // would show on all of them, so a shared entry saves a new custom track for this row instead.
+            const sharedWith = mode === 'edit' ? this.otherRowsOnTrack(idx) : [];
             this.trackForm = {
-                fileId: this.currentFileId, idx, mode, error: '',
-                position: mode === 'add' ? this.suggestCustomPosition(idx) : mapped.position,
+                fileId: this.currentFileId, idx, mode, error: '', sharedWith,
+                originalPosition: mode === 'edit' ? mapped.position : '',
+                position: mode === 'add' || sharedWith.length ? this.suggestCustomPosition(idx) : mapped.position,
                 title: mode === 'add' ? '' : mapped.title
             };
+        },
+
+        /** Numbers of the other, non-ignored detected tracks mapped to the same release entry as row idx. */
+        otherRowsOnTrack(idx) {
+            const releaseIdx = Number(this.customMapping[idx]);
+            const numbers = [];
+            this.customMapping.forEach((m, i) => {
+                if (i !== idx && Number(m) === releaseIdx && !this.detectedTracks[i]?.ignored) {
+                    numbers.push(this.detectedTracks[i].number);
+                }
+            });
+            return numbers;
+        },
+
+        /** The edit form's position field is only editable for a custom track or a new track for a shared row. */
+        trackFormPositionLocked() {
+            const form = this.trackForm;
+            if (!form || form.mode === 'add' || form.sharedWith?.length) return false;
+            return !this.mappedTrack(form.idx)?.custom;
+        },
+
+        /** Note under the edit form explaining a shared track. */
+        sharedTrackNote() {
+            const numbers = this.trackForm?.sharedWith || [];
+            if (!numbers.length) return '';
+            return `Also used by ${numbers.length === 1 ? 'track' : 'tracks'} ${numbers.join(', ')}. Save adds a new track for this row only.`;
         },
 
         closeTrackForm() { this.trackForm = null; },
@@ -3277,9 +3765,25 @@ function vinylApp() {
         submitTrackForm() {
             const form = this.trackForm;
             if (!form) return;
-            const error = form.mode === 'add'
-                ? this.addCustomTrack(form.idx, form.position, form.title)
-                : this.renameTrack(Number(this.customMapping[form.idx]), form.title);
+            const releaseIdx = Number(this.customMapping[form.idx]);
+            const normalizedPosition = String(form.position || '').trim().toUpperCase();
+            let error;
+            if (form.mode === 'add' || form.sharedWith?.length) {
+                error = this.addCustomTrack(form.idx, form.position, form.title);
+            } else if (this.mappedTrack(form.idx)?.custom && normalizedPosition !== form.originalPosition) {
+                error = this.editCustomTrack(releaseIdx, form.position, form.title);
+            } else {
+                error = this.renameTrack(releaseIdx, form.title);
+            }
+            form.error = error;
+            if (!error) this.trackForm = null;
+        },
+
+        /** "Rename all N" on a shared track: retitle the shared entry, as before. */
+        renameAllSharedTracks() {
+            const form = this.trackForm;
+            if (!form) return;
+            const error = this.renameTrack(Number(this.customMapping[form.idx]), form.title);
             form.error = error;
             if (!error) this.trackForm = null;
         },
@@ -3394,6 +3898,49 @@ function vinylApp() {
             return '';
         },
 
+        /**
+         * Give a custom track a new position and title in one edit: it moves to its sorted place, every row
+         * keeps pointing at the same track, sides follow. Returns an error message, or ''.
+         */
+        editCustomTrack(releaseIdx, positionText, titleText) {
+            const tracks = this.selectedRelease?.tracks || [];
+            const track = tracks[releaseIdx];
+            if (!track?.custom || this.currentLocked) return 'Not available right now.';
+            const position = String(positionText || '').trim().toUpperCase();
+            const title = String(titleText || '').trim();
+            if (!CUSTOM_POSITION_RE.test(position)) return 'Position needs a side letter and a number, like B5.';
+            const takenByOthers = this.releasePositions();
+            takenByOthers.delete(track.position);
+            if (takenByOthers.has(position)) return `${position} is already on this release.`;
+            if (!title) return 'Enter a title.';
+            if (title.length > CUSTOM_TITLE_MAX) return `Keep the title under ${CUSTOM_TITLE_MAX} characters.`;
+
+            const before = { fileId: this.currentFileId, release: this.selectedRelease,
+                mapping: [...this.customMapping], sides: [...this.selectedSides] };
+            const key = this.positionKey(position);
+            // order[newIndex] = oldIndex: the other entries keep their order, this one goes to its sorted place.
+            const order = tracks.map((_, i) => i).filter(i => i !== releaseIdx);
+            let at = 0;
+            order.forEach((oldIdx, n) => {
+                if (this.comparePositionKeys(this.positionKey(tracks[oldIdx].position), key) <= 0) at = n + 1;
+            });
+            order.splice(at, 0, releaseIdx);
+            this.editReleaseCopy(release => {
+                const entry = release.tracks[releaseIdx];
+                entry.position = position;
+                entry.title = title;
+                release.tracks = order.map(oldIdx => release.tracks[oldIdx]);
+            });
+            this.customMapping = this.customMapping.map(m => order.indexOf(Number(m)));
+            const sides = this.sideChips.map(g => g.side);
+            const kept = this.selectedSides.filter(side => sides.includes(side));
+            if (!kept.includes(key[0]) && sides.includes(key[0])) kept.push(key[0]);
+            this.selectedSides = kept.length ? kept : sides;
+            this.afterReleaseEdit();
+            this.offerTrackUndo(`Moved ${track.position} to ${position} \u00b7 ${title}.`, before, this.selectedRelease);
+            return '';
+        },
+
         /** Put a renamed Discogs track's title back. */
         resetRenamedTrack(releaseIdx) {
             const track = this.selectedRelease?.tracks?.[releaseIdx];
@@ -3444,9 +3991,24 @@ function vinylApp() {
             return out;
         },
 
+        /**
+         * Title as it will be exported: a split index-track part (it has `umbrella`) reads
+         * "Work: Part" while prefixPartTitles is on.  Mirrors MetadataHandler._part_title
+         * (a part already starting with the work title, case-insensitively, is kept as is;
+         * empty titles fall back to the other one).  Display only: edit forms and
+         * customTracksPayload use the bare `title`.
+         */
+        partDisplayTitle(track) {
+            const partTitle = String(track?.title ?? '');
+            const workTitle = String(track?.umbrella?.title ?? '');
+            if (!track?.umbrella || !this.prefixPartTitles) return partTitle;
+            if (!workTitle || partTitle.toLowerCase().startsWith(workTitle.toLowerCase())) return partTitle || workTitle;
+            return partTitle ? `${workTitle}: ${partTitle}` : workTitle;
+        },
+
         /** Label for the mapping dropdown: "B5 · Title", marked when custom or renamed. */
         trackOptionLabel(dt) {
-            return `${dt.position} \u00b7 ${dt.title}${dt.custom ? ' \u00b7 custom' : dt.renamed ? ' \u00b7 renamed' : ''}`;
+            return `${dt.position} \u00b7 ${this.partDisplayTitle(dt)}${dt.custom ? ' \u00b7 custom' : dt.renamed ? ' \u00b7 renamed' : ''}`;
         },
 
         /**
@@ -3725,6 +4287,7 @@ function vinylApp() {
 
                 this.waveformRegions = markRaw(this.waveform.registerPlugin(WaveSurfer.Regions.create()));
                 this.tameRegionDragScroll(waveform, this.waveformRegions);
+                this.guardRegionDragRelease(this.waveformRegions);
                 this.bindWaveScrollbar(waveform);
 
                 const peaksResponse = await fetch(`/api/waveform-peaks/${this.currentFileId}`);
@@ -3894,6 +4457,41 @@ function vinylApp() {
                     ? region.start * pxPerSec - margin
                     : region.end * pxPerSec - (view.clientWidth - margin);
             };
+        },
+
+        /**
+         * The regions plugin ends a drag only on a document pointerup/pointercancel and its
+         * pointermove never checks `buttons`; a second pointerdown on the same element also
+         * overwrites the remover of the first drag's listeners. If a pointerup is lost (macOS
+         * Ctrl+click opening our context menu, a fast double-click) the region stays glued to
+         * the pointer. This ends such a drag with a synthetic document pointerup: when a
+         * press arrives while one is still active, or a move arrives with no button held.
+         * Document listeners are installed once per app, however often the waveform reloads.
+         */
+        guardRegionDragRelease(regions) {
+            if (!this._regionDragGuard) {
+                const guard = this._regionDragGuard = markRaw({ active: false });
+                guard.endDrag = event => {
+                    guard.active = false;
+                    const init = { bubbles: true, clientX: event.clientX, clientY: event.clientY };
+                    document.dispatchEvent(typeof PointerEvent === 'function'
+                        ? new PointerEvent('pointerup', init) : new MouseEvent('pointerup', init));
+                };
+                document.addEventListener('pointermove', event => {
+                    if (guard.active && event.buttons === 0) guard.endDrag(event);
+                }, true);
+                // Real or synthetic releases both clear the flag
+                for (const type of ['pointerup', 'pointercancel']) {
+                    document.addEventListener(type, () => { guard.active = false; }, true);
+                }
+            }
+            const guard = this._regionDragGuard;
+            // Capture phase: runs before the plugin's own (and the resize handles') listeners
+            regions.on?.('region-created', region => region.element?.addEventListener('pointerdown', event => {
+                if (event.button !== 0) return;
+                if (guard.active) guard.endDrag(event);
+                guard.active = true;
+            }, true));
         },
 
         /** Track WaveSurfer's scroll position (its scroll element wraps the waveform wrapper). */
@@ -4317,7 +4915,7 @@ function vinylApp() {
             let base = `Track ${track.number}`;
             const dt = this.mappedTrack(this.detectedTracks.indexOf(track));
             if (dt) {
-                const title = String(dt.title ?? '');
+                const title = this.partDisplayTitle(dt);
                 const short = title.length > REGION_TITLE_MAX
                     ? title.slice(0, REGION_TITLE_MAX - 1).trimEnd() + '…'
                     : title;

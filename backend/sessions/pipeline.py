@@ -40,7 +40,7 @@ from audio_processor import (
     format_replaygain_peak,
     replaygain_gain_db,
 )
-from metadata_handler import MetadataHandler, with_custom_tracks
+from metadata_handler import MetadataHandler, with_borrowed_work, with_custom_tracks
 
 from .events import OutputSpec, ProcessingRun, ProgressEvent
 from .session import Session, SessionState
@@ -73,6 +73,14 @@ def run(
         release = metadata_handler.get_release_by_id(release_id)
         if not release:
             raise RuntimeError("Failed to fetch Discogs release")
+        if spec.title_source:
+            # Borrowed movements first, so renames / custom tracks can still target them.
+            donor = metadata_handler.get_release_by_id(spec.title_source.release_id)
+            if not donor:
+                raise RuntimeError(
+                    f"Failed to fetch the title source release {spec.title_source.release_id} from Discogs"
+                )
+            release = with_borrowed_work(release, donor, spec.title_source)
         if spec.custom_tracks:
             release = with_custom_tracks(release, spec.custom_tracks)
 
@@ -143,10 +151,12 @@ def run(
                 temp_output, track, release, cover_data, spec.output_format,
                 track_numbering=spec.track_numbering,
                 job_positions=job_positions,
+                prefix_part_titles=spec.prefix_part_titles,
             )
 
             final_filename = metadata_handler.create_track_filename(
-                track, release, spec.output_format, job_positions
+                track, release, spec.output_format, job_positions,
+                prefix_part_titles=spec.prefix_part_titles,
             )
             final_path = album_folder / final_filename
             temp_output.replace(final_path)

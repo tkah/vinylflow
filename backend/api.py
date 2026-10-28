@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 
 import logging
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
 from backend.security import SameOriginMiddleware
@@ -62,12 +62,15 @@ import silence_analysis
 from track_boundaries import (
     boundaries_from_expected_durations,
     guided_by_alignment,
+    find_side_changes,
     gaps_from_envelope,
     music_span,
+    smooth_envelope,
 )
 from metadata_handler import MetadataHandler
 from backend.sessions import (
     OutputSpec,
+    TitleSourceSpec,
     ProgressEvent,
     Session,
     SessionState,
@@ -342,6 +345,34 @@ class CustomTrack(BaseModel):
         return value
 
 
+MAX_TITLE_SOURCE_TRACKS = 200
+MAX_TITLE_SOURCE_POSITION = 32
+
+
+class TitleSourceAssignment(BaseModel):
+    """One borrowed movement/track: the position it gets on the primary and where it comes from."""
+    position: str = Field(min_length=1, max_length=12, pattern=CUSTOM_TRACK_POSITION)
+    source: str = Field(min_length=1, max_length=MAX_TITLE_SOURCE_POSITION)  # donor part / top-level position
+
+
+class TitleSource(BaseModel):
+    """Take a work's titles from another Discogs release (``metadata_handler.with_borrowed_work``)."""
+    release_id: int = Field(gt=0)
+    replace_position: str = Field(min_length=1, max_length=MAX_TITLE_SOURCE_POSITION)  # primary top-level track
+    donor_position: Optional[str] = Field(default=None, min_length=1, max_length=MAX_TITLE_SOURCE_POSITION)  # donor umbrella; None = plain tracks
+    assignments: List[TitleSourceAssignment] = Field(min_length=1, max_length=MAX_TITLE_SOURCE_TRACKS)
+
+
+def _title_source_spec(title_source: Optional[TitleSource]) -> Optional[TitleSourceSpec]:
+    """Immutable form of a request's title source for the OutputSpec."""
+    if title_source is None:
+        return None
+    return TitleSourceSpec(
+        title_source.release_id, title_source.replace_position, title_source.donor_position,
+        tuple((entry.position, entry.source) for entry in title_source.assignments),
+    )
+
+
 def _legacy_restore(level: Optional[int]) -> tuple:
     """Map the legacy ``restoration_level`` (0/1) to (rumble, declick)."""
     if level not in (0, 1):
@@ -388,6 +419,8 @@ class ProcessRequest(BaseModel):
     replaygain: bool = True      # write ReplayGain 2.0 track + album tags
     bit_depth: Optional[str] = None  # per-workspace depth; omitted uses the server default
     custom_tracks: Optional[List[CustomTrack]] = Field(default=None, max_length=MAX_CUSTOM_TRACKS)  # user-added tracks / renamed Discogs titles
+    prefix_part_titles: bool = True  # title split (index) track parts "Work: Movement"; False = bare part title
+    title_source: Optional[TitleSource] = None  # movements borrowed from another release
 
 
 class ConfigUpdate(BaseModel):
@@ -1115,9 +1148,15 @@ async def rescan_file(request: RescanRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+MAX_SIDE_CHANGES = 8  # most side flips a scan request may ask for
+
+
 @app.get("/api/scan/{file_id}")
-async def get_scan(file_id: str):
-    """Music span from the background envelope scan; never blocks on it."""
+async def get_scan(file_id: str, side_changes: int = Query(0, ge=0, le=MAX_SIDE_CHANGES)):
+    """Music span from the background envelope scan; never blocks on it.
+
+    ``side_changes=N`` (> 0) also returns ``side_changes: [[start, end], ...]``, the N longest
+    non-music stretches inside the music span in time order (fewer when the record has fewer)."""
     session = session_store.get(file_id)
     if session is None:
         raise HTTPException(status_code=404, detail="File not found")
@@ -1131,12 +1170,18 @@ async def get_scan(file_id: str):
         return {"ready": False}
 
     start, end = music_span(db, ENVELOPE_FRAME_S)
-    return {
+    scan = {
         "ready": True,
         "music_start": start,
         "music_end": end,
         "music_duration": max(0.0, end - start),
     }
+    if side_changes > 0:
+        # Smoothing a long recording's envelope takes a moment: keep it off the event loop
+        stretches = await asyncio.to_thread(
+            lambda: find_side_changes(smooth_envelope(db, ENVELOPE_FRAME_S), ENVELOPE_FRAME_S, start, end, side_changes))
+        scan["side_changes"] = [[round(c.start, 2), round(c.end, 2)] for c in stretches]
+    return scan
 
 
 @app.post("/api/analyze-guided")
@@ -1894,6 +1939,8 @@ def _output_spec(request: ProcessRequest, noise_profile=None) -> OutputSpec:
         track_numbering=config.track_numbering,
         bit_depth=request.bit_depth or config.bit_depth,
         custom_tracks=tuple((entry.position, entry.title) for entry in request.custom_tracks or []),
+        prefix_part_titles=request.prefix_part_titles,
+        title_source=_title_source_spec(request.title_source),
     )
 
 
@@ -1924,6 +1971,11 @@ async def process_album(request: AlbumProcessRequest):
             if merged_custom.setdefault(entry.position, entry.title) != entry.title:
                 raise HTTPException(status_code=400, detail=f"Recordings disagree on the title of {entry.position}.")
     shared_custom = tuple(merged_custom.items())
+    # Likewise one title source: tags and numbering must agree across recordings.
+    title_sources = {_title_source_spec(item.title_source) for item in request.files} - {None}
+    if len(title_sources) > 1:
+        raise HTTPException(status_code=400, detail="Recordings disagree on the title source.")
+    shared_title_source = next(iter(title_sources), None)
     members = []
     positions = set()
     file_ids = set()
@@ -1955,7 +2007,7 @@ async def process_album(request: AlbumProcessRequest):
             if not position or position in positions:
                 raise HTTPException(status_code=400, detail="Album positions must be nonempty and unique across recordings.")
             positions.add(position)
-        members.append(AlbumMember(session, replace(_output_spec(item), custom_tracks=shared_custom), item.release_id))
+        members.append(AlbumMember(session, replace(_output_spec(item), custom_tracks=shared_custom, title_source=shared_title_source), item.release_id))
     # No await before all validations/reservations: competing requests cannot split the group.
     for member, item in zip(members, request.files):
         member.session.set_boundaries(list(item.track_boundaries))
