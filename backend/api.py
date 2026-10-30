@@ -214,6 +214,14 @@ def get_session_path(file_id: str, filename: str = None) -> Path:
     return session_dir if filename is None else session_dir / filename
 
 
+def _forget_session_tasks(file_id: str) -> None:
+    """Drop a removed Session's in-memory background work (envelope, silence
+    analysis, click scans; a running click scan is cancelled)."""
+    _envelope_tasks.pop(file_id, None)
+    _analysis_tasks.pop(file_id, None)
+    _drop_click_scans(file_id)
+
+
 def cleanup_session(file_id: str) -> bool:
     """Drop a Session and its on-disk source folder."""
     session = session_store.get(file_id)
@@ -233,9 +241,7 @@ def cleanup_session(file_id: str) -> bool:
         session_store.remove(file_id)
         return False
     finally:
-        _envelope_tasks.pop(file_id, None)
-        _analysis_tasks.pop(file_id, None)
-        _drop_click_scans(file_id)
+        _forget_session_tasks(file_id)
 
 
 def reap_expired() -> None:
@@ -246,6 +252,7 @@ def reap_expired() -> None:
     # Drop stale Sessions (the store skips PROCESSING entries),
     # then remove their on-disk source folders.
     for sid in session_store.reap_stale(ttl_hours=ttl):
+        _forget_session_tasks(sid)
         session_dir = get_session_path(sid)
         if session_dir.exists():
             shutil.rmtree(session_dir, ignore_errors=True)
