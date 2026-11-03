@@ -1349,7 +1349,10 @@
                                                 <span x-show="track.editing">✓ Done</span>
                                             </button>
                                             <button @click="toggleTrackIgnored(track)" class="px-2 py-1 rounded text-xs text-primary" style="background-color: #F0EFEB;" :style="track.ignored ? 'background-color: #8A8A86; color: #FFFFFF;' : ''" title="Exclude this track from processing" x-text="track.ignored ? 'Ignored' : 'Ignore'"></button>
-                                            <button @click="deleteTrack(track.number)" class="px-2 py-1 btn-danger rounded text-xs" title="Delete this track">🗑️</button>
+                                            <button @click="deleteTrack(track.number)" class="px-2 py-1 btn-danger rounded text-xs" title="Delete this track" aria-label="Delete this track">
+                                                <!-- Outline icon in currentColor (white): the 🗑️ emoji ignored the button's colour and showed grey on red -->
+                                                <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" style="display: block;"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+                                            </button>
                                         </div>
                                     </div>
                                     <form x-show="trackFormShown(idx)" x-cloak @submit.prevent="submitTrackForm()" @keydown.escape="closeTrackForm()"
