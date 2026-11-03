@@ -15,7 +15,7 @@ import shutil
 import threading
 from pathlib import Path
 from subprocess import CalledProcessError
-from typing import List, Optional
+from typing import Annotated, List, Optional
 import asyncio
 import json
 from datetime import datetime, timedelta
@@ -1224,7 +1224,9 @@ MAX_SIDE_CHANGES = 8  # most side flips a scan request may ask for
 
 
 @app.get("/api/scan/{file_id}")
-async def get_scan(file_id: str, side_changes: int = Query(0, ge=0, le=MAX_SIDE_CHANGES)):
+# Annotated keeps a plain default of 0, so direct calls (tests/test_envelope_scan.py) work; a
+# Query(...) default would arrive there as a Query object.
+async def get_scan(file_id: str, side_changes: Annotated[int, Query(ge=0, le=MAX_SIDE_CHANGES)] = 0):
     """Music span from the background envelope scan; never blocks on it.
 
     ``side_changes=N`` (> 0) also returns ``side_changes: [[start, end], ...]``, the N longest
