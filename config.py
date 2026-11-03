@@ -147,6 +147,10 @@ class Config:
         self.replaygain = self._as_bool(
             json_settings.get("REPLAYGAIN", os.getenv("REPLAYGAIN")), True
         )
+        # Wikipedia lead paragraph in the Comment tag: off by default (no outbound traffic unasked)
+        self.album_description = self._as_bool(
+            json_settings.get("ALBUM_DESCRIPTION", os.getenv("ALBUM_DESCRIPTION")), False
+        )
 
     @staticmethod
     def _as_bool(value, default: bool) -> bool:
@@ -287,6 +291,9 @@ class Config:
 
     def save_replaygain(self, enabled: bool) -> bool:
         return self._write_settings({'REPLAYGAIN': bool(enabled)})
+
+    def save_album_description(self, enabled: bool) -> bool:
+        return self._write_settings({'ALBUM_DESCRIPTION': bool(enabled)})
 
     def reload(self):
         """

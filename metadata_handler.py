@@ -39,6 +39,7 @@ from release_credits import (
     performer_text,
     sole_artist_name,
 )
+from album_description import DIGITIZED_COMMENT, AlbumDescriptions
 from track_matching import match_tracklists
 
 
@@ -65,7 +66,7 @@ class TagSet:
     year: Optional[int]
     label: Optional[str]
     release_id: int
-    comment: str = "Digitized from vinyl"
+    comment: str = DIGITIZED_COMMENT
     cover_data: Optional[bytes] = None
     disc_number: Optional[str] = None
     vinyl_position: Optional[str] = None
@@ -484,6 +485,8 @@ class MetadataHandler:
         self._release_cache_lock = threading.Lock()
         self._donor_cache: dict = {}
         self._donor_cache_lock = threading.Lock()
+        # Independent of the Discogs token, so ``reinitialize`` leaves it (and its cache) alone.
+        self.album_descriptions = AlbumDescriptions()
 
     RELEASE_CACHE_SIZE = 128
     DONOR_VERSION_PAGES = 3  # max master-version pages read per search
@@ -843,6 +846,7 @@ class MetadataHandler:
         track_numbering: str = "vinyl",
         job_positions: Optional[List[str]] = None,
         prefix_part_titles: bool = True,
+        comment: Optional[str] = None,
     ) -> bool:
         """
         Write metadata tags to an audio file.
@@ -860,16 +864,17 @@ class MetadataHandler:
                 count over these.  Defaults to the release tracklist.
             prefix_part_titles: Title split (index) track parts "Work: Movement"
                 (True) or with the bare part title (False); WORK/TIT1 either way.
+            comment: Comment tag text; None keeps the default ("Digitized from vinyl").
 
         Returns:
             True if successful
         """
         if output_format == "flac":
-            return self._tag_flac(file_path, track, release, cover_data, track_numbering, job_positions, prefix_part_titles)
+            return self._tag_flac(file_path, track, release, cover_data, track_numbering, job_positions, prefix_part_titles, comment)
         elif output_format == "mp3":
-            return self._tag_mp3(file_path, track, release, cover_data, track_numbering, job_positions, prefix_part_titles)
+            return self._tag_mp3(file_path, track, release, cover_data, track_numbering, job_positions, prefix_part_titles, comment)
         elif output_format == "aiff":
-            return self._tag_aiff(file_path, track, release, cover_data, track_numbering, job_positions, prefix_part_titles)
+            return self._tag_aiff(file_path, track, release, cover_data, track_numbering, job_positions, prefix_part_titles, comment)
         else:
             print(f"Unsupported output format for tagging: {output_format}")
             return False
@@ -1025,6 +1030,7 @@ class MetadataHandler:
         track_numbering: str = "vinyl",
         processed_positions: Optional[List[str]] = None,
         prefix_part_titles: bool = True,
+        comment: Optional[str] = None,
     ) -> Optional[TagSet]:
         """Compute the TagSet for one track.  Returns None if the Discogs
         track lookup fails — caller treats that as a tag-write failure."""
@@ -1081,6 +1087,7 @@ class MetadataHandler:
             album_artist=album_artist,
             compilation=various,
             work=getattr(discogs_track, "work", None),
+            comment=comment or DIGITIZED_COMMENT,
             **classical,
         )
 
@@ -1217,6 +1224,12 @@ class MetadataHandler:
             print(f"Failed to write ReplayGain tags to {file_path}: {e}")
             return False
 
+    @staticmethod
+    def _comment_kwargs(comment: Optional[str]) -> dict:
+        """``comment=`` only when set, so the default call to ``_build_tag_set`` stays unchanged
+        (existing test doubles of it have a fixed positional signature)."""
+        return {"comment": comment} if comment else {}
+
     def _tag_flac(
         self,
         file_path: Path,
@@ -1226,8 +1239,12 @@ class MetadataHandler:
         track_numbering: str = "vinyl",
         job_positions: Optional[List[str]] = None,
         prefix_part_titles: bool = True,
+        comment: Optional[str] = None,
     ) -> bool:
-        tags = self._build_tag_set(track, release, cover_data, track_numbering, job_positions, prefix_part_titles)
+        tags = self._build_tag_set(
+            track, release, cover_data, track_numbering, job_positions, prefix_part_titles,
+            **self._comment_kwargs(comment),
+        )
         if tags is None:
             return False
         try:
@@ -1251,13 +1268,17 @@ class MetadataHandler:
         track_numbering: str = "vinyl",
         job_positions: Optional[List[str]] = None,
         prefix_part_titles: bool = True,
+        comment: Optional[str] = None,
     ) -> bool:
         """Shared ID3 tagger used by ``_tag_mp3`` and ``_tag_aiff``.
 
         ``open_audio(path)`` returns the Mutagen wrapper instance; the
         only difference between the MP3 and AIFF paths.
         """
-        tags = self._build_tag_set(track, release, cover_data, track_numbering, job_positions, prefix_part_titles)
+        tags = self._build_tag_set(
+            track, release, cover_data, track_numbering, job_positions, prefix_part_titles,
+            **self._comment_kwargs(comment),
+        )
         if tags is None:
             return False
         try:
@@ -1274,17 +1295,17 @@ class MetadataHandler:
             return False
 
     def _tag_mp3(self, file_path, track, release, cover_data=None, track_numbering="vinyl",
-                 job_positions=None, prefix_part_titles=True):
+                 job_positions=None, prefix_part_titles=True, comment=None):
         return self._tag_id3_format(
             file_path, track, release, cover_data, lambda p: MP3(p, ID3=ID3), track_numbering,
-            job_positions, prefix_part_titles,
+            job_positions, prefix_part_titles, comment,
         )
 
     def _tag_aiff(self, file_path, track, release, cover_data=None, track_numbering="vinyl",
-                  job_positions=None, prefix_part_titles=True):
+                  job_positions=None, prefix_part_titles=True, comment=None):
         return self._tag_id3_format(
             file_path, track, release, cover_data, AIFF, track_numbering, job_positions,
-            prefix_part_titles,
+            prefix_part_titles, comment,
         )
 
     def sanitize_filename(self, name: str) -> str:

@@ -79,3 +79,13 @@ def test_queue_keeps_terminal_album_errors_and_warnings_for_recovery(album_env):
     queued = {file['id']: file for file in client.get('/api/queue').json()['uploaded']}
     assert queued['0']['error'] == 'Synthetic failure'
     assert queued['0']['album_warnings'] == job.warnings
+
+
+def test_album_members_must_agree_on_album_description(album_env):
+    client, store, body = album_env
+    body['files'][0]['album_description'] = True
+    body['files'][1]['album_description'] = False
+    response = client.post('/api/process-album', json=body)
+    assert response.status_code == 400, response.text
+    assert 'album description' in response.json()['detail'].lower()
+    assert all(not session.export_reserved for session in store.list())

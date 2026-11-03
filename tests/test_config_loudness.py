@@ -48,3 +48,16 @@ def test_independent_of_other_fields(tmp_config):
 def test_validation_rejects_non_bool(tmp_config):
     assert client.put("/api/config", json={"album_gain": "maybe"}).status_code == 422
     assert client.put("/api/config", json={"replaygain": [1]}).status_code == 422
+
+
+def test_album_description_defaults_off_and_persists(tmp_config, tmp_path):
+    assert tmp_config.album_description is False
+    assert client.get("/api/config").json()["album_description"] is False
+    assert client.put("/api/config", json={"album_description": True}).json()["album_description"] is True
+    assert json.loads((tmp_path / "settings.json").read_text())["ALBUM_DESCRIPTION"] is True
+    assert client.get("/api/config").json()["album_description"] is True
+    reloaded = Config(env_path=tmp_path / ".env", settings_path=tmp_path / "settings.json")
+    assert reloaded.album_description is True
+    # Turning it back off must persist too (False is not "absent").
+    assert client.put("/api/config", json={"album_description": False}).json()["album_description"] is False
+    assert json.loads((tmp_path / "settings.json").read_text())["ALBUM_DESCRIPTION"] is False

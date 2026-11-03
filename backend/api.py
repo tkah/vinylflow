@@ -459,6 +459,7 @@ class ProcessRequest(BaseModel):
     replaygain: bool = True      # write ReplayGain 2.0 track + album tags
     bit_depth: Optional[str] = None  # per-workspace depth; omitted uses the server default
     custom_tracks: Optional[List[CustomTrack]] = Field(default=None, max_length=MAX_CUSTOM_TRACKS)  # user-added tracks / renamed Discogs titles
+    album_description: Optional[bool] = None  # Wikipedia lead paragraph in the Comment tag; None = server setting
     prefix_part_titles: bool = True  # title split (index) track parts "Work: Movement"; False = bare part title
     title_source: Optional[TitleSource] = None  # movements borrowed from another release
 
@@ -480,6 +481,7 @@ class ConfigUpdate(BaseModel):
     hiss_strength: Optional[str] = None      # remembered strength (light | medium | strong)
     album_gain: Optional[bool] = None
     replaygain: Optional[bool] = None
+    album_description: Optional[bool] = None
 
 
 class DiscogsSetupRequest(BaseModel):
@@ -1928,6 +1930,20 @@ async def get_release(release_id: int):
     return _serialize_release(release)
 
 
+@app.get("/api/release/{release_id}/description")
+async def get_release_description(release_id: int):
+    """The album's Wikipedia lead paragraph (cached); ``disabled`` without any lookup when the setting is off."""
+    if not config.album_description:
+        return {"status": "disabled"}
+    release = await asyncio.to_thread(metadata_handler.get_release_by_id, release_id)
+    if release is None:
+        raise HTTPException(status_code=404, detail="Release not found or Discogs unavailable")
+    result = await asyncio.to_thread(
+        metadata_handler.album_descriptions.lookup, release.id, getattr(release, "master_id", None)
+    )
+    return {"status": result.status, "text": result.text, "title": result.title, "url": result.url}
+
+
 @app.get("/api/release/{release_id}/length-donors")
 async def get_length_donors(release_id: int):
     """Other pressings (same master) whose track lengths match this release.
@@ -2025,6 +2041,9 @@ def _output_spec(request: ProcessRequest, noise_profile=None) -> OutputSpec:
         custom_tracks=tuple((entry.position, entry.title) for entry in request.custom_tracks or []),
         prefix_part_titles=request.prefix_part_titles,
         title_source=_title_source_spec(request.title_source),
+        album_description=(
+            config.album_description if request.album_description is None else request.album_description
+        ),
     )
 
 
@@ -2064,9 +2083,10 @@ async def process_album(request: AlbumProcessRequest):
     positions = set()
     file_ids = set()
     for item in request.files:
-        if (item.release_id, item.output_format, item.album_gain, item.replaygain) != (
-                reference.release_id, reference.output_format, reference.album_gain, reference.replaygain):
-            raise HTTPException(status_code=400, detail="Use the same release, format, album gain and ReplayGain choices for an album group.")
+        if (item.release_id, item.output_format, item.album_gain, item.replaygain, item.album_description) != (
+                reference.release_id, reference.output_format, reference.album_gain, reference.replaygain,
+                reference.album_description):
+            raise HTTPException(status_code=400, detail="Use the same release, format, album gain, ReplayGain and album description choices for an album group.")
         session = session_store.get(item.file_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Recording not found")
@@ -2338,6 +2358,7 @@ async def get_config():
         "hiss_strength": config.hiss_strength,
         "album_gain": config.album_gain,
         "replaygain": config.replaygain,
+        "album_description": config.album_description,
     }
 
 
@@ -2406,6 +2427,9 @@ async def update_config(updates: ConfigUpdate):
     if updates.replaygain is not None:
         config.replaygain = updates.replaygain
         config.save_replaygain(updates.replaygain)
+    if updates.album_description is not None:
+        config.album_description = updates.album_description
+        config.save_album_description(updates.album_description)
 
     return await get_config()
 

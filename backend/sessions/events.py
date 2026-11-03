@@ -51,6 +51,9 @@ class OutputSpec:
     # Title split (index) track parts "Work: Movement"; False = the bare part title
     # (WORK/TIT1 tags are written either way).
     prefix_part_titles: bool = True
+    # Look up the album's Wikipedia lead paragraph for the Comment tag. Off on the spec so
+    # callers that build one directly never touch the network; api._output_spec resolves the setting.
+    album_description: bool = False
 
 
 @dataclass(frozen=True)

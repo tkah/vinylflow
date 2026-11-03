@@ -138,6 +138,7 @@ vinylflow/
 ├── silence_analysis.py     # Hum detector (50/60 Hz + harmonics) + surface-noise profile, from the silent stretches only
 ├── metadata_handler.py     # Discogs fetch, cover art download, audio tagging
 ├── release_credits.py      # Pure Discogs artist names, join strings, credit roles (allowlist) and track ranges
+├── album_description.py    # Wikipedia lead paragraph for the Comment tag, found via Wikidata by Discogs master/release id (cached)
 ├── desktop_launcher.py     # Entry point — sets up dirs/env vars, starts FastAPI, opens window
 ├── VinylFlow.spec          # PyInstaller spec (macOS .app + Windows .exe)
 ├── requirements.txt
@@ -209,6 +210,7 @@ audio_processor.py  metadata_handler.py  config.py    Discogs API
 | GET | `/api/audio/{file_id}` | Range playback; waveform uses `?precise=true` for source WAV, AIFF keeps the pinned preview fallback |
 | POST | `/api/search` | Discogs search `{query, max_results, page}` -> `{results, has_more}`; 12 per page in the UI, "Load more" up to `SEARCH_MAX_PAGES` (3) fetches per query. The page size is set on the result list, never as a `per_page` search field (the library appends its own, so Discogs got two) |
 | GET | `/api/release/{release_id}` | Full release + tracklist (cached) |
+| GET | `/api/release/{release_id}/description` | `{status: found/none/error, text, title, url}` (album's Wikipedia lead paragraph; `{status: disabled}` without a lookup when the setting is off) |
 | GET | `/api/release/{release_id}/length-donors` | Other pressings of the same master with matching track lengths (rate-limited, <=12 fetches, cached; progress via WS `donor_progress`) |
 | POST | `/api/process` | Start background processing job |
 | GET | `/api/process/{job_id}` | Poll job status |
@@ -349,12 +351,14 @@ Besides silence detection and `track_numbering`/`output_dir`:
 | `hiss_reduction` / `hiss_strength` | `off` (default) / `light` / `medium` / `strong`; remembered strength default `light` | `afftdn` (`HISS_PRESETS` nr 6/12/20 dB). The UI toggle is off ↔ `hiss_strength`; choosing a strength sets both; `PUT` with `hiss_reduction` wins over `hiss_strength` in the same request. Keys `HISS_REDUCTION` / `HISS_STRENGTH` |
 | `album_gain` | bool, default off | One gain for the whole album |
 | `replaygain` | bool, default on | ReplayGain 2.0 tags |
+| `album_description` | bool, default off | Wikipedia lead paragraph in the Comment tag (key `ALBUM_DESCRIPTION`). Only the backend contacts Wikidata/Wikipedia. `ProcessRequest.album_description` None = this setting; `OutputSpec.album_description` defaults False; album members must agree |
 | `bit_depth` | `"source"` (default) / `"24"` | FLAC/AIFF depth. Source depth is probed at upload; unknown -> 24 (never truncates). 16-bit targets get triangular dither only when processing runs (rumble / hum / declick / hiss / gain); unprocessed 16->16 stays bit-exact. MP3 unaffected |
 
 ## Tags
 
 - Built once per file (`MetadataHandler._build_tag_set` -> `TagSet`), written by `_apply_vorbis` (FLAC) / `_apply_id3` (MP3, AIFF). Unknown values are omitted, never written empty.
 - Artist names: Discogs join strings ("&", ","; fallback ", "), disambiguation suffix stripped ("Nirvana (2)" -> "Nirvana"; also the album folder name). ALBUMARTIST/TPE2 always (release artist, or "Various Artists").
+- COMMENT / COMM: "Digitized from vinyl", or with the `album_description` setting on, the album's English Wikipedia lead paragraph + LF + "Digitized from vinyl" (`album_description.compose_comment`). Lookup: Wikidata `haswbstatement:P1954=<master>` (else `P2206=<release>` only when the master search has no hits) -> exactly one item with an enwiki sitelink (several = none, never guessed) -> REST `page/summary` (`type == "standard"`). In-memory LRU per release id (`found`/`none` cached, `error` retried; lock never held across HTTP), 12 s chain budget, stops at the first connection error. The pipeline looks it up for the primary release (before title source / custom tracks) and passes `comment=` to `tag_file` only when found; an error is a `Warning:` progress event, never a failed job. Release card preview: `loadAlbumDescription` (from `selectRelease`, `restoreWorkspace`, `saveConfig`, Retry; stale replies dropped), shown only while `albumDescription.releaseId === selectedRelease.id`.
 - Default numbering is `sequential_disc_per_lp`: DISCNUMBER + TRACKNUMBER with `TRACKTOTAL`/`DISCTOTAL` (ID3 `n/total`). Numbering follows the release tracklist plus the exported positions (`OutputSpec.job_positions`), so a side exported on its own continues after side A; a skipped track leaves a gap. DISCTOTAL = LPs in the release. `vinyl` mode writes no totals.
 - Compilations (release artist Various): ARTIST = the track's own Discogs artist(s), ALBUMARTIST "Various Artists", `COMPILATION=1` / `TCMP`.
 - Classical (release genre "Classical"): COMPOSER/TCOM from composer credits (else the release artist when Discogs lists exactly one; "Beethoven – Karajan, BPO" names performers too, so no guess), ARTIST = soloists, then ensembles, then conductor credited on the track (else release artist), CONDUCTOR/TPE3, ENSEMBLE (TXXX), `PERFORMER=Name (Instrument)` / TMCL. Only the allowlisted performing roles in `release_credits.py` are tagged; credit track ranges ("A1 to A3", "B1, B2") are honoured (a credit on any movement of an unsplit index track covers the umbrella; "B1" covers B1a/B1.1), unresolvable ones cover nothing. "<voice> Vocals" roles count as performers.

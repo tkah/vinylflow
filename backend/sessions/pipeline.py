@@ -29,6 +29,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from album_description import STATUS_ERROR, STATUS_FOUND, compose_comment
 from audio_processor import (
     OUTPUT_FORMATS,
     target_bit_depth,
@@ -73,6 +74,10 @@ def run(
         release = metadata_handler.get_release_by_id(release_id)
         if not release:
             raise RuntimeError("Failed to fetch Discogs release")
+        # The description belongs to the primary release; borrowing movements or custom
+        # tracks below replaces ``release`` with a per-job copy.
+        primary_release_id = release.id
+        primary_master_id = getattr(release, "master_id", None)
         if spec.title_source:
             # Borrowed movements first, so renames / custom tracks can still target them.
             donor = metadata_handler.get_release_by_id(spec.title_source.release_id)
@@ -88,6 +93,12 @@ def run(
         session.mark_processing(run_record)
 
         tracks = _build_tracks(session)
+
+        comment = None
+        if spec.album_description:
+            comment = _lookup_album_comment(
+                metadata_handler, primary_release_id, primary_master_id, on_progress
+            )
 
         album_folder = Path(spec.output_dir) / metadata_handler.create_album_folder_name(release)
         album_folder.mkdir(parents=True, exist_ok=True)
@@ -147,11 +158,13 @@ def run(
             # Every position this export covers (an album job's members included): numbering,
             # and which split (index) track parts are exported, depend on all of them.
             job_positions = list(spec.job_positions) or [t.vinyl_number for t in tracks]
+            tag_extras = {"comment": comment} if comment else {}  # only when found: default call unchanged
             metadata_handler.tag_file(
                 temp_output, track, release, cover_data, spec.output_format,
                 track_numbering=spec.track_numbering,
                 job_positions=job_positions,
                 prefix_part_titles=spec.prefix_part_titles,
+                **tag_extras,
             )
 
             final_filename = metadata_handler.create_track_filename(
@@ -196,6 +209,28 @@ def run(
         if session.state == SessionState.PROCESSING:
             session.mark_failed(str(e))
         raise
+
+
+def _lookup_album_comment(metadata_handler, release_id, master_id, on_progress):
+    """The Comment tag text for this export, or None to keep the default call and comment.
+
+    A lookup error only warns (``Warning:`` prefix, which album jobs collect); it never fails the job.
+    """
+    on_progress(
+        ProgressEvent(phase="fetching_description", fraction=0.25, message="Fetching album description...")
+    )
+    result = metadata_handler.album_descriptions.lookup(release_id, master_id)
+    if result.status == STATUS_FOUND:
+        return compose_comment(result.text)
+    if result.status == STATUS_ERROR:
+        on_progress(
+            ProgressEvent(
+                phase="fetching_description",
+                fraction=0.25,
+                message="Warning: Album description unavailable; comment left as 'Digitized from vinyl'",
+            )
+        )
+    return None
 
 
 def _build_tracks(session: Session) -> list[Track]:

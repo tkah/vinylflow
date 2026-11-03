@@ -429,8 +429,14 @@ function vinylApp() {
             hiss_reduction: 'off',
             hiss_strength: 'light',
             album_gain: false,
-            replaygain: true
+            replaygain: true,
+            album_description: false   // global like output_dir: not a workspace field
         },
+
+        // Wikipedia description of the selected release (from our backend; never stored). Shown
+        // only while releaseId matches selectedRelease.id, so a stale state is simply hidden.
+        albumDescription: { releaseId: null, status: 'idle', text: '', title: '', url: '' },
+        albumDescriptionExpanded: false,   // "Show more" in the preview
 
         // Supported input file extensions
         supportedExtensions: ['.wav', '.aiff', '.aif'],
@@ -777,6 +783,7 @@ function vinylApp() {
             }
             this.config.bit_depth = state.bitDepth;
             this.config.replaygain = state.replaygain;
+            this.loadAlbumDescription();
             this.trackCountMismatch = !!this.selectedRelease && this.activeTrackCount !== this.targetTracks.length;
             this._restoreZoom = this.currentZoom;
             if (this.detectedTracks.length) this.$nextTick(() => this.initWaveform());
@@ -793,7 +800,8 @@ function vinylApp() {
                 gain: state.albumGain, replaygain: state.replaygain, depth: state.bitDepth,
                 prefixPartTitles: state.prefixPartTitles !== false,
                 titleSource: state.titleSource || null,
-                outputDir: this.config.output_dir
+                outputDir: this.config.output_dir,
+                albumDescription: this.config.album_description === true
             });
         },
 
@@ -991,6 +999,7 @@ function vinylApp() {
                 output_format: state.outputFormat, rumble_filter: state.rumbleFilter, declick: state.declick,
                 hum_filter: state.humFilter, hum_freq: state.humFreq, hiss_reduction: state.hissReduction,
                 album_gain: state.albumGain, replaygain: state.replaygain !== false, bit_depth: state.bitDepth,
+                album_description: this.config.album_description === true,
                 custom_tracks: this.customTracksPayload(state.selectedRelease),
                 prefix_part_titles: state.prefixPartTitles !== false,
                 // Contract: only these four keys (label/work are display-only workspace fields).
@@ -1312,6 +1321,7 @@ function vinylApp() {
                     this.syncCleanupFromConfig(data);
                 }
                 this.showSettings = false;
+                this.loadAlbumDescription();   // the setting may have just been switched on or off
                 this.notify('Settings saved.', { type: 'success' });
             } catch (error) {
                 console.error('Failed to save config:', error);
@@ -2974,6 +2984,7 @@ function vinylApp() {
             if (this.analyzing || this.currentLocked) return;
 
             this.selectedRelease = release;
+            this.loadAlbumDescription();
             this.prefixPartTitles = true;  // a per-release choice
             this.titleSource = null;       // borrowed movements belong to the previous release
             this.closeMovementsPanel();
@@ -2991,6 +3002,42 @@ function vinylApp() {
 
             this.resetMappingToTargets();
             this.afterTargetsChanged();
+        },
+
+        /** True when the loaded description belongs to the release now selected and is worth showing. */
+        get albumDescriptionVisible() {
+            const state = this.albumDescription;
+            return !!this.selectedRelease && state.releaseId === this.selectedRelease.id
+                && ['loading', 'found', 'none', 'error'].includes(state.status);
+        },
+
+        /**
+         * Fetch the Wikipedia description of the selected release for the preview. Skipped (no
+         * request) when the setting is off. A reply for a release that is no longer selected is
+         * ignored. Never touches detection or tracks. Called explicitly, not from a watcher.
+         */
+        async loadAlbumDescription() {
+            const releaseId = this.selectedRelease?.id;
+            this.albumDescriptionExpanded = false;
+            if (!releaseId || this.config.album_description !== true) {
+                this.albumDescription = { releaseId: null, status: 'idle', text: '', title: '', url: '' };
+                return;
+            }
+            this.albumDescription = { releaseId, status: 'loading', text: '', title: '', url: '' };
+            let result;
+            try {
+                const response = await fetch(`/api/release/${releaseId}/description`);
+                // A 404 means the release itself can't be loaded; the preview treats it as an error.
+                result = response.ok ? await response.json() : { status: 'error' };
+            } catch (error) {
+                result = { status: 'error' };
+            }
+            // Stale reply: another release was selected, or the setting was switched off meanwhile.
+            if (this.selectedRelease?.id !== releaseId || this.config.album_description !== true) return;
+            this.albumDescription = {
+                releaseId, status: result.status || 'error',
+                text: result.text || '', title: result.title || '', url: result.url || ''
+            };
         },
 
         /**
