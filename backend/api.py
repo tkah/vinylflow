@@ -214,12 +214,41 @@ def get_session_path(file_id: str, filename: str = None) -> Path:
     return session_dir if filename is None else session_dir / filename
 
 
+def _cancel_tasks(tasks) -> None:
+    """Cancel asyncio Tasks from the event loop or from a worker thread.
+
+    ``DELETE /api/queue`` runs ``cleanup_session`` in ``asyncio.to_thread``, and
+    ``Task.cancel()`` is not thread-safe (asyncio debug mode raises "Non-thread-safe
+    operation", and the task can be left waiting forever), so the cancels are handed
+    to the tasks' loop; from the loop thread they land on the next iteration.  All
+    go in one callback: a task awaiting another one (a click scan awaiting the
+    envelope) must see its own cancel before the other's cancellation reaches it."""
+    running = [task for task in tasks if task is not None and not task.done()]
+    if running:
+        running[0].get_loop().call_soon_threadsafe(lambda: [task.cancel() for task in running])
+
+
+def _cancel_requested() -> bool:
+    """True when the running task itself was asked to cancel.
+
+    An awaiter of a shared task (a click scan awaiting the envelope) can be
+    cancelled in the same removal as that task; its own cancel must win over
+    the 404 translation, or it would end as a failure instead of cancelled."""
+    current = asyncio.current_task()
+    return current is not None and current.cancelling() > 0
+
+
 def _forget_session_tasks(file_id: str) -> None:
-    """Drop a removed Session's in-memory background work (envelope, silence
-    analysis, click scans; a running click scan is cancelled)."""
-    _envelope_tasks.pop(file_id, None)
-    _analysis_tasks.pop(file_id, None)
-    _drop_click_scans(file_id)
+    """Drop and cancel a removed Session's in-memory background work (envelope,
+    silence analysis, click scans).
+
+    Cancelling cannot stop a decode already running in a worker thread: ffmpeg
+    runs to the end and its cache write into the removed session dir fails with
+    OSError (caught).  Only the broadcast and the work after it are skipped, and
+    a request awaiting the task gets 404."""
+    _envelope_errors.pop(file_id, None)
+    _cancel_tasks([_envelope_tasks.pop(file_id, None), _analysis_tasks.pop(file_id, None),
+                   *_drop_click_scans(file_id)])
 
 
 def cleanup_session(file_id: str) -> bool:
@@ -517,6 +546,7 @@ async def get_output_formats():
 # task's result is the array itself, so endpoints just await it instead of
 # re-decoding.  file_id -> Task[np.ndarray]
 _envelope_tasks: dict = {}
+_envelope_errors: dict = {}  # file_id -> message of the last failed scan (cleared on success)
 
 
 def _load_or_compute_envelope(file_id: str, file_path: Path):
@@ -546,45 +576,65 @@ def _load_or_compute_envelope(file_id: str, file_path: Path):
 
 
 async def _run_envelope(file_id: str, file_path: Path):
-    db = await asyncio.to_thread(_load_or_compute_envelope, file_id, file_path)
-    start, end = music_span(db, ENVELOPE_FRAME_S)
-    await broadcast_message(
-        {
-            "type": "scan_complete",
-            "file_id": file_id,
-            "music_start": start,
-            "music_end": end,
-            "music_duration": max(0.0, end - start),
-        }
-    )
-    return db
+    # A cancel (recording removed) is delivered at this await, so nothing after
+    # it runs for a removed recording; the decode thread itself still finishes.
+    return await asyncio.to_thread(_load_or_compute_envelope, file_id, file_path)
 
 
 def start_envelope(file_id: str, file_path: Path) -> "asyncio.Task":
-    """Start (or join) the envelope computation for a Session."""
+    """Start (or join) the envelope computation for a Session.
+
+    404 for a recording that is gone: a request that passed its own session
+    check just before a delete must not start a scan for a dead id."""
+    if session_store.get(file_id) is None:
+        raise HTTPException(status_code=404, detail="File not found")
     task = _envelope_tasks.get(file_id)
     if task is None:
         task = asyncio.create_task(_run_envelope(file_id, file_path))
         _envelope_tasks[file_id] = task
 
         def _done(t: "asyncio.Task") -> None:
-            # Failed scans must not poison later requests: drop the task so
-            # the next caller retries.
+            if _envelope_tasks.get(file_id) is not t:
+                return  # forgotten: the recording was removed
             if t.cancelled() or t.exception() is not None:
-                if t.exception() is not None:
+                # Failed scans must not poison later requests: drop the task so
+                # the next caller (GET /api/scan included) retries, and keep the
+                # message for /api/scan to report.
+                _envelope_tasks.pop(file_id, None)
+                if not t.cancelled():
                     print(f"Envelope scan failed for {file_id}: {t.exception()}")
-                if _envelope_tasks.get(file_id) is t:
-                    _envelope_tasks.pop(file_id, None)
+                    _envelope_errors[file_id] = str(t.exception()) or type(t.exception()).__name__
+                return
+            _envelope_errors.pop(file_id, None)
+            if session_store.get(file_id) is None:
+                return
+            # Sent from here, not from inside the task, so a client reacting to
+            # it always finds the task done and /api/scan ready.
+            start, end = music_span(t.result(), ENVELOPE_FRAME_S)
+            asyncio.ensure_future(broadcast_message({
+                "type": "scan_complete",
+                "file_id": file_id,
+                "music_start": start,
+                "music_end": end,
+                "music_duration": max(0.0, end - start),
+            }))
 
         task.add_done_callback(_done)
     return task
 
 
 async def get_envelope(session: Session):
-    """Awaitable accessor: in-flight task -> cache on disk -> compute now."""
+    """Awaitable accessor: in-flight task -> cache on disk -> compute now.
+
+    404 when the recording is removed while waiting (its task is cancelled)."""
     task = start_envelope(session.id, session.source_audio)
-    # shield: a cancelled request must not cancel the shared background scan.
-    return await asyncio.shield(task)
+    try:
+        # shield: a cancelled request must not cancel the shared background scan.
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        if task.cancelled() and not _cancel_requested():
+            raise HTTPException(status_code=404, detail="File not found")
+        raise  # the request itself was cancelled
 
 
 # --- Silent-stretch analysis (plan 07 slice 4): hum detector + noise profile --------
@@ -618,13 +668,19 @@ async def get_silence_analysis(session: Session) -> dict:
     if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
         task = asyncio.create_task(_run_silence_analysis(session))
         _analysis_tasks[session.id] = task
-    # shield: a cancelled request must not cancel the shared analysis.
-    return await asyncio.shield(task)
+    try:
+        # shield: a cancelled request must not cancel the shared analysis.
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        if task.cancelled() and not _cancel_requested():  # the recording was removed
+            raise HTTPException(status_code=404, detail="File not found")
+        raise  # the request itself was cancelled
 
 
 async def _noise_profile_for(session: Session) -> Optional[NoiseProfile]:
     """The file's measured NoiseProfile for hiss reduction, or None (generic
-    fallback chain) when the analysis finds no usable silence or fails."""
+    fallback chain) when the analysis finds no usable silence or fails (a
+    recording removed meanwhile lands here too, as the 404 HTTPException)."""
     try:
         data = await get_silence_analysis(session)
     except Exception as e:
@@ -646,6 +702,8 @@ async def get_hum(file_id: str):
         raise HTTPException(status_code=404, detail="File not found")
     try:
         data = await get_silence_analysis(session)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Hum analysis failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Hum analysis failed: {e}")
@@ -661,18 +719,17 @@ _click_errors: dict = {}     # (file_id, strength) -> message
 _click_cancel: dict = {}     # file_id -> threading.Event
 
 
-def _drop_click_scans(file_id: str) -> None:
-    """Cancel and forget every click scan of a removed Session."""
+def _drop_click_scans(file_id: str) -> list:
+    """Stop and forget every click scan of a removed Session; returns their
+    tasks for the caller to cancel (``_cancel_tasks``)."""
     event = _click_cancel.pop(file_id, None)
     if event is not None:
         event.set()  # the worker thread checks this between chunks
-    for key in [k for k in _click_tasks if k[0] == file_id]:
-        task = _click_tasks.pop(key, None)
-        if task is not None and not task.done():
-            task.cancel()
+    tasks = [_click_tasks.pop(key) for key in [k for k in _click_tasks if k[0] == file_id]]
     for d in (_click_progress, _click_errors):
         for key in [k for k in d if k[0] == file_id]:
             d.pop(key, None)
+    return tasks
 
 
 def _click_cached(file_id: str, strength: str) -> Optional[dict]:
@@ -1143,6 +1200,8 @@ async def rescan_file(request: RescanRequest):
 
         return {"tracks": tracks_data, "matched": scan_info["matched"], "scan": scan_info}
 
+    except HTTPException:
+        raise
     except Exception as e:
         await broadcast_message(
             {
@@ -1168,13 +1227,27 @@ async def get_scan(file_id: str, side_changes: int = Query(0, ge=0, le=MAX_SIDE_
     if session is None:
         raise HTTPException(status_code=404, detail="File not found")
 
+    # Never block: get_envelope joins a running task, and the cache file exists
+    # before the task finishes (between the thread's os.replace and its return),
+    # so the running check must come before the cache check.
     task = _envelope_tasks.get(file_id)
-    if task is None and get_session_path(file_id, "envelope.npy").exists():
-        db = await get_envelope(session)  # cached on disk: quick load
-    elif task is not None and task.done() and not task.cancelled() and task.exception() is None:
+    if task is not None:
+        if not task.done():
+            return {"ready": False}
+        if task.cancelled():
+            return {"ready": False}
+        if task.exception() is not None:  # failed; its done callback has not dropped it yet
+            return {"ready": False, "error": str(task.exception())}
         db = task.result()
+    elif get_session_path(file_id, "envelope.npy").exists():
+        db = await get_envelope(session)  # cached on disk: quick load
     else:
-        return {"ready": False}
+        # No scan running and none cached: (re)start it.  A decode that always
+        # fails restarts once per call; callers poll this only on file selection
+        # and when measuring movement targets, so no backoff.
+        error = _envelope_errors.get(file_id)
+        start_envelope(file_id, session.source_audio)
+        return {"ready": False, "error": error} if error else {"ready": False}
 
     start, end = music_span(db, ENVELOPE_FRAME_S)
     scan = {
@@ -2234,6 +2307,7 @@ async def clear_all_temp():
     for session in session_store.list():
         if session.id not in keep_ids:
             session_store.remove(session.id)
+            _forget_session_tasks(session.id)
 
     return {"status": "cleared", "sessions_removed": cleared}
 
