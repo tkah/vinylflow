@@ -142,5 +142,93 @@ function mkApp() {
     assert.deepStrictEqual(a.detectedTracks.map(x => x.end), [10]);
     assert.ok(a.toasts.some(x => x.type === 'warning'));
 
+    // ---- the toast cap never commits a pending removal (review #86-2) ----
+    deletes.length = 0;
+    global.fetch = async (url, opts) => { deletes.push(`${opts.method} ${url}`); return { ok: true, status: 200, json: async () => ({}) }; };
+    a = mkApp();
+    a.uploadedFiles = ['f1', 'f2', 'f3', 'f4', 'f5', 'f6'].map(id => ({ id, filename: `${id}.wav` }));
+    a.currentFileId = null; a.currentFile = null;
+    for (const f of [...a.uploadedFiles]) a.removeFile(f.id, 5000);
+    await sleep(10);
+    assert.deepStrictEqual(deletes, [], 'no DELETE inside any undo window');
+    assert.strictEqual(a.toasts.filter(t => t.action).length, 6, 'every removal keeps its Undo');
+    for (const t of [...a.toasts]) a.runToastAction(t.id);
+    assert.deepStrictEqual(a.uploadedFiles.map(f => f.id), ['f1', 'f2', 'f3', 'f4', 'f5', 'f6']);
+    await sleep(10);
+    assert.deepStrictEqual(deletes, []);
+
+    // ...nor drops a delete-track Undo when error toasts pile up after it
+    a = mkApp();
+    a.detectedTracks = [trk(1, 0, 100), trk(2, 100, 200)];
+    a.customMapping = [0, 1];
+    a.deleteTrack(2);
+    const delUndo = a.toasts[a.toasts.length - 1];
+    for (let n = 1; n <= 5; n++) a.notify(`Failure ${n}`, { type: 'error' });
+    assert.ok(a.toasts.some(t => t.id === delUndo.id), 'the Undo toast survives the cap');
+    assert.deepStrictEqual(a.toasts.map(t => t.message).slice(1), ['Failure 2', 'Failure 3', 'Failure 4', 'Failure 5'],
+        'the oldest toast without an action made room');
+    a.runToastAction(delUndo.id);
+    assert.deepStrictEqual(a.detectedTracks.map(x => x.end), [100, 200]);
+
+    // ---- Undo puts files back in their old order (review #86-3) ----
+    const ids = (app) => app.uploadedFiles.map(f => f.id);
+    const removalToast = (app, id) => app.toasts.find(t => t.id === app.pendingRemovals[id].toastId);
+    for (const undoOrder of [['f1', 'f2'], ['f2', 'f1']]) {
+        a = mkApp(); a.currentFileId = null; a.currentFile = null;
+        a.removeFile('f1', 5000); a.removeFile('f2', 5000);
+        const toastsById = { f1: removalToast(a, 'f1'), f2: removalToast(a, 'f2') };
+        for (const id of undoOrder) a.runToastAction(toastsById[id].id);
+        assert.deepStrictEqual(ids(a), ['f1', 'f2', 'f3'], `undo ${undoOrder.join(' then ')}`);
+        await a.commitAllRemovals();
+    }
+    // a file added during the window doesn't break the order
+    a = mkApp(); a.currentFileId = null; a.currentFile = null;
+    a.removeFile('f2', 5000);
+    a.uploadedFiles = [...a.uploadedFiles, { id: 'f4', filename: 'four.wav' }];
+    a.runToastAction(removalToast(a, 'f2').id);
+    assert.deepStrictEqual(ids(a), ['f1', 'f2', 'f3', 'f4']);
+    // a failed DELETE puts the file back between its old neighbours
+    global.fetch = async () => ({ ok: false, status: 500, json: async () => ({}) });
+    a = mkApp(); a.currentFileId = null; a.currentFile = null;
+    a.removeFile('f2', 5000);
+    await a.commitAllRemovals();
+    assert.deepStrictEqual(ids(a), ['f1', 'f2', 'f3']);
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({}) });
+
+    // ---- an Undo refuses while the recording is being re-detected or exported (review #86-4b) ----
+    const deleteThenBlock = (block) => {
+        const app = mkApp();
+        app.detectedTracks = [trk(1, 0, 100), trk(2, 100, 200)];
+        app.customMapping = [0, 1];
+        app.deleteTrack(2);
+        const undo = app.toasts[app.toasts.length - 1];
+        block(app);
+        app.runToastAction(undo.id);
+        return app;
+    };
+    a = deleteThenBlock(app => { app.analyzing = true; });
+    assert.deepStrictEqual(a.detectedTracks.map(x => x.end), [100], 'undo during detection leaves the tracks alone');
+    assert.ok(a.toasts.some(x => x.type === 'warning'));
+    a = deleteThenBlock(app => { app.uploadedFiles[1].status = 'processing'; });   // f2 is exporting
+    assert.deepStrictEqual(a.detectedTracks.map(x => x.end), [100], 'undo while exporting leaves the tracks alone');
+    assert.ok(a.toasts.some(x => x.type === 'warning'));
+    // re-analyze Undo while a detection runs
+    a = mkApp();
+    a.detectedTracks = [trk(1, 0, 100)];
+    a.analyzeFile = async () => { a.setDetectedTracks([trk(1, 0, 50)]); };
+    await a.reanalyzeFile();
+    const reUndo = a.toasts[a.toasts.length - 1];
+    a.analyzing = true;
+    a.runToastAction(reUndo.id);
+    await sleep(5);
+    assert.deepStrictEqual(a.detectedTracks.map(x => x.end), [50], 're-analyze undo during detection is refused');
+    assert.ok(a.toasts.some(x => x.type === 'warning'));
+    // file removal stays undoable while another recording is open or exporting
+    a = mkApp();
+    a.removeFile('f1', 5000);
+    a.uploadedFiles[0].status = 'processing';   // f2, the open one, is exporting
+    a.runToastAction(removalToast(a, 'f1').id);
+    assert.deepStrictEqual(ids(a), ['f1', 'f2', 'f3']);
+
     console.log('undo ok');
 })().catch(err => { console.error(err); process.exit(1); });

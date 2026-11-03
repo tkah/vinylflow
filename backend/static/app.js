@@ -40,6 +40,10 @@ const WHEEL_ZOOM_RATE = 0.003;
 // Custom tracks (must match CustomTrack in backend/api.py): new positions are A1/B12; titles <= 200 chars.
 const CUSTOM_POSITION_RE = /^[A-Z]+\d+$/;
 const CUSTOM_TITLE_MAX = 200;
+// Toast stack cap: past it the oldest toast without an action makes room (an Undo is never evicted)
+const MAX_TOASTS = 5;
+// How long an Undo toast stays (ms)
+const UNDO_TOAST_MS = 8000;
 // Dragging a track wider than the view keeps its leading edge this far (fraction of the view) in from the screen edge
 const DRAG_EDGE_MARGIN = 0.15;
 const REGION_EDGE_HIT_PX = 6;
@@ -406,7 +410,7 @@ function vinylApp() {
         toasts: [],
         _toastSeq: 0,
         _toastTimers: {},
-        pendingRemovals: {},   // fileId -> { file, index, choice, toastId, committed }
+        pendingRemovals: {},   // fileId -> { file, order, wasCurrent, toastId, committed }
 
         // Config
         config: {
@@ -509,7 +513,9 @@ function vinylApp() {
          *  - type: 'info' | 'success' (auto-dismiss ~5 s) | 'warning' | 'error' (sticky)
          *  - timeout: ms override (0 = sticky)
          *  - action: button on the toast; clicking runs fn and closes the toast
-         *  - onClose(reason): reason is 'timeout' | 'dismiss' | 'action' (used by undo flows)
+         *  - onClose(reason): reason is 'timeout' | 'dismiss' | 'action' | 'commit' | 'evict'
+         *    (used by undo flows; 'commit' = a pending removal was committed early,
+         *    'evict' = pushed out by the stack cap, which never happens to a toast with an action)
          * Hovering a toast pauses its timer.  Returns the toast id.
          */
         notify(message, opts = {}) {
@@ -529,13 +535,22 @@ function vinylApp() {
             this.toasts.push({
                 id, message, type,
                 action: opts.action || null,
-                onClose: opts.onClose || null,
-                role: type === 'error' || type === 'warning' ? 'alert' : 'status'
+                onClose: opts.onClose || null
             });
-            // Keep the stack short; the oldest toast makes room
-            while (this.toasts.length > 5) this.dismissToast(this.toasts[0].id, 'dismiss');
+            // Keep the stack short: the oldest other toast without an action makes room.  Toasts
+            // with an action (Undo) are never evicted, so the stack may grow past the cap.
+            while (this.toasts.length > MAX_TOASTS) {
+                const oldest = this.toasts.find(t => !t.action && t.id !== id);
+                if (!oldest) break;
+                this.dismissToast(oldest.id, 'evict');
+            }
             this._armToast(id, timeout);
             return id;
+        },
+
+        /** Type icon shown before a toast's message (decorative: the type word is read instead) */
+        toastIcon(type) {
+            return { success: '\u2713', warning: '\u26a0', error: '\u2715' }[type] || '\u2139';
         },
 
         _armToast(id, ms) {
@@ -592,6 +607,36 @@ function vinylApp() {
         notifyError(prefix, error) {
             const detail = error && error.message ? error.message : String(error || '');
             return this.notify(detail ? `${prefix}: ${detail}` : prefix, { type: 'error' });
+        },
+
+        /** Why an edit Undo for `fileId` can't run now, or '' when it can. */
+        undoBlockedReason(fileId) {
+            if (this.currentFileId !== fileId) return 'Switch back to that file to undo.';
+            if (this.analyzing) return 'Wait for track detection to finish, then undo.';
+            if (this.isLocked(fileId)) return "Can't undo while this recording is exporting.";
+            return '';
+        },
+
+        /**
+         * Undo toast.  Its button first checks undoBlockedReason(fileId); a refusal is a
+         * warning toast and leaves the state alone.  guard: false skips that check (file
+         * removal must stay undoable while another file is open).
+         */
+        notifyUndo(message, undo, { fileId = null, guard = true, type = 'info', timeout = UNDO_TOAST_MS, onClose } = {}) {
+            return this.notify(message, {
+                type, timeout, onClose,
+                action: {
+                    label: 'Undo',
+                    fn: () => {
+                        const blocked = guard ? this.undoBlockedReason(fileId) : '';
+                        if (blocked) {
+                            this.notify(blocked, { type: 'warning', timeout: 6000 });
+                            return;
+                        }
+                        undo();
+                    }
+                }
+            });
         },
 
         /** Read the active editor without cloning large search results on every queue update. */
@@ -1868,7 +1913,8 @@ function vinylApp() {
             }
             this.saveWorkspace();
             const entry = {
-                file, index,
+                file,
+                order: this.uploadedFiles.map(f => f.id),   // queue order before this removal, for Undo
                 wasCurrent: this.currentFileId === fileId,
                 committed: false,
                 toastId: null
@@ -1888,10 +1934,9 @@ function vinylApp() {
             const removedMsg = file.in_place
                 ? `Removed "${this.shortFilename(file.filename)}" from the queue. The original file stays in the import folder.`
                 : `Removed "${this.shortFilename(file.filename)}" from the queue.`;
-            entry.toastId = this.notify(removedMsg, {
-                type: 'info',
+            entry.toastId = this.notifyUndo(removedMsg, () => this.undoRemoveFile(fileId), {
+                guard: false,
                 timeout: undoMs,
-                action: { label: 'Undo', fn: () => this.undoRemoveFile(fileId) },
                 onClose: (reason) => { if (reason !== 'action') this.commitRemoval(fileId); }
             });
         },
@@ -1904,12 +1949,34 @@ function vinylApp() {
             delete next[fileId];
             this.pendingRemovals = next;
 
-            const files = [...this.uploadedFiles];
-            files.splice(Math.min(entry.index, files.length), 0, entry.file);
-            this.uploadedFiles = files;
+            this.reinsertFile(entry.file, entry.order);
             if (entry.wasCurrent && !this.currentFileId) {
                 this.selectFile(fileId);
             }
+        },
+
+        /**
+         * Put a removed file back where it was in `order` (the queue's ids before its
+         * removal): before the first later file still queued, else after the nearest
+         * earlier one, else at the end.  Removals and Undos may interleave in any order.
+         */
+        reinsertFile(file, order) {
+            const files = this.uploadedFiles.filter(f => f.id !== file.id);
+            const at = order.indexOf(file.id);
+            const position = id => files.findIndex(f => f.id === id);
+            let index = -1;
+            if (at !== -1) {
+                for (const id of order.slice(at + 1)) {
+                    index = position(id);
+                    if (index !== -1) break;
+                }
+                for (const id of index === -1 ? order.slice(0, at).reverse() : []) {
+                    const before = position(id);
+                    if (before !== -1) { index = before + 1; break; }
+                }
+            }
+            files.splice(index === -1 ? files.length : index, 0, file);
+            this.uploadedFiles = files;
         },
 
         /** Really delete a soft-removed file on the server */
@@ -1935,7 +2002,7 @@ function vinylApp() {
                 if (workspace) this.workspaces = { ...this.workspaces, [fileId]: workspace };
                 this.persistWorkspaces();
                 if (!this.uploadedFiles.some(f => f.id === fileId)) {
-                    this.uploadedFiles = [...this.uploadedFiles, entry.file];
+                    this.reinsertFile(entry.file, entry.order);
                 }
                 this.notifyError(`Could not remove "${this.shortFilename(entry.file.filename)}"`, error);
             } finally {
@@ -2037,20 +2104,13 @@ function vinylApp() {
             await this.analyzeFile();
 
             if (this.currentFileId === fileId && this.detectedTracks.length > 0) {
-                this.notify('Re-analyzed. Boundaries and release were reset.', {
-                    type: 'info',
-                    timeout: 8000,
-                    action: { label: 'Undo', fn: () => this.restoreReanalyze(fileId, snapshot) }
-                });
+                this.notifyUndo('Re-analyzed. Boundaries and release were reset.',
+                    () => this.restoreReanalyze(fileId, snapshot), { fileId });
             }
         },
 
-        /** Undo a re-analysis: previous tracks, release, sides and mapping */
+        /** Undo a re-analysis: previous tracks, release, sides and mapping (its toast checks undoBlockedReason) */
         async restoreReanalyze(fileId, snap) {
-            if (this.currentFileId !== fileId) {
-                this.notify('Switch back to that file to undo the re-analysis.', { type: 'warning', timeout: 6000 });
-                return;
-            }
             this.pauseWaveform();
             this.restoreEdits(snap, { rebuildRegions: false });
             this.selectedRelease = snap.selectedRelease;
@@ -3162,20 +3222,13 @@ function vinylApp() {
             this.resetDonors();
             this.afterTargetsChanged();
 
-            this.notify(`Borrowed ${filled} track length${filled === 1 ? '' : 's'} from ${this.borrowedLabel(release.lengthsBorrowedFrom)}.`, {
-                type: 'success',
-                timeout: 8000,
-                action: {
-                    label: 'Undo',
-                    fn: () => {
-                        release.tracks.forEach((t, i) => { if (i < originals.length) t.duration = originals[i]; });
-                        release.lengthsBorrowedFrom = previousMarker;
-                        if (this.currentFileId === fileId && this.selectedRelease?.id === release.id) {
-                            this.afterTargetsChanged();
-                        }
-                    }
+            this.notifyUndo(`Borrowed ${filled} track length${filled === 1 ? '' : 's'} from ${this.borrowedLabel(release.lengthsBorrowedFrom)}.`, () => {
+                release.tracks.forEach((t, i) => { if (i < originals.length) t.duration = originals[i]; });
+                release.lengthsBorrowedFrom = previousMarker;
+                if (this.currentFileId === fileId && this.selectedRelease?.id === release.id) {
+                    this.afterTargetsChanged();
                 }
-            });
+            }, { fileId, type: 'success' });
         },
 
         /**
@@ -3229,21 +3282,14 @@ function vinylApp() {
             release.tracks.splice(entry.index, unfold ? 1 : entry.count, ...replacement);
             this.afterIndexChange(release.id, snapshot.all);
 
-            this.notify(unfold
+            this.notifyUndo(unfold
                 ? `${umbrella.title}: split into ${umbrella.parts.length} parts.`
-                : `${umbrella.title}: kept as one track.`, {
-                type: 'success',
-                timeout: 8000,
-                action: {
-                    label: 'Undo',
-                    fn: () => {
-                        if (this.selectedRelease !== release) return;
-                        release.tracks.splice(0, release.tracks.length, ...snapshot.tracks);
-                        this.selectedSides = snapshot.sides;
-                        this.afterIndexChange(release.id, false);
-                    }
-                }
-            });
+                : `${umbrella.title}: kept as one track.`, () => {
+                if (this.selectedRelease !== release) return;
+                release.tracks.splice(0, release.tracks.length, ...snapshot.tracks);
+                this.selectedSides = snapshot.sides;
+                this.afterIndexChange(release.id, false);
+            }, { fileId: this.currentFileId, type: 'success' });
         },
 
         /** Tracks changed shape: keep only sides that still exist, remap, re-detect. */
@@ -3586,23 +3632,17 @@ function vinylApp() {
             const after = this.selectedRelease;
             this.closeMovementsPanel();
             this.afterIndexChange(after.id, false);
-            this.notify(`Movements of \u201c${workTitle}\u201d from ${donor.id}.`, {
-                type: 'success', timeout: 8000,
-                action: {
-                    label: 'Undo',
-                    fn: () => {
-                        if (this.currentFileId !== before.fileId || this.selectedRelease !== after) {
-                            this.notify('Switch back to that recording to undo.', { type: 'warning', timeout: 6000 });
-                            return;
-                        }
-                        this.selectedRelease = before.release;
-                        this.titleSource = before.titleSource;
-                        this.selectedSides = before.sides;
-                        this.trackForm = null;
-                        this.afterIndexChange(before.release.id, false);
-                    }
+            this.notifyUndo(`Movements of \u201c${workTitle}\u201d from ${donor.id}.`, () => {
+                if (this.selectedRelease !== after) {
+                    this.notify('Switch back to that recording to undo.', { type: 'warning', timeout: 6000 });
+                    return;
                 }
-            });
+                this.selectedRelease = before.release;
+                this.titleSource = before.titleSource;
+                this.selectedSides = before.sides;
+                this.trackForm = null;
+                this.afterIndexChange(before.release.id, false);
+            }, { fileId: before.fileId, type: 'success' });
         },
 
         /**
@@ -3817,24 +3857,18 @@ function vinylApp() {
 
         /** Undo toast for a release edit: puts back the previous release and mapping if nothing replaced the edit since. */
         offerTrackUndo(message, before, after) {
-            this.notify(message, {
-                type: 'success', timeout: 8000,
-                action: {
-                    label: 'Undo',
-                    fn: () => {
-                        if (this.currentFileId !== before.fileId || this.selectedRelease !== after) {
-                            this.notify('Switch back to that recording to undo.', { type: 'warning', timeout: 6000 });
-                            return;
-                        }
-                        this.selectedRelease = before.release;
-                        this.customMapping = before.mapping;
-                        this.selectedSides = before.sides;
-                        this.trackForm = null;
-                        this.resetDonors();
-                        this.afterReleaseEdit();
-                    }
+            this.notifyUndo(message, () => {
+                if (this.selectedRelease !== after) {
+                    this.notify('Switch back to that recording to undo.', { type: 'warning', timeout: 6000 });
+                    return;
                 }
-            });
+                this.selectedRelease = before.release;
+                this.customMapping = before.mapping;
+                this.selectedSides = before.sides;
+                this.trackForm = null;
+                this.resetDonors();
+                this.afterReleaseEdit();
+            }, { fileId: before.fileId, type: 'success' });
         },
 
         /** Targets changed shape without re-detecting: refresh the count flag and labels. */
@@ -4860,17 +4894,7 @@ function vinylApp() {
                 this.resetMappingToTargets();
             }
 
-            this.notify(`Deleted track ${trackNumber}.`, {
-                type: 'info',
-                timeout: 8000,
-                action: {
-                    label: 'Undo',
-                    fn: () => {
-                        if (this.currentFileId !== fileId) return;
-                        this.restoreEdits(snapshot);
-                    }
-                }
-            });
+            this.notifyUndo(`Deleted track ${trackNumber}.`, () => this.restoreEdits(snapshot), { fileId });
         },
 
         renumberTracks() {

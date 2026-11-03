@@ -141,7 +141,8 @@ frontend tests fake both); screenshots are full-page PNGs.
 - WaveSurfer canvas lives in shadow DOM — `#waveform *` counts only 1 light-DOM child;
   screenshot to confirm rendering instead.
 
-- Toasts (`role="status"` / `role="alert"`) appear bottom-right; there is no `alert()` / `confirm()`
+- Toasts appear bottom-right inside the `.toast-stack` polite live region (no role per toast; a
+  type icon plus a screen-reader type word); there is no `alert()` / `confirm()`
   anywhere. Destructive actions (remove file, delete track, re-analyze) show an Undo toast.
 
 ## Gotchas
