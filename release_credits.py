@@ -11,7 +11,7 @@ name ("Nirvana (2)").  ``role`` is free text such as "Conductor, Liner Notes" or
 
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 DEFAULT_ARTIST_JOIN = ", "
 VARIOUS_ARTISTS = "Various Artists"
@@ -47,6 +47,9 @@ INSTRUMENT_ROLES = frozenset({
     "accordion", "drums", "synthesizer", "keyboards",
 })
 
+# Second word of a singer credit: Discogs writes "Soprano Vocals", "Baritone Voice".
+VOICE_SUFFIXES = frozenset({"vocals", "vocal", "voice"})
+
 # Other performing roles tagged as PERFORMER (no instrument).
 OTHER_PERFORMER_ROLES = frozenset({
     "performer", "soloist", "leader", "concertmaster",
@@ -80,6 +83,7 @@ def clean_artist_name(name: str) -> str:
 
 
 def is_various(name: str) -> bool:
+    """True for the compilation pseudo-artist ("Various", "Various Artists")."""
     return clean_artist_name(name).lower() in _VARIOUS_NAMES
 
 
@@ -108,6 +112,16 @@ def join_artist_names(entries: Sequence) -> str:
     return "".join(parts)
 
 
+def sole_artist_name(entries: Sequence) -> str:
+    """The cleaned name when exactly one artist is listed, else "".
+
+    Used as the classical composer fallback: a line such as "Beethoven – Karajan,
+    Berliner Philharmoniker" also names performers, so it is no composer."""
+    names = [clean_artist_name(_fields(entry).get("name")) for entry in entries or []]
+    names = [name for name in names if name]
+    return names[0] if len(names) == 1 else ""
+
+
 def _split_roles(role_text: str) -> List[str]:
     """Split "Conductor, Liner Notes" on commas outside [brackets]."""
     pieces, depth, current = [], 0, ""
@@ -131,10 +145,17 @@ def role_base(role: str) -> str:
 
 
 def _allowed(base: str, allowed: frozenset) -> bool:
+    """Is a role (``role_base`` form) in ``allowed``, alone or after one modifier ("Principal Oboe")?"""
     if base in allowed:
         return True
     head, _, rest = base.partition(" ")
     return head in ROLE_MODIFIERS and rest in allowed
+
+
+def _is_singer(base: str) -> bool:
+    """A "<voice type> Vocals" credit ("Soprano Vocals", "Baritone Voice")."""
+    head, _, rest = base.partition(" ")
+    return head in VOICE_ROLES and rest in VOICE_SUFFIXES
 
 
 def parse_credits(entries: Sequence) -> List[Credit]:
@@ -154,26 +175,30 @@ def credit_applies(tracks_text: str, position: str, positions: Sequence[Tuple[st
     """Does a credit's track text cover ``position``?
 
     ``positions`` is the release's ordered [(raw Discogs position, normalised
-    position)].  Empty text covers every track.  Entries are comma/semicolon
+    position)].  Several entries may share a normalised position: an index
+    track's movements are listed under their umbrella's position, so a credit
+    on any movement covers the umbrella.  Empty text covers every track.  Entries are comma/semicolon
     separated; each is a position or a range ("A1 to A3", "1-4").  Credits
     that can't be resolved cover nothing (never attribute a soloist wrongly).
     """
     text = (tracks_text or "").strip()
     if not text:
         return True
-    order = [normalised for _, normalised in positions]
-    if position not in order:
+    here = {i for i, (_, normalised) in enumerate(positions) if normalised == position}
+    if not here:
         return False
-    here = order.index(position)
 
     def indexes(token: str) -> List[int]:
         token = token.strip().lower()
         if not token:
             return []
+        # "B1" also covers sub-positions "B1a" / "B1.1", but not "B10"; a bare
+        # side letter "A" must not match a repeated-letter position "AA".
+        boundary = r"(?![0-9])" if token[-1].isdigit() else r"(?![0-9a-z])"
         found = []
         for i, (raw, normalised) in enumerate(positions):
             for candidate in (raw.lower(), normalised.lower()):
-                if candidate == token or re.match(re.escape(token) + r"(?![0-9a-z])", candidate):
+                if candidate == token or re.match(re.escape(token) + boundary, candidate):
                     found.append(i)
                     break
         return found
@@ -182,9 +207,9 @@ def credit_applies(tracks_text: str, position: str, positions: Sequence[Tuple[st
         pieces = re.split(r"\s+to\s+|\s*[-–—]\s*", part.strip(), maxsplit=1)
         if len(pieces) == 2:
             first, last = indexes(pieces[0]), indexes(pieces[1])
-            if first and last and min(first) <= here <= max(last):
+            if first and last and any(min(first) <= i <= max(last) for i in here):
                 return True
-        elif here in indexes(part):
+        elif here & set(indexes(part)):
             return True
     return False
 
@@ -209,6 +234,8 @@ def credits_for_track(
 
 @dataclass(frozen=True)
 class ClassicalCredits:
+    """One track's taggable credits by kind; performers are (name, role label)."""
+
     composers: Tuple[str, ...] = ()
     conductors: Tuple[str, ...] = ()
     ensembles: Tuple[str, ...] = ()
@@ -231,7 +258,7 @@ def classify_credits(credits: Sequence[Credit]) -> ClassicalCredits:
             add(conductors, credit.name)
         elif _allowed(base, ENSEMBLE_ROLES):
             add(ensembles, credit.name)
-        elif _allowed(base, PERFORMING_ROLES):
+        elif _allowed(base, PERFORMING_ROLES) or _is_singer(base):
             label = "" if base in OTHER_PERFORMER_ROLES else role_base(credit.role).title()
             add(performers, (credit.name, label))
     return ClassicalCredits(

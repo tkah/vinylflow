@@ -37,6 +37,7 @@ from release_credits import (
     join_artist_names,
     parse_credits,
     performer_text,
+    sole_artist_name,
 )
 from track_matching import match_tracklists
 
@@ -94,6 +95,7 @@ class DiscogsTrack:
         credits: Optional[List[Credit]] = None,
         raw_position: str = "",
         parts: Optional[List[dict]] = None,
+        sole_artist: str = "",
     ):
         """
         Initialize Discogs track.
@@ -107,6 +109,8 @@ class DiscogsTrack:
             raw_position: Position as Discogs wrote it (credit track ranges use it)
             parts: For an umbrella track (a Discogs index track such as a suite),
                 its sub-tracks as ``{position, title, duration}``
+            sole_artist: The track artist when Discogs lists exactly one (classical
+                composer fallback on compilations), else ""
         """
         self.position = position
         self.parts = list(parts or [])
@@ -116,6 +120,7 @@ class DiscogsTrack:
         self.credits_resolved = False
         self.raw_position = raw_position or position
         self.artist = artist
+        self.sole_artist = sole_artist
         self.credits = list(credits or [])
         self.title = title
         self.duration_str = duration
@@ -170,6 +175,7 @@ class DiscogsRelease:
         # Get artists
         artists = getattr(release, "artists", [])
         self.artist = join_artist_names(artists) or "Unknown Artist"
+        self.sole_artist = sole_artist_name(artists)
 
         # Handle various artists
         self.various_artists = is_various(self.artist)
@@ -208,7 +214,10 @@ class DiscogsRelease:
             duration = getattr(track, "duration", "")
             track_artist = join_artist_names(getattr(track, "artists", None) or [])
             track_credits = parse_credits(getattr(track, "credits", None))
-            extras = {"artist": track_artist, "credits": track_credits, "raw_position": position}
+            extras = {
+                "artist": track_artist, "credits": track_credits, "raw_position": position,
+                "sole_artist": sole_artist_name(getattr(track, "artists", None) or []),
+            }
 
             # Skip Discogs side-heading entries (type_='heading').
             if kind == "heading":
@@ -419,7 +428,7 @@ def with_borrowed_work(release: DiscogsRelease, donor: DiscogsRelease, title_sou
         lengths = [DiscogsTrack("", "", p["duration"]).duration_seconds for p in parts]
         total = _format_duration(sum(lengths)) if all(length is not None for length in lengths) else ""
         borrowed = DiscogsTrack(
-            parts[0]["position"], umbrella.title, total, artist=umbrella.artist,
+            parts[0]["position"], umbrella.title, total, artist=umbrella.artist, sole_artist=umbrella.sole_artist,
             credits=credits_for_track(donor.credits, umbrella.credits, umbrella.position, donor_positions),
             raw_position=parts[0]["position"], parts=parts,
         )
@@ -432,7 +441,7 @@ def with_borrowed_work(release: DiscogsRelease, donor: DiscogsRelease, title_sou
             if track is None:
                 raise ValueError(f"The title source has no track {source_position}.")
             plain = DiscogsTrack(
-                new_position, track.title, track.duration_str, artist=track.artist,
+                new_position, track.title, track.duration_str, artist=track.artist, sole_artist=track.sole_artist,
                 credits=credits_for_track(donor.credits, track.credits, track.position, donor_positions),
             )
             plain.credits_resolved = True
@@ -901,6 +910,7 @@ class MetadataHandler:
                         self._part_title(dt.title, part.get("title", ""), prefix_part_titles),
                         part.get("duration", ""),
                         artist=dt.artist,
+                        sole_artist=dt.sole_artist,
                         # A borrowed part carries its own resolved credits.
                         credits=part["credits"] if "credits" in part else dt.credits,
                     )
@@ -962,10 +972,15 @@ class MetadataHandler:
     def _classical_tags(self, discogs_track, release, various: bool) -> dict:
         """Composer / conductor / ensemble / performers for one track of a
         classical release (see ``release_credits``); ``performer_names`` feeds ARTIST."""
+        # (raw Discogs position, exported position) pairs: credit track ranges are written
+        # against what Discogs shows ("1 - 3", "B1a to B1b"), not our A1/B1 labels. When the
+        # umbrella itself is tagged (``_find_discogs_track`` returned it, not a split part),
+        # its movements map to its position so their credits reach it.
         positions = []
         for t in release.tracks:
             positions.append((getattr(t, "raw_position", t.position), t.position))
-            positions += [(p["position"], p["position"]) for p in getattr(t, "parts", None) or []
+            owner = t.position if t is discogs_track else None
+            positions += [(p["position"], owner or p["position"]) for p in getattr(t, "parts", None) or []
                           if p.get("position") and p["position"] != t.position]
         if getattr(discogs_track, "credits_resolved", False):
             credits = list(discogs_track.credits)  # borrowed: the primary's release credits do not apply
@@ -985,7 +1000,11 @@ class MetadataHandler:
                     found.ensembles or fallback.ensembles,
                     found.performers,
                 )
-        fallback_composer = getattr(discogs_track, "artist", "") if various else release.artist
+        # No composer credit: a lone release artist (on a compilation, a lone track
+        # artist) is the best guess; a line that also names performers is no composer.
+        fallback_composer = (
+            getattr(discogs_track, "sole_artist", "") if various else getattr(release, "sole_artist", "")
+        )
         # Conventional classical ARTIST order: soloists, then ensembles, then the conductor.
         performer_names = list(dict.fromkeys(
             [name for name, _ in found.performers] + list(found.ensembles) + list(found.conductors)

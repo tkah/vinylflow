@@ -158,7 +158,7 @@ def test_classical_credits_and_track_ranges():
         FakeArtist("Ludwig van Beethoven", role="Composed By"),
         FakeArtist("Herbert von Karajan", role="Conductor, Liner Notes"),
         FakeArtist("Berliner Philharmoniker", role="Orchestra"),
-        FakeArtist("Maria Callas", role="Soprano Vocals"),  # unknown phrasing: not tagged
+        FakeArtist("Maria Callas", role="Some Unknown Role"),  # not an allowlisted role: not tagged
         FakeArtist("Wilhelm Kempff", role="Piano [Solo]", tracks="A1 to A2"),
         FakeArtist("Pierre Fournier", role="Cello", tracks="B1, B2"),
         FakeArtist("Some Producer", role="Producer"),
@@ -281,3 +281,32 @@ def test_compilation_id3_flag(tmp_path):
     assert handler().tag_file(path, FakeTrack("A1"), compilation(), None, "mp3", SEQ)
     tags = MP3(path).tags
     assert str(tags["TCMP"]) == "1" and str(tags["TPE1"]) == "Blur / Pulp"
+
+
+def test_split_suite_parts_keep_their_own_credits_and_the_umbrella_gets_all():
+    """Fork only (split index tracks): exported as parts, each movement gets the credits
+    written on it; exported whole, the umbrella gets every movement's credits."""
+    from types import SimpleNamespace
+    suite = SimpleNamespace(
+        data={"position": "", "type_": "index", "title": "Suite", "duration": "",
+              "sub_tracks": [{"position": p, "title": f"Mvt {p}", "duration": "1:00"} for p in ("B4", "B5", "B6")]},
+        position="", title="Suite", duration="", artists=[], credits=[],
+    )
+    release = DiscogsRelease(FakeReleaseObj(
+        [FakeArtist("Beethoven")], [FakeTrackObj("B3", "Before"), suite],
+        genres=["Classical"], credits=[
+            FakeArtist("Kempff", role="Piano", tracks="B5"),
+            FakeArtist("Gould", role="Piano", tracks="B6"),
+            FakeArtist("Fournier", role="Cello", tracks="B4 to B6"),
+        ],
+    ))
+    handler = MetadataHandler(discogs_token="", user_agent="")
+    split = ["B3", "B4", "B5", "B6"]
+    performers = {p: handler._build_tag_set(FakeTrack(p), release, None, "vinyl", split).performers for p in split[1:]}
+    assert performers == {
+        "B4": (("Fournier", "Cello"),),
+        "B5": (("Kempff", "Piano"), ("Fournier", "Cello")),
+        "B6": (("Gould", "Piano"), ("Fournier", "Cello")),
+    }
+    whole = handler._build_tag_set(FakeTrack("B4"), release, None, "vinyl", ["B3", "B4"]).performers
+    assert whole == (("Kempff", "Piano"), ("Gould", "Piano"), ("Fournier", "Cello"))
