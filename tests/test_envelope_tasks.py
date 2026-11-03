@@ -9,7 +9,9 @@ can be caught mid-decode; every test releases it, or the loop's executor shutdow
 would wait for the blocked thread forever."""
 
 import asyncio
+import shutil
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta
 
@@ -112,6 +114,38 @@ def test_delete_mid_decode_cancels_the_scan_and_sends_no_scan_complete(recording
 
     task = asyncio.run(scenario())
     assert task.cancelled()
+    assert scan_completes(recording) == []
+    assert recording["id"] not in api._envelope_tasks
+
+
+def test_decode_finishing_during_the_folder_removal_sends_no_scan_complete(recording, monkeypatch):
+    # Deleting a large session folder takes a while; a decode that ends meanwhile must not
+    # announce a recording that is being removed.  The fake rmtree (in the worker thread, like
+    # the real one) lets the decode finish and waits for the task before deleting.
+    decode = use_decode(monkeypatch, BlockingDecode())
+    real_rmtree = shutil.rmtree
+    tasks = {}
+
+    def slow_rmtree(path, *args, **kwargs):
+        decode.release.set()
+        deadline = time.monotonic() + 2
+        while not tasks["task"].done() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.05)  # done callbacks and the broadcast they schedule
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(api.shutil, "rmtree", slow_rmtree)
+
+    async def scenario():
+        tasks["task"] = task = api.start_envelope(recording["id"], recording["source"])
+        await until(decode.started)
+        try:
+            await api.remove_from_queue(recording["id"])
+        finally:
+            decode.release.set()
+        await settle(task)
+
+    asyncio.run(scenario())
     assert scan_completes(recording) == []
     assert recording["id"] not in api._envelope_tasks
 

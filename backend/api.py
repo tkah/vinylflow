@@ -256,6 +256,10 @@ def cleanup_session(file_id: str) -> bool:
     session = session_store.get(file_id)
     if session and session.export_reserved:
         return False
+    # Forget the background work first: removing a large folder takes a while, and a scan
+    # finishing meanwhile must not announce a recording that is going away.  The finally
+    # below catches work started during the removal (the Session still exists until then).
+    _forget_session_tasks(file_id)
     session_dir = get_session_path(file_id)
     try:
         if session_dir.exists():
