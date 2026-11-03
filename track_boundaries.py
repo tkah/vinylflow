@@ -326,10 +326,10 @@ class BoundaryInfo:
     """How one internal Track Boundary was placed."""
 
     index: int  # 1 = boundary between track 1 and 2
-    expected: float  # where the Discogs durations put it (gap centre or scaled)
+    expected: float  # where the Discogs durations put it ('align': this track's start + its own length)
     snapped: bool
     gap: Optional[Gap]  # the chosen Gap when snapped
-    position: float  # where the cut actually landed (gap midpoint if snapped)
+    position: float  # where the cut landed: gap midpoint if snapped; 'align': midway between the tracks
 
 
 @dataclass
@@ -339,7 +339,7 @@ class GuidedBoundaries:
     scale: float  # scale actually applied to the Discogs durations
     scale_clamped: bool  # True when span/total was outside the clamp (scale=1.0)
     raw_scale: float
-    model: str = "scale"  # 'gap', 'scale' (proportional), or 'sides' (anchored flip)
+    model: str = "scale"  # 'align' / 'align-even' (best match), 'gap', 'scale' (proportional), or 'sides' (anchored flip)
     gap_s: float = 0.0  # per-gap silence assumed by 'gap'; 0.0 for the other models
 
 

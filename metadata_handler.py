@@ -971,8 +971,11 @@ class MetadataHandler:
 
     @staticmethod
     def _sort_positions(positions) -> List[str]:
-        """Unique vinyl positions in side/track order (B6.1 after B5, before B6.2)."""
-        return sorted(set(positions), key=position_sort_key)
+        """Unique vinyl positions in side/track order (B6.1 after B5, before B6.2).
+
+        The position itself breaks ties (A2 < A2a < A2b share a sort key): the set() has no
+        stable order, so without it the numbering changed with the process's hash seed."""
+        return sorted(set(positions), key=lambda position: (position_sort_key(position), position))
 
     def _classical_tags(self, discogs_track, release, various: bool) -> dict:
         """Composer / conductor / ensemble / performers for one track of a

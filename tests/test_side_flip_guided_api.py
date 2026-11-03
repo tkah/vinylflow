@@ -50,3 +50,12 @@ def test_invalid_side_hints_are_rejected(recording, breaks):
         'file_id': recording, 'expected_tracks': 4, 'durations': [100] * 4, 'side_breaks': breaks,
     })
     assert response.status_code == 422
+
+
+def test_guided_endpoint_treats_an_infinite_length_as_unknown(recording):
+    """JSON 1e400 parses as float('inf'); it must not reach the response (inf is not valid JSON)."""
+    body = '{"file_id": "%s", "expected_tracks": 4, "durations": [100, 1e400, 100, 100]}' % recording
+    response = TestClient(api.app).post(
+        '/api/analyze-guided', content=body, headers={'Content-Type': 'application/json'})
+    assert response.status_code == 200, response.text
+    assert len(response.json()['tracks']) == 4

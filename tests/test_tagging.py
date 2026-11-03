@@ -266,3 +266,24 @@ def test_tag_file_threads_comment_to_every_format(monkeypatch):
         handler.tag_file("x", FakeTrack("A1"), make_release(), None, output_format, comment="C")
     handler.tag_file("x", FakeTrack("A1"), make_release(), None, "flac")
     assert seen == ["C", "C", "C", None]
+
+
+def test_sub_tracks_number_in_tracklist_order_on_every_hash_seed():
+    """A2a/A2b/A2c share a sort key. Deduplicating through a set() once made their order (and
+    so their track numbers) depend on the process's string hash seed, so two exports of the
+    same record could disagree. Each seed runs in its own process."""
+    import os
+    import subprocess
+    import sys
+
+    snippet = (
+        "from metadata_handler import MetadataHandler\n"
+        "release = ['A1', 'A2a', 'A2b', 'A2c', 'B1']\n"
+        "print(MetadataHandler._sort_positions(['B1', 'A2c'] + release))\n"
+    )
+    for seed in ("0", "1", "2", "3", "4"):
+        result = subprocess.run(
+            [sys.executable, "-c", snippet], capture_output=True, encoding="utf-8", check=True,
+            env={**os.environ, "PYTHONHASHSEED": seed}, cwd=os.path.dirname(os.path.dirname(__file__)),
+        )
+        assert result.stdout.strip() == "['A1', 'A2a', 'A2b', 'A2c', 'B1']", (seed, result.stdout)

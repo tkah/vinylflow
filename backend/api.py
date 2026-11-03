@@ -1301,7 +1301,8 @@ async def analyze_guided(request: GuidedAnalyzeRequest):
 
     durations = request.durations
     sized = durations is not None and len(durations) == request.expected_tracks
-    known = [d if d is not None and d > 0 else None for d in durations] if sized else []
+    # Zero, negative and non-finite lengths (JSON 1e400 parses as inf) count as unknown.
+    known = [d if d is not None and math.isfinite(d) and d > 0 else None for d in durations] if sized else []
     all_known = sized and all(d is not None for d in known)
     try_align = sized and request.expected_tracks >= 2  # no length at all: even split between clear gaps
 
@@ -1332,7 +1333,8 @@ async def analyze_guided(request: GuidedAnalyzeRequest):
                     side_breaks=side_breaks,
                 )
             if result is not None:
-                # Contiguous aligned cuts touch, so only the outer edges widen.
+                # Aligned cuts touch, so for them only the outer edges widen; the gap/scale
+                # model's snapped cuts can widen into their gaps.
                 refined = audio_processor.refine_tracks(db, result.tracks)
                 return refined, True, result, music_start, music_end
             tracks, info = audio_processor.tracks_for_count_from_envelope(
