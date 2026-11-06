@@ -25,19 +25,24 @@ from mutagen.id3 import (
 )
 from mutagen.aiff import AIFF
 from PIL import Image
+from config import DEFAULT_TRACK_NUMBERING
 
 from release_credits import (
+    COMPOSER_ROLES,
     VARIOUS_ARTISTS,
     ClassicalCredits,
     Credit,
+    artist_from_credits,
+    artist_names,
     classify_credits,
     clean_artist_name,
     credits_for_track,
     is_various,
     join_artist_names,
+    lone_artist_composer,
     parse_credits,
     performer_text,
-    sole_artist_name,
+    role_base,
 )
 from album_description import DIGITIZED_COMMENT, AlbumDescriptions
 from track_matching import match_tracklists
@@ -96,7 +101,7 @@ class DiscogsTrack:
         credits: Optional[List[Credit]] = None,
         raw_position: str = "",
         parts: Optional[List[dict]] = None,
-        sole_artist: str = "",
+        artist_names: Tuple[str, ...] = (),
     ):
         """
         Initialize Discogs track.
@@ -110,8 +115,7 @@ class DiscogsTrack:
             raw_position: Position as Discogs wrote it (credit track ranges use it)
             parts: For an umbrella track (a Discogs index track such as a suite),
                 its sub-tracks as ``{position, title, duration}``
-            sole_artist: The track artist when Discogs lists exactly one (classical
-                composer fallback on compilations), else ""
+            artist_names: The track's own artists, one name each (``artist`` joins them)
         """
         self.position = position
         self.parts = list(parts or [])
@@ -121,7 +125,7 @@ class DiscogsTrack:
         self.credits_resolved = False
         self.raw_position = raw_position or position
         self.artist = artist
-        self.sole_artist = sole_artist
+        self.artist_names = tuple(artist_names)
         self.credits = list(credits or [])
         self.title = title
         self.duration_str = duration
@@ -176,13 +180,19 @@ class DiscogsRelease:
         # Get artists
         artists = getattr(release, "artists", [])
         self.artist = join_artist_names(artists) or "Unknown Artist"
-        self.sole_artist = sole_artist_name(artists)
+        self.artist_names = artist_names(artists)
 
         # Handle various artists
         self.various_artists = is_various(self.artist)
 
-        self.genres = list(getattr(release, "genres", None) or [])
-        self.credits = parse_credits(getattr(release, "credits", None))
+        # Genres and release-level credits (Discogs ``extraartists``); classical tags use them.
+        # Read from the raw payload, which the fields above have loaded: discogs_client refreshes
+        # on any key the payload lacks, one more Discogs request. Plain fakes set attributes.
+        payload = getattr(release, "data", None)
+        if not isinstance(payload, dict):
+            payload = {"genres": getattr(release, "genres", None), "extraartists": getattr(release, "credits", None)}
+        self.genres = list(payload.get("genres") or [])
+        self.credits = parse_credits(payload.get("extraartists"))
 
         # Get label
         labels = getattr(release, "labels", [])
@@ -217,7 +227,7 @@ class DiscogsRelease:
             track_credits = parse_credits(getattr(track, "credits", None))
             extras = {
                 "artist": track_artist, "credits": track_credits, "raw_position": position,
-                "sole_artist": sole_artist_name(getattr(track, "artists", None) or []),
+                "artist_names": artist_names(getattr(track, "artists", None) or []),
             }
 
             # Skip Discogs side-heading entries (type_='heading').
@@ -429,7 +439,7 @@ def with_borrowed_work(release: DiscogsRelease, donor: DiscogsRelease, title_sou
         lengths = [DiscogsTrack("", "", p["duration"]).duration_seconds for p in parts]
         total = _format_duration(sum(lengths)) if all(length is not None for length in lengths) else ""
         borrowed = DiscogsTrack(
-            parts[0]["position"], umbrella.title, total, artist=umbrella.artist, sole_artist=umbrella.sole_artist,
+            parts[0]["position"], umbrella.title, total, artist=umbrella.artist, artist_names=umbrella.artist_names,
             credits=credits_for_track(donor.credits, umbrella.credits, umbrella.position, donor_positions),
             raw_position=parts[0]["position"], parts=parts,
         )
@@ -442,7 +452,7 @@ def with_borrowed_work(release: DiscogsRelease, donor: DiscogsRelease, title_sou
             if track is None:
                 raise ValueError(f"The title source has no track {source_position}.")
             plain = DiscogsTrack(
-                new_position, track.title, track.duration_str, artist=track.artist, sole_artist=track.sole_artist,
+                new_position, track.title, track.duration_str, artist=track.artist, artist_names=track.artist_names,
                 credits=credits_for_track(donor.credits, track.credits, track.position, donor_positions),
             )
             plain.credits_resolved = True
@@ -843,7 +853,7 @@ class MetadataHandler:
         release: DiscogsRelease,
         cover_data: Optional[bytes] = None,
         output_format: str = "flac",
-        track_numbering: str = "vinyl",
+        track_numbering: str = DEFAULT_TRACK_NUMBERING,
         job_positions: Optional[List[str]] = None,
         prefix_part_titles: bool = True,
         comment: Optional[str] = None,
@@ -915,7 +925,7 @@ class MetadataHandler:
                         self._part_title(dt.title, part.get("title", ""), prefix_part_titles),
                         part.get("duration", ""),
                         artist=dt.artist,
-                        sole_artist=dt.sole_artist,
+                        artist_names=dt.artist_names,
                         # A borrowed part carries its own resolved credits.
                         credits=part["credits"] if "credits" in part else dt.credits,
                     )
@@ -964,7 +974,7 @@ class MetadataHandler:
     @staticmethod
     def _disc_of(position: str) -> Optional[int]:
         """LP number of a vinyl position: A,B→1  C,D→2  E,F→3 …; None if unrecognised."""
-        m = re.match(r'^([A-Z]+)\d+', position or "")
+        m = re.match(r'^([A-Z])\1*\d+', position or "")
         if not m:
             return None
         return (ord(m.group(1)[0]) - ord('A') + 2) // 2
@@ -976,6 +986,22 @@ class MetadataHandler:
         The position itself breaks ties (A2 < A2a < A2b share a sort key): the set() has no
         stable order, so without it the numbering changed with the process's hash seed."""
         return sorted(set(positions), key=lambda position: (position_sort_key(position), position))
+
+    @staticmethod
+    def _own_and_lent_credits(release) -> Tuple[List[Credit], List[Credit]]:
+        """Every credit on the release, whatever tracks it covers: its own, and those a title
+        source lends it (borrowed tracks and their parts, the donor's conductor and ensemble)."""
+        own, lent = list(getattr(release, "credits", [])), []
+        for release_track in release.tracks:
+            target = lent if getattr(release_track, "credits_resolved", False) else own
+            target += getattr(release_track, "credits", [])
+            for part in getattr(release_track, "parts", None) or []:
+                lent += part.get("credits") or []
+        fallback = getattr(release, "fallback_credits", None)
+        if fallback is not None:
+            lent += [Credit(name, "Conductor") for name in fallback.conductors]
+            lent += [Credit(name, "Ensemble") for name in fallback.ensembles]
+        return own, lent
 
     def _classical_tags(self, discogs_track, release, various: bool) -> dict:
         """Composer / conductor / ensemble / performers for one track of a
@@ -1008,15 +1034,20 @@ class MetadataHandler:
                     found.ensembles or fallback.ensembles,
                     found.performers,
                 )
-        # No composer credit: a lone release artist (on a compilation, a lone track
-        # artist) is the best guess; a line that also names performers is no composer.
-        fallback_composer = (
-            getattr(discogs_track, "sole_artist", "") if various else getattr(release, "sole_artist", "")
-        )
-        # Conventional classical ARTIST order: soloists, then ensembles, then the conductor.
-        performer_names = list(dict.fromkeys(
-            [name for name, _ in found.performers] + list(found.ensembles) + list(found.conductors)
-        ))
+        own, lent = self._own_and_lent_credits(release)
+        # Who a name is shows in any credit; whether a composer is known is up to the release
+        # this track's credits come from (a title source never fills composers on the others).
+        speaks_for_track, other = (lent, own) if getattr(discogs_track, "credits_resolved", False) else (own, lent)
+        evidence = speaks_for_track + [c for c in other if role_base(c.role) not in COMPOSER_ROLES]
+        # A compilation's track artist is as often the singer as the composer: no guess there.
+        fallback_composer = "" if various else lone_artist_composer(getattr(release, "artist_names", ()), evidence)
+        performer_names = artist_from_credits(found)
+        # Credits often name only part of the line up, so they replace ARTIST only when no
+        # one would be lost from it; the composer isn't lost, ARTIST is for the performers.
+        main_artists = getattr(discogs_track, "artist_names", ()) if various else getattr(release, "artist_names", ())
+        accounted_for = {*performer_names, *classify_credits(own + lent).composers, fallback_composer}
+        if not accounted_for.issuperset(main_artists):
+            performer_names = []
         return {
             "composers": found.composers or ((fallback_composer,) if fallback_composer else ()),
             "conductors": found.conductors,
@@ -1030,7 +1061,7 @@ class MetadataHandler:
         track: "Track",
         release: DiscogsRelease,
         cover_data: Optional[bytes],
-        track_numbering: str = "vinyl",
+        track_numbering: str = DEFAULT_TRACK_NUMBERING,
         processed_positions: Optional[List[str]] = None,
         prefix_part_titles: bool = True,
         comment: Optional[str] = None,
@@ -1056,7 +1087,7 @@ class MetadataHandler:
             else:
                 track_total = str(sum(self._disc_of(p) == int(disc_str) for p in positions))
                 discs = {self._disc_of(t.position) for t in release.tracks} - {None}
-                disc_total = str(max(len(discs), int(disc_str)))
+                disc_total = str(max(discs | {int(disc_str)}))
         else:
             disc_str, track_str = None, track.vinyl_number
 
@@ -1239,7 +1270,7 @@ class MetadataHandler:
         track: "Track",
         release: DiscogsRelease,
         cover_data: Optional[bytes] = None,
-        track_numbering: str = "vinyl",
+        track_numbering: str = DEFAULT_TRACK_NUMBERING,
         job_positions: Optional[List[str]] = None,
         prefix_part_titles: bool = True,
         comment: Optional[str] = None,
@@ -1268,7 +1299,7 @@ class MetadataHandler:
         release: DiscogsRelease,
         cover_data: Optional[bytes],
         open_audio,
-        track_numbering: str = "vinyl",
+        track_numbering: str = DEFAULT_TRACK_NUMBERING,
         job_positions: Optional[List[str]] = None,
         prefix_part_titles: bool = True,
         comment: Optional[str] = None,
@@ -1297,14 +1328,14 @@ class MetadataHandler:
             print(f"Failed to tag {file_path}: {e}")
             return False
 
-    def _tag_mp3(self, file_path, track, release, cover_data=None, track_numbering="vinyl",
+    def _tag_mp3(self, file_path, track, release, cover_data=None, track_numbering=DEFAULT_TRACK_NUMBERING,
                  job_positions=None, prefix_part_titles=True, comment=None):
         return self._tag_id3_format(
             file_path, track, release, cover_data, lambda p: MP3(p, ID3=ID3), track_numbering,
             job_positions, prefix_part_titles, comment,
         )
 
-    def _tag_aiff(self, file_path, track, release, cover_data=None, track_numbering="vinyl",
+    def _tag_aiff(self, file_path, track, release, cover_data=None, track_numbering=DEFAULT_TRACK_NUMBERING,
                   job_positions=None, prefix_part_titles=True, comment=None):
         return self._tag_id3_format(
             file_path, track, release, cover_data, AIFF, track_numbering, job_positions,

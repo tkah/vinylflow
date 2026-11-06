@@ -150,7 +150,8 @@ def raw(position, title, duration="", type_="track", sub_tracks=None, credits=()
 def synthetic(rel_id, title, tracklist, credits=(), artist="Composer", genres=("Classical",)):
     return DiscogsRelease(SimpleNamespace(
         id=rel_id, title=title, year=2000, artists=[SimpleNamespace(name=artist, data={"name": artist}, join="", anv="")],
-        labels=[], formats=[], images=[], genres=list(genres), credits=list(credits), data={}, tracklist=tracklist))
+        labels=[], formats=[], images=[], tracklist=tracklist,
+        data={"genres": list(genres), "extraartists": list(credits)}))
 
 
 def test_primary_release_credits_do_not_apply_to_borrowed_tracks():
@@ -196,6 +197,39 @@ def test_plain_donor_tracks_become_plain_tracks_with_resolved_credits():
     assert second.performers == (("Soloist", "Cello"),)
     assert tags(result, "A2").performers == ()  # the cello credit covers donor track 2 only
     assert tags(result, "A2").conductors == ("Donor Conductor",)
+
+
+def test_a_conductor_lent_by_the_title_source_is_not_guessed_as_composer():
+    """The primary lists its conductor alone and credits nobody: only the donor shows who they are."""
+    primary = synthetic(1, "Primary", [raw("A1", "Old"), raw("A2", "Keep")], artist="Karajan")
+    donor = synthetic(2, "Donor", [raw("1", "New", "3:00")], credits=[person("Karajan", "Conductor")])
+    result = with_borrowed_work(primary, donor, TitleSourceSpec(2, "A1", None, (("A1", donor.tracks[0].position),)))
+    assert tags(result, "A2").composers == ()
+    assert tags(result, "A2").conductors == ("Karajan",)
+
+
+def test_composer_guess_follows_the_release_a_track_takes_its_credits_from():
+    """The donor's composer credit rules out a guess on its own movements, not on the primary's."""
+    primary = synthetic(1, "Primary", [raw("A1", "Old"), raw("A2", "Keep")], artist="Gould")
+    donor = synthetic(2, "Donor", [raw("", "Work", "", "index", [
+        {"position": "A1", "type_": "track", "title": "I", "duration": "1:00"},
+        {"position": "A2", "type_": "track", "title": "II", "duration": "2:00"}])],
+        credits=[person("Bach", "Composed By", "A2")])
+    result = with_borrowed_work(primary, donor, TitleSourceSpec(
+        2, "A1", donor.tracks[0].position, (("A1", "A1"), ("A1.1", "A2"))))
+    assert tags(result, "A1.1").composers == ("Bach",)
+    assert tags(result, "A1").composers == ()  # same donor, unresolved: left empty
+    assert tags(result, "A2").composers == ("Gould",)  # composers are never filled
+
+
+def test_a_borrowed_performer_does_not_push_the_main_artists_out_of_artist():
+    primary = synthetic(1, "Primary", [raw("A1", "Old"), raw("A2", "Keep")], artist="Berliner Philharmoniker",
+                        credits=[person("Berliner Philharmoniker", "Orchestra", "A2")])
+    donor = synthetic(2, "Donor", [raw("1", "New", "3:00")], credits=[person("Soloist", "Violin [Solo]")])
+    result = with_borrowed_work(primary, donor, TitleSourceSpec(2, "A1", None, (("A1", donor.tracks[0].position),)))
+    borrowed = tags(result, "A1")
+    assert borrowed.artist == "Berliner Philharmoniker" and borrowed.composers == ()
+    assert borrowed.performers == (("Soloist", "Violin"),)
 
 
 # ---- validation errors ----

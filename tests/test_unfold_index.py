@@ -34,7 +34,7 @@ def symphony(genres=("Classical",)):
     return DiscogsRelease(SimpleNamespace(
         id=424244, title="Dvorak: New World", year=1960, artists=[SimpleNamespace(
             name="Antonín Dvořák", data={"name": "Antonín Dvořák"}, join="", anv="")],
-        labels=[], formats=[], images=[], genres=list(genres), credits=[], data={},
+        labels=[], formats=[], images=[], data={"genres": list(genres), "extraartists": []},
         tracklist=[index]))
 
 

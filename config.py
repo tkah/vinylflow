@@ -16,6 +16,9 @@ from dotenv import load_dotenv
 #                            appears as 1 disc. VINYLPOSITION custom tag preserved.
 # "vinyl"                  — TRACKNUMBER="A1" (legacy behaviour, no DISCNUMBER written).
 DEFAULT_TRACK_NUMBERING = "sequential_disc_per_lp"
+TRACK_NUMBERING_SCHEMES = ("sequential_disc_per_lp", "vinyl")
+# What a value that isn't a scheme has always acted as.
+LEGACY_TRACK_NUMBERING = "vinyl"
 OUTPUT_FORMATS = ("flac", "mp3", "aiff")
 BIT_DEPTHS = ("source", "24")
 DECLICK_LEVELS = ("off", "light", "medium", "strong")
@@ -96,10 +99,7 @@ class Config:
         self.temp_ttl_hours = float(os.getenv("TEMP_TTL_HOURS", "2"))
 
         # Track numbering scheme
-        self.track_numbering = (
-            json_settings.get("TRACK_NUMBERING")
-            or os.getenv("TRACK_NUMBERING", DEFAULT_TRACK_NUMBERING)
-        )
+        self.track_numbering = self._resolve_track_numbering(json_settings)
 
         # Remembered export defaults (output format, rumble/declick, album gain)
         output_format = json_settings.get("OUTPUT_FORMAT") or os.getenv("OUTPUT_FORMAT", "flac")
@@ -159,6 +159,16 @@ class Config:
         if isinstance(value, bool):
             return value
         return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+    def _resolve_track_numbering(self, json_settings: dict) -> str:
+        """The numbering scheme; an unknown value warns and keeps acting as ``vinyl``."""
+        scheme = json_settings.get("TRACK_NUMBERING") or os.getenv("TRACK_NUMBERING")
+        if not scheme:
+            return DEFAULT_TRACK_NUMBERING
+        if scheme not in TRACK_NUMBERING_SCHEMES:
+            print(f"Warning: unknown TRACK_NUMBERING {scheme!r}, using {LEGACY_TRACK_NUMBERING!r}")
+            return LEGACY_TRACK_NUMBERING
+        return scheme
 
     def validate(self):
         """

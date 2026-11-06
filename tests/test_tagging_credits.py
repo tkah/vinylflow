@@ -163,7 +163,7 @@ def test_classical_credits_and_track_ranges():
         FakeArtist("Pierre Fournier", role="Cello", tracks="B1, B2"),
         FakeArtist("Some Producer", role="Producer"),
         FakeArtist("Some Engineer", role="Recorded By", tracks="A1"),
-    ])
+    ], artist="Ludwig van Beethoven")
     a1, b2 = tags_for(release, "A1"), tags_for(release, "B2")
     assert a1.composers == ("Ludwig van Beethoven",)
     assert a1.conductors == ("Herbert von Karajan",)
@@ -175,7 +175,7 @@ def test_classical_credits_and_track_ranges():
     assert ("Pierre Fournier", "Cello") in b2.performers
     assert ("Pierre Fournier", "Cello") not in a1.performers
     assert ("Wilhelm Kempff", "Piano") not in b2.performers
-    assert b2.album_artist == "Beethoven"
+    assert b2.album_artist == "Ludwig van Beethoven"
 
 
 def test_classical_track_level_credits_and_artist_order():

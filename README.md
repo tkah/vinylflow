@@ -386,7 +386,7 @@ DEFAULT_FLAC_COMPRESSION=8
 **Config Priority**: `config/settings.json` (UI-editable) → `.env` (manual) → environment variables (Docker)
 
 **Track Numbering**: Configurable via Settings (⚙️) or by setting `TRACK_NUMBERING` in `config/settings.json`:
-- `sequential_disc_per_lp` *(default)* — writes integer `DISCNUMBER` (A+B = disc 1, C+D = disc 2) and sequential `TRACKNUMBER` across both sides of each LP, with track/disc totals (`TRACKTOTAL`/`DISCTOTAL`, or `n/total` in ID3) and the original vinyl position preserved in a `VINYLPOSITION` tag. Single LPs appear as one disc; 2-LP sets appear as two. When several recordings of one release are exported together, numbering and totals span all of them.
+- `sequential_disc_per_lp` *(default)* — writes integer `DISCNUMBER` (A+B = disc 1, C+D = disc 2) and sequential `TRACKNUMBER` across both sides of each LP, with track/disc totals (`TRACKTOTAL`/`DISCTOTAL`, or `n/total` in ID3) and the original vinyl position preserved in a `VINYLPOSITION` tag. Single LPs appear as one disc; 2-LP sets appear as two. When several recordings of one release are exported together, numbering and totals span all of them. The disc comes from the side letter, so a release whose sides skip letters on Discogs (A, B, E, F) counts as 3 discs, and tracks on other media (`CD1`, `DVD1`) keep their position as `TRACKNUMBER` with no disc or totals.
 - `vinyl` — writes the vinyl position (e.g. `A1`, `B2`) directly as `TRACKNUMBER`, without totals. Preserves vinyl notation but some players (Jellyfin, Roon) may mis-sort tracks.
 
 ### Silence Detection Tips
