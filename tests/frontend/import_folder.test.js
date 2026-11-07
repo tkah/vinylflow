@@ -99,16 +99,76 @@ function reset(files = []) {
 
     // ---- desktop picker: paths -> POST; cancel -> no POST ----
     reset(); postReply = (b) => ({ files: [{ id: 'p1', filename: 'p.wav', size: 1, duration: 61, in_place: true }], skipped: [] });
-    global.window.pywebview = { api: { choose_import_files: async () => ['/Users/me/p.wav'] } };
+    global.window.pywebview = { api: { choose_import_files: async () => ['/Users/you/p.wav'] } };
     a = mkApp();
     await a.chooseImportFiles();
-    assert.deepStrictEqual(posts, [{ paths: ['/Users/me/p.wav'] }]);
+    assert.deepStrictEqual(posts, [{ paths: ['/Users/you/p.wav'] }]);
     assert.strictEqual(a.uploadedFiles.length, 1);
     posts.length = 0;
     global.window.pywebview.api.choose_import_files = async () => [];
     await a.chooseImportFiles();
     assert.strictEqual(posts.length, 0);
     delete global.window.pywebview;
+
+    // ---- a file that changed on disk came back as a new session. These use the real selectFile:
+    // it saves the open workspace first, which would bring the dropped session's work back ----
+    const replacedReply = () => ({ files: [{ id: 'new', filename: 'a.wav', size: 9, duration: 90, in_place: true, replaces: 'old' }], skipped: [] });
+    const realApp = () => {
+        const app = vinylApp();
+        app.discogsConfigured = false;   // selectFile would search
+        app.uploadedFiles = [{ id: 'old', filename: 'a.wav', status: 'analyzed', in_place: true }, { id: 'other', filename: 'b.wav', status: 'analyzed' }];
+        app.workspaces = { old: { detectedTracks: [{ number: 1 }] } };
+        return app;
+    };
+
+    reset([row('a.wav', { imported_id: 'old' })]);
+    postReply = replacedReply;
+    a = realApp();
+    a.currentFileId = 'old'; a.currentFile = a.uploadedFiles[0]; a.detectedTracks = [{ number: 1, start: 0, end: 9 }];
+    await a.postImport({ names: ['a.wav'] });
+    assert.deepStrictEqual(a.uploadedFiles.map(f => f.id), ['other', 'new'], 'the stale entry is gone');
+    assert.strictEqual(a.currentFileId, 'new', 'the editor moves to the new session');
+    assert.strictEqual(a.detectedTracks.length, 0, 'the old splits are not shown on the new audio');
+    assert.ok(!('old' in a.workspaces), 'and its saved work does not come back');
+    assert.ok(a.toasts.some(t => t.type === 'warning' && t.message.includes('changed')), 'it says why the splits are gone');
+
+    // a replaced file that isn't open leaves the editor where it is
+    reset([row('a.wav', { imported_id: 'old' })]);
+    postReply = replacedReply;
+    a = realApp();
+    a.currentFileId = 'other'; a.currentFile = a.uploadedFiles[1]; a.detectedTracks = [{ number: 1, start: 0, end: 9 }];
+    await a.postImport({ names: ['a.wav'] });
+    assert.strictEqual(a.currentFileId, 'other');
+    assert.strictEqual(a.detectedTracks.length, 1);
+    assert.ok(!('old' in a.workspaces));
+
+    // selectFile refuses during detection: the dropped session must not stay on screen
+    reset([row('a.wav', { imported_id: 'old' })]);
+    postReply = replacedReply;
+    a = realApp();
+    a.currentFileId = 'old'; a.currentFile = a.uploadedFiles[0]; a.analyzing = true;
+    await a.postImport({ names: ['a.wav'] });
+    assert.notStrictEqual(a.currentFileId, 'old');
+    assert.ok(a.uploadedFiles.some(f => f.id === 'new'), 'the new row is there to open');
+
+    // recordings locked in this browser are named, so the server won't replace them
+    reset();
+    a = mkApp();
+    a.uploadedFiles = [{ id: 'q', filename: 'q.wav', status: 'queued' }, { id: 'r', filename: 'r.wav', status: 'analyzed' }];
+    await a.postImport({ names: ['x.wav'] });
+    assert.deepStrictEqual(posts, [{ names: ['x.wav'], locked_ids: ['q'] }]);
+
+    // ---- default tab: the folder only when it has something to show. An empty folder would
+    // otherwise hide the drop zone from a first-time user ----
+    reset([row('a.wav')]);
+    a = mkApp(); await a.loadImportList();
+    a.chooseDefaultImportTab();
+    assert.strictEqual(a.importTab, 'folder', 'a folder with recordings opens on the folder tab');
+    reset([]);
+    a = mkApp(); await a.loadImportList();
+    a.chooseDefaultImportTab();
+    assert.strictEqual(a.importTab, 'upload', 'an empty folder opens on the drop zone');
+    assert.strictEqual(a.showFolderTab, true, 'the folder tab stays available');
 
     // ---- in-place removal: wording + list refresh after DELETE only ----
     reset([row('a.wav', { imported_id: 'q1' })]);

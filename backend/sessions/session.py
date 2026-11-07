@@ -46,6 +46,9 @@ class Session:
     # True when source_audio is a file in the import folder, referenced in
     # place (never copied, never inside the session dir, never deleted).
     in_place: bool = False
+    # mtime of an in-place source when it was imported: with the size, it tells whether the
+    # file is still the one the cached envelope and boundaries describe.
+    source_mtime: Optional[float] = None
 
     state: SessionState = SessionState.READY
     release: Optional[Any] = None
@@ -72,6 +75,7 @@ class Session:
         source_size: int,
         source_bit_depth: Optional[int] = None,
         in_place: bool = False,
+        source_mtime: Optional[float] = None,
     ) -> "Session":
         return cls(
             id=str(uuid.uuid4()),
@@ -81,6 +85,7 @@ class Session:
             source_size=source_size,
             source_bit_depth=source_bit_depth,
             in_place=in_place,
+            source_mtime=source_mtime,
         )
 
     def link_release(self, release: Any) -> None:

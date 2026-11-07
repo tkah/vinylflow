@@ -332,7 +332,7 @@ function vinylApp() {
         searchMoreLoading: false,
         searchMoreError: '',
         detailsSettled: false,    // True once every result's tracklist load finished/failed
-        _detailInflight: {},      // release id -> in-flight detail fetch promise
+        _detailInflight: {},      // `${searchSeq}:${releaseId}` -> in-flight detail fetch promise
 
         // Smart Rescan
         expectedTracks: null,
@@ -501,7 +501,7 @@ function vinylApp() {
             this.detectDesktopPicker();
             window.addEventListener('pywebviewready', () => this.detectDesktopPicker());
             await this.loadImportList();
-            this.importTab = this.importInfo.enabled ? 'folder' : 'upload';
+            this.chooseDefaultImportTab();
 
             this.$watch('currentFile', (file) => {
                 if (file && !this.searchQuery) {
@@ -1637,6 +1637,11 @@ function vinylApp() {
             if (file.stable !== false) this.toggleImportSelected(file.name);
         },
 
+        /** Folder tab only when it has recordings: an empty one would hide the drop zone from a new user */
+        chooseDefaultImportTab() {
+            this.importTab = this.importInfo.files.length > 0 ? 'folder' : 'upload';
+        },
+
         /** Import the ticked folder files */
         async importSelectedFiles() {
             if (!this.importSelected.length) return;
@@ -1663,17 +1668,23 @@ function vinylApp() {
             this.importBusy = true;
             try {
                 await this.commitAllRemovals();
+                const lockedIds = this.uploadedFiles.filter(file => this.isLocked(file.id)).map(file => file.id);
                 const response = await fetch('/api/import', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(body)
+                    body: JSON.stringify(lockedIds.length ? { ...body, locked_ids: lockedIds } : body)
                 });
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 const data = await response.json();
 
                 const known = new Set(this.uploadedFiles.map(f => f.id));
                 const added = [];
+                let replacedCurrentBy = null;
                 (data.files || []).forEach(file => {
+                    if (file.replaces) {
+                        if (file.replaces === this.currentFileId) replacedCurrentBy = file.id;
+                        this.dropReplacedFile(file);
+                    }
                     if (known.has(file.id)) {
                         const existing = this.uploadedFiles.find(entry => entry.id === file.id);
                         if (file.status) existing.status = file.status;
@@ -1689,7 +1700,9 @@ function vinylApp() {
                     this.uploadedFiles.push(entry);
                     added.push(entry);
                 });
-                if (!this.currentFile && data.files?.length > 0) {
+                if (replacedCurrentBy) {
+                    this.selectFile(replacedCurrentBy);
+                } else if (!this.currentFile && data.files?.length > 0) {
                     this.selectFile((added[0] || data.files[0]).id);
                 } else if (data.files?.length === 1 && known.has(data.files[0].id) && !added.length) {
                     this.selectFile(data.files[0].id);
@@ -1708,6 +1721,18 @@ function vinylApp() {
                 this.importBusy = false;
             }
             await this.loadImportList();
+        },
+
+        /**
+         * The file changed on disk, so the server dropped its session and started over.  Closes
+         * it first: selectFile saves the open workspace, which would bring the old work back,
+         * and it refuses during detection, which would leave the dropped session on screen.
+         */
+        dropReplacedFile(file) {
+            if (file.replaces === this.currentFileId) this.closeCurrentFile();
+            this.uploadedFiles = this.uploadedFiles.filter(entry => entry.id !== file.replaces);
+            delete this.workspaces[file.replaces];
+            this.notify(`"${this.shortFilename(file.filename)}" changed on disk, so it was imported again. Earlier splits for it are gone.`, { type: 'warning' });
         },
 
         /**
@@ -1932,14 +1957,7 @@ function vinylApp() {
             this.pendingRemovals = { ...this.pendingRemovals, [fileId]: entry };
 
             this.uploadedFiles = this.uploadedFiles.filter(f => f.id !== fileId);
-            if (entry.wasCurrent) {
-                this.pauseWaveform();
-                this.destroyWaveform();
-                this.currentFileId = null;
-                this.currentFile = null;
-                this.detectedTracks = [];
-                this.resetEditState();
-            }
+            if (entry.wasCurrent) this.closeCurrentFile();
 
             const removedMsg = file.in_place
                 ? `Removed "${this.shortFilename(file.filename)}" from the queue. The original file stays in the import folder.`
@@ -1949,6 +1967,16 @@ function vinylApp() {
                 timeout: undoMs,
                 onClose: (reason) => { if (reason !== 'action') this.commitRemoval(fileId); }
             });
+        },
+
+        /** Leave the editor empty: the recording in it is going away */
+        closeCurrentFile() {
+            this.pauseWaveform();
+            this.destroyWaveform();
+            this.currentFileId = null;
+            this.currentFile = null;
+            this.detectedTracks = [];
+            this.resetEditState();
         },
 
         /** Put a soft-removed file back in its old queue position */
@@ -2027,11 +2055,11 @@ function vinylApp() {
             return Promise.all(Object.keys(this.pendingRemovals).map(id => this.commitRemoval(id, opts)));
         },
 
-        /** Return to the existing search UI while keeping all current cuts. */
+        /** Return to the existing search UI while keeping all current cuts; searches only if it has no results. */
         tryDiscogsAgain() {
             if (this.analyzing || this.currentLocked) return;
             if (!this.searchQuery.trim()) this.searchQuery = this.cleanFilename(this.currentFile?.filename || '');
-            this.searchDiscogs();
+            if (this.searchResults.length === 0) this.searchDiscogs();
             this.$nextTick(() => {
                 if (typeof document === 'undefined') return;
                 const search = document.getElementById('discogs-search');
@@ -2076,7 +2104,9 @@ function vinylApp() {
                     this.resetMappingToTargets();
                 }
 
-                await this.initWaveform();
+                // No tracks, no waveform: initWaveform keeps an existing one, so a retry's tracks
+                // would get no regions.
+                if (this.detectedTracks.length) await this.initWaveform();
             } catch (error) {
                 console.error('Analysis failed:', error);
                 this.notifyError('Analysis failed', error);
@@ -2364,7 +2394,10 @@ function vinylApp() {
         loadReleaseDetails(id, seq = this.searchSeq) {
             const existing = this.searchResults.find(r => r.id === id);
             if (existing && existing.tracks) return Promise.resolve(true);
-            if (this._detailInflight[id]) return this._detailInflight[id];
+            // Keyed by search too: a load left over from the previous search must not be handed
+            // to this one (its reply is dropped, so the card would stay pending).
+            const key = `${seq}:${id}`;
+            if (this._detailInflight[key]) return this._detailInflight[key];
 
             const promise = (async () => {
                 try {
@@ -2386,10 +2419,10 @@ function vinylApp() {
                     console.error('Release details failed:', error);
                     return false;
                 } finally {
-                    delete this._detailInflight[id];
+                    delete this._detailInflight[key];
                 }
             })();
-            this._detailInflight[id] = promise;
+            this._detailInflight[key] = promise;
             return promise;
         },
 

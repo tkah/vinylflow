@@ -217,3 +217,90 @@ def test_listing_and_reimport_distinguish_queued_from_completed(env):
         again = client.post("/api/import", json={"names": ["again.wav"]}).json()["files"][0]
         assert again["id"] == entry["id"]
         assert again["status"] == expected
+
+
+def _import(name, **extra):
+    return client.post("/api/import", json={"names": [name], **extra}).json()
+
+
+@pytest.mark.parametrize("seconds", [3, 1], ids=["longer", "same size"])
+def test_a_file_changed_since_its_import_starts_a_new_session(env, seconds):
+    """A re-recorded side under the same name must not reuse the old envelope and boundaries:
+    the export would cut the new audio at the old splits."""
+    imp, up, _ = env
+    src = _wav(imp / "side.wav", 1, age=7200)
+    old_id = _import("side.wav")["files"][0]["id"]
+    (up / old_id / "envelope.npy").write_bytes(b"of the old file")
+
+    _wav(src, seconds, age=3600)
+    before = _sha(src)
+    entry = _import("side.wav")["files"][0]
+
+    assert entry["id"] != old_id and entry["replaces"] == old_id
+    assert entry["size"] == src.stat().st_size
+    assert session_store.get(old_id) is None and not (up / old_id).exists()
+    assert session_store.get(entry["id"]).source_audio == src.resolve()
+    assert _sha(src) == before, "starting over never touches the source"
+
+
+def test_an_unchanged_file_keeps_its_session(env):
+    imp, _, _ = env
+    _wav(imp / "side.wav", 1, age=7200)
+    old_id = _import("side.wav")["files"][0]["id"]
+    entry = _import("side.wav")["files"][0]
+    assert entry["id"] == old_id and "replaces" not in entry
+
+
+def test_a_file_being_overwritten_is_not_reused(env):
+    imp, _, _ = env
+    src = _wav(imp / "side.wav", 1, age=7200)
+    old_id = _import("side.wav")["files"][0]["id"]
+    _wav(src, 2, age=0)
+    body = _import("side.wav")
+    assert body["files"] == [] and "still being copied" in body["skipped"][0]["reason"]
+    assert session_store.get(old_id) is not None
+
+
+def _lock_by_state(session):
+    session.state = api.SessionState.PROCESSING
+
+
+def _lock_by_album_reservation(session):
+    session.export_reserved = True
+
+
+@pytest.mark.parametrize("lock", [_lock_by_state, _lock_by_album_reservation], ids=["exporting", "reserved"])
+def test_a_file_changed_during_its_export_is_refused(env, lock):
+    """An album job holds its members reserved through the final tags, not just while each one
+    exports, and it reads the source path it was given."""
+    imp, _, _ = env
+    src = _wav(imp / "side.wav", 1, age=7200)
+    old_id = _import("side.wav")["files"][0]["id"]
+    lock(session_store.get(old_id))
+    _wav(src, 2, age=3600)
+    body = _import("side.wav")
+    assert body["files"] == [] and "export" in body["skipped"][0]["reason"]
+    assert session_store.get(old_id) is not None
+
+
+def test_a_file_waiting_for_its_export_in_the_browser_is_not_replaced(env):
+    """The browser's export queue and batches hold frozen requests the server knows nothing
+    about yet: dropping their session would strand them, so the browser names them."""
+    imp, _, _ = env
+    src = _wav(imp / "side.wav", 1, age=7200)
+    old_id = _import("side.wav")["files"][0]["id"]
+    _wav(src, 2, age=3600)
+    body = _import("side.wav", locked_ids=[old_id])
+    assert body["files"] == [] and "export" in body["skipped"][0]["reason"]
+    assert session_store.get(old_id) is not None
+
+
+def test_a_timestamp_from_a_faster_clock_counts_as_settled(env):
+    """A NAS clock ahead of ours, or timestamps preserved from such a machine: the file is not
+    being written, and a negative age would otherwise never reach the stable age."""
+    imp, _, _ = env
+    src = _wav(imp / "future.wav")
+    ahead = time.time() + 120
+    os.utime(src, (ahead, ahead))
+    assert client.get("/api/import").json()["files"][0]["stable"] is True
+    assert _import("future.wav")["skipped"] == []

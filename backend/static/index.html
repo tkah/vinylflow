@@ -639,7 +639,7 @@
                     <!-- Import from folder: files are read in place, never uploaded -->
                     <div x-show="showFolderTab && importTab === 'folder'" x-cloak>
                         <div class="flex items-center gap-2 mb-2">
-                            <p class="text-xs text-muted flex-1 min-w-0 truncate" :title="importInfo.dir" x-text="importInfo.dir"></p>
+                            <p class="text-xs text-secondary flex-1 min-w-0 truncate" :title="importInfo.dir" x-text="importInfo.dir"></p>
                             <button x-show="importInfo.enabled" @click="loadImportList()" :disabled="importLoading" title="Refresh the folder list"
                                     class="px-2 py-1 rounded text-xs text-secondary hover:bg-page" style="background-color: #F0EFEB;"
                                     :class="{'opacity-60 cursor-not-allowed': importLoading}">↻ Refresh</button>
@@ -650,7 +650,7 @@
                         <template x-if="importInfo.enabled && !importInfo.error">
                             <div>
                                 <template x-if="importInfo.files.length === 0">
-                                    <p class="text-muted text-center py-4 text-sm" x-text="`No WAV/AIFF files in ${importInfo.dir}. Copy recordings there and press Refresh.`"></p>
+                                    <p class="text-secondary text-center py-4 text-sm" x-text="`No WAV/AIFF files in ${importInfo.dir}. Copy recordings there and press Refresh.`"></p>
                                 </template>
                                 <template x-if="importInfo.files.length > 0">
                                     <div>
@@ -665,7 +665,7 @@
                                                     <input type="checkbox" @click.stop :checked="isImportSelected(file.name)" @change="toggleImportSelected(file.name)"
                                                            :disabled="file.stable === false" :aria-label="`Select ${file.name}`">
                                                     <span class="flex-1 min-w-0 truncate font-medium text-primary" :title="file.name" x-text="file.name"></span>
-                                                    <span class="text-muted whitespace-nowrap" x-text="formatSize(file.size)"></span>
+                                                    <span class="text-secondary whitespace-nowrap" x-text="formatSize(file.size)"></span>
                                                     <span class="text-secondary whitespace-nowrap"
                                                           :style="importFileLabel(file) === 'Complete' ? 'color: #166534; font-weight: 600;' : ''"
                                                           x-text="importFileLabel(file)"></span>
@@ -755,7 +755,7 @@
                                     <div class="flex justify-between items-start">
                                         <div class="flex-1 min-w-0">
                                             <p class="font-medium text-xs truncate text-primary"><span x-text="file.filename"></span>
-                                                <span x-show="file.in_place" class="ml-1 px-1 rounded text-muted align-middle" style="background-color: rgba(138, 138, 134, 0.2); font-size: 0.65rem;" title="Read from the import folder — the original is never modified or deleted">in place</span></p>
+                                                <span x-show="file.in_place" class="ml-1 px-1 rounded text-secondary align-middle" style="background-color: rgba(138, 138, 134, 0.2); font-size: 0.65rem;" title="Read from the import folder — the original is never modified or deleted">in place</span></p>
                                             <p class="text-xs text-muted" x-text="formatSize(file.size) + ' • ' + formatDuration(file.duration)"></p>
                                             <p class="text-xs mt-1 font-semibold text-primary"
                                                :style="queueLabel(file) === 'Complete' ? 'color: #166534;' : ''"
@@ -901,46 +901,46 @@
                             <img :src="result.cover_url || ''" :alt="result.title" class="w-full aspect-square object-cover rounded mb-2" style="background-color: #F0EFEB;" onerror="this.style.display='none'">
                             <p class="font-semibold text-sm truncate text-primary" x-text="result.artist"></p>
                             <p class="text-xs text-secondary truncate" x-text="result.title"></p>
-                            <p class="text-xs text-muted" x-text="result.year"></p>
+                            <p class="text-xs text-secondary" x-text="result.year"></p>
                             <p class="text-xs text-secondary mt-1">
                                 <template x-if="result.tracks">
                                     <span>
                                         <span x-text="`${result.tracks.length} tracks`"></span>
-                                        <span x-show="releaseSides(result).length > 0" class="text-muted ml-1" x-text="sidesSummary(result)"></span>
+                                        <span x-show="releaseSides(result).length > 0" class="ml-1" x-text="sidesSummary(result)"></span>
                                     </span>
                                 </template>
                                 <template x-if="!result.tracks">
-                                    <span class="text-muted" x-text="result.detailStatus === 'error' ? '– tracks' : '… tracks'"></span>
+                                    <span x-text="result.detailStatus === 'error' ? '– tracks' : '… tracks'"></span>
                                 </template>
                             </p>
                             <template x-if="!result.tracks && result.opening">
-                                <span class="inline-block mt-1 px-2 py-0.5 rounded-full text-xs font-medium" style="background-color: #F0EFEB; color: #A87500;">
+                                <span class="inline-block mt-1 px-2 py-0.5 rounded-full text-xs font-medium" style="background-color: #F0EFEB; color: #7A5400;">
                                     <span class="inline-block w-3 h-3 border-2 rounded-full animate-spin align-middle mr-1" style="border-color: #E5A100; border-top-color: transparent;"></span>Loading tracklist…
                                 </span>
                             </template>
                             <template x-if="!result.tracks && !result.opening && result.detailStatus === 'error'">
-                                <span class="inline-block mt-1 px-2 py-0.5 rounded-full text-xs font-medium" style="background-color: rgba(229, 161, 0, 0.15); color: #A87500;">couldn't load tracklist · click to retry</span>
+                                <span class="inline-block mt-1 px-2 py-0.5 rounded-full text-xs font-medium" style="background-color: rgba(229, 161, 0, 0.15); color: #7A5400;">couldn't load tracklist · click to retry</span>
                             </template>
                             <template x-if="!result.tracks && !result.opening && result.detailStatus !== 'error'">
-                                <span class="inline-block mt-1 px-2 py-0.5 rounded-full text-xs font-medium text-muted" style="background-color: #F0EFEB;">checking lengths…</span>
+                                <span class="inline-block mt-1 px-2 py-0.5 rounded-full text-xs font-medium" style="background-color: #F0EFEB; color: #5E5E5A;">checking lengths…</span>
                             </template>
                             <template x-if="result.tracks && releaseDurationInfo(result).status === 'full'">
-                                <span class="inline-block mt-1 px-2 py-0.5 rounded-full text-xs font-semibold" style="background-color: rgba(16, 185, 129, 0.15); color: #0B8F63;">⏱ Track lengths</span>
+                                <span class="inline-block mt-1 px-2 py-0.5 rounded-full text-xs font-semibold" style="background-color: rgba(16, 185, 129, 0.15); color: #0A6B4B;">⏱ Track lengths</span>
                             </template>
                             <template x-if="result.tracks && releaseDurationInfo(result).status === 'partial'">
-                                <span class="inline-block mt-1 px-2 py-0.5 rounded-full text-xs font-semibold" style="background-color: rgba(229, 161, 0, 0.15); color: #A87500;" x-text="`⏱ ${releaseDurationInfo(result).withDuration}/${releaseDurationInfo(result).total} lengths`"></span>
+                                <span class="inline-block mt-1 px-2 py-0.5 rounded-full text-xs font-semibold" style="background-color: rgba(229, 161, 0, 0.15); color: #7A5400;" x-text="`⏱ ${releaseDurationInfo(result).withDuration}/${releaseDurationInfo(result).total} lengths`"></span>
                             </template>
                             <template x-if="result.tracks && releaseDurationInfo(result).status === 'none'">
-                                <span class="inline-block mt-1 px-2 py-0.5 rounded-full text-xs font-medium text-muted" style="background-color: #F0EFEB;">No track lengths</span>
+                                <span class="inline-block mt-1 px-2 py-0.5 rounded-full text-xs font-medium" style="background-color: #F0EFEB; color: #5E5E5A;">No track lengths</span>
                             </template>
                             <template x-if="result.tracks && cardFit(result)">
-                                <p class="text-xs mt-1 font-medium" :style="cardFit(result).state === 'fit' ? 'color: #0B8F63;' : 'color: #8A8A86;'">
-                                    <span x-show="bestFitId === result.id" class="inline-block mr-1 px-1.5 py-0.5 rounded-full text-xs font-semibold" style="background-color: #10B981; color: #FFFFFF;">Best fit</span>
+                                <p class="text-xs mt-1 font-medium" :style="cardFit(result).state === 'fit' ? 'color: #0A6B4B;' : 'color: #5E5E5A;'">
+                                    <span x-show="bestFitId === result.id" class="inline-block mr-1 px-1.5 py-0.5 rounded-full text-xs font-semibold" style="background-color: #0B6B4A; color: #FFFFFF;">Best fit</span>
                                     <span x-text="fitText(cardFit(result))"></span>
                                 </p>
                             </template>
                             <br>
-                            <a @click.stop :href="`https://www.discogs.com${result.uri}`" target="_blank" rel="noopener noreferrer" class="text-xs hover:underline mt-1 inline-block" style="color: #E5A100;">View on Discogs ↗</a>
+                            <a @click.stop :href="`https://www.discogs.com${result.uri}`" target="_blank" rel="noopener noreferrer" class="text-xs underline hover:no-underline mt-1 inline-block" style="color: #8A5F00;">View on Discogs ↗</a>
                         </div>
                     </template>
                 </div>

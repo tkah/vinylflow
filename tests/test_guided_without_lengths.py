@@ -171,3 +171,23 @@ def test_fixture_release_parses_to_twelve_sides_of_five():
     letters = [t.position[0] for t in rel.tracks]
     breaks = [i for i in range(1, len(letters)) if letters[i] != letters[i - 1]]  # as the frontend sends them
     assert breaks == list(range(5, 60, 5))
+
+
+def test_a_side_of_one_track_still_has_to_be_long_enough_to_be_a_song():
+    """A one-track span has no gap to align, so nothing else checks its length: here a stretch of
+    noise before a 2 s fragment is taken for the flip, and "side B" would be a 3 s track."""
+    rng = np.random.default_rng(1)
+    music = lambda d: -20 + rng.normal(0, 2, round(d / F))
+    noise = lambda d: -60 + rng.normal(0, 1.5, round(d / F))
+    db = np.concatenate([noise(5), music(180), noise(3), music(180), noise(3), music(180),
+                         noise(15), music(2), noise(5)])
+    ms, me = music_span(db, F)
+    assert me > 5 + 180 * 3 + 6 + 15, "the fragment keeps the music span past the stretch"
+    assert guided_by_alignment(db, F, ms, me, [None] * 4, [3]) is None
+
+
+def test_a_real_side_of_one_track_is_placed():
+    db, ms, me, spans, _stretches = recording([[180, 180, 180], [200]])
+    placed = guided_by_alignment(db, F, ms, me, [None] * 4, [3])
+    assert placed.model == "align-even" and len(placed.tracks) == 4
+    assert abs(placed.tracks[3].duration - 200) < 5

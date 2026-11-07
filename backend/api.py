@@ -905,6 +905,7 @@ async def _register_source(
         source_size=file_size,
         source_bit_depth=source_bit_depth,
         in_place=in_place,
+        source_mtime=file_path.stat().st_mtime if in_place else None,
     )
 
     # Start MP3 conversion in background (for fast waveform loading)
@@ -998,7 +999,14 @@ def _import_state() -> tuple[Optional[Path], Optional[str]]:
     return d, import_folder.dir_error(d, UPLOAD_DIR)
 
 
+def _source_changed(session: Session, real: Path) -> bool:
+    """True when ``real`` is no longer the file this session's caches and boundaries describe."""
+    stat = real.stat()
+    return stat.st_size != session.source_size or stat.st_mtime != session.source_mtime
+
+
 def _session_for_source(real: Path) -> Optional[Session]:
+    """The session reading ``real`` in place, if any."""
     for s in session_store.list():
         try:
             if s.source_audio.resolve() == real:
@@ -1011,6 +1019,9 @@ def _session_for_source(real: Path) -> Optional[Session]:
 class ImportRequest(BaseModel):
     names: Optional[List[str]] = None
     paths: Optional[List[str]] = None
+    # Recordings the browser holds for export: its queue and batches are frozen requests the
+    # server knows nothing about until they start, so only the browser can name them.
+    locked_ids: List[str] = []
 
 
 @app.get("/api/import")
@@ -1064,25 +1075,36 @@ async def import_files(req: ImportRequest):
 
     for label, real in candidates:
         try:
-            existing = _session_for_source(real)
-            if existing is not None:
-                imported.append({
-                    "id": existing.id,
-                    "status": _session_status(existing),
-                    "filename": existing.source_filename,
-                    "size": existing.source_size,
-                    "duration": existing.source_duration,
-                    "in_place": True,
-                })
-                continue
             if not import_folder.is_stable(real):
                 skipped.append({"name": label, "reason": "File is still being copied"})
                 continue
-            imported.append(
-                await _register_source(
-                    str(uuid.uuid4()), real, real.name, real.stat().st_size, in_place=True
-                )
+            existing = _session_for_source(real)
+            replaces = None
+            if existing is not None:
+                if not _source_changed(existing, real):
+                    imported.append({
+                        "id": existing.id,
+                        "status": _session_status(existing),
+                        "filename": existing.source_filename,
+                        "size": existing.source_size,
+                        "duration": existing.source_duration,
+                        "in_place": True,
+                    })
+                    continue
+                if (existing.state == SessionState.PROCESSING or existing.export_reserved
+                        or existing.id in req.locked_ids):
+                    skipped.append({"name": label, "reason": "File changed during its export"})
+                    continue
+                # A re-recorded side under the same name: its caches and boundaries belong to
+                # the old audio, and the export would cut the new audio at the old splits.
+                cleanup_session(existing.id)
+                replaces = existing.id
+            entry = await _register_source(
+                str(uuid.uuid4()), real, real.name, real.stat().st_size, in_place=True
             )
+            if replaces:
+                entry["replaces"] = replaces
+            imported.append(entry)
         except Exception as e:
             logger.warning("Import of %s failed: %s", label, e)
             skipped.append({"name": label, "reason": "Could not read the file"})
