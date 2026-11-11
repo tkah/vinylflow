@@ -15,6 +15,7 @@ need the calling event loop to stay responsive while ffmpeg runs.
 
 from __future__ import annotations
 
+import os
 import sys
 import traceback
 from datetime import datetime
@@ -47,6 +48,11 @@ from .events import OutputSpec, ProcessingRun, ProgressEvent
 from .session import Session, SessionState
 
 ProgressCallback = Callable[[ProgressEvent], None]
+
+OVERWRITES_SOURCE = (
+    "This export would overwrite the recording being split. "
+    "Choose a different output folder or format."
+)
 
 
 def run(
@@ -101,6 +107,26 @@ def run(
             )
 
         album_folder = Path(spec.output_dir) / metadata_handler.create_album_folder_name(release)
+        ext = OUTPUT_FORMATS[spec.output_format]["extension"]
+        # Every position this export covers (an album job's members included): numbering,
+        # and which split (index) track parts are exported, depend on all of them.
+        job_positions = list(spec.job_positions) or [t.vinyl_number for t in tracks]
+        # Every (temp, final) path this export writes, decided before anything is written: none
+        # may be the source, e.g. an earlier export picked again to re-split it. The loop uses
+        # these exact paths.
+        targets = [
+            (
+                album_folder / f"temp_{track.vinyl_number}{ext}",
+                album_folder / metadata_handler.create_track_filename(
+                    track, release, spec.output_format, job_positions,
+                    prefix_part_titles=spec.prefix_part_titles,
+                ),
+            )
+            for track in tracks
+        ]
+        if any(_same_file(path, session.source_audio) for pair in targets for path in pair):
+            raise RuntimeError(OVERWRITES_SOURCE)
+
         album_folder.mkdir(parents=True, exist_ok=True)
 
         on_progress(
@@ -117,7 +143,6 @@ def run(
             if metadata_handler.download_cover_art(release.cover_url, cover_path):
                 cover_data = metadata_handler.prepare_cover_for_embedding(cover_path)
 
-        ext = OUTPUT_FORMATS[spec.output_format]["extension"]
         output_files: list[str] = []
         total = len(tracks)
 
@@ -139,7 +164,7 @@ def run(
                 )
             )
 
-            temp_output = album_folder / f"temp_{track.vinyl_number}{ext}"
+            temp_output, final_path = targets[i]
 
             audio_processor.extract_track(
                 session.source_audio,
@@ -155,9 +180,6 @@ def run(
                 bit_depth=bit_depth,
             )
 
-            # Every position this export covers (an album job's members included): numbering,
-            # and which split (index) track parts are exported, depend on all of them.
-            job_positions = list(spec.job_positions) or [t.vinyl_number for t in tracks]
             tag_extras = {"comment": comment} if comment else {}  # only when found: default call unchanged
             metadata_handler.tag_file(
                 temp_output, track, release, cover_data, spec.output_format,
@@ -167,14 +189,9 @@ def run(
                 **tag_extras,
             )
 
-            final_filename = metadata_handler.create_track_filename(
-                track, release, spec.output_format, job_positions,
-                prefix_part_titles=spec.prefix_part_titles,
-            )
-            final_path = album_folder / final_filename
             temp_output.replace(final_path)
 
-            output_files.append(final_filename)
+            output_files.append(final_path.name)
 
         if spec.replaygain:
             _write_replaygain_tags(
@@ -209,6 +226,17 @@ def run(
         if session.state == SessionState.PROCESSING:
             session.mark_failed(str(e))
         raise
+
+
+def _same_file(path: Path, source: Path) -> bool:
+    """True when writing ``path`` would replace ``source``: the same resolved path, or, when
+    ``path`` exists, the same file under another spelling (other case on macOS, a hard link)."""
+    if path.resolve() == source.resolve():
+        return True
+    try:
+        return path.exists() and os.path.samefile(path, source)
+    except OSError:
+        return False
 
 
 def _lookup_album_comment(metadata_handler, release_id, master_id, on_progress):

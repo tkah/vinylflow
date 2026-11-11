@@ -14,6 +14,7 @@ import uuid
 import shutil
 import threading
 from pathlib import Path
+from stat import S_ISREG
 from subprocess import CalledProcessError
 from typing import Annotated, List, Optional
 import asyncio
@@ -201,11 +202,24 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _require_source(session: Session) -> None:
-    """410 when an in-place source vanished from the import folder."""
-    if session.in_place and not session.source_audio.is_file():
+    """410 when an in-place source vanished from the import folder, 409 when it changed
+    since its import: the session's caches and splits describe the old audio."""
+    if not session.in_place:
+        return
+    try:
+        stat = session.source_audio.stat()
+    except OSError:
+        stat = None
+    if stat is None or not S_ISREG(stat.st_mode):
         raise HTTPException(
             status_code=410,
             detail=f"The source file is no longer in the import folder: {session.source_filename}",
+        )
+    if _source_changed(session, stat):
+        raise HTTPException(
+            status_code=409,
+            detail=f"{session.source_filename} changed on disk since it was imported. "
+            "Import it again to split the new recording.",
         )
 
 
@@ -707,6 +721,7 @@ async def get_hum(file_id: str):
     session = session_store.get(file_id)
     if session is None:
         raise HTTPException(status_code=404, detail="File not found")
+    _require_source(session)
     try:
         data = await get_silence_analysis(session)
     except HTTPException:
@@ -820,6 +835,7 @@ async def post_clicks(file_id: str, req: ClickScanRequest):
     session = session_store.get(file_id)
     if session is None:
         raise HTTPException(status_code=404, detail="File not found")
+    _require_source(session)
     requested = _check_declick(req.declick)
     strength = click_detection.scan_strength(requested)
     cached = _click_cached(file_id, strength)
@@ -878,6 +894,22 @@ async def preconvert_to_mp3(file_id: str, file_path: Path):
             print(f"MP3 conversion failed for {file_id}: {e}")
 
 
+# Background prep runs for this many files at a time: "Select all" in the import folder must
+# not queue hundreds of decodes in the thread pool ahead of the endpoints' own work.
+PREP_CONCURRENCY = 2
+_prep_slots = asyncio.Semaphore(PREP_CONCURRENCY)
+
+
+async def _prepare_source(file_id: str, file_path: Path) -> None:
+    """MP3 preview and envelope for a new Session, once a slot is free. A recording opened
+    meanwhile starts its envelope on demand (start_envelope), which this then joins."""
+    async with _prep_slots:
+        if session_store.get(file_id) is None:
+            return  # removed while it waited
+        envelope = start_envelope(file_id, file_path)
+        await asyncio.gather(preconvert_to_mp3(file_id, file_path), envelope, return_exceptions=True)
+
+
 async def _register_source(
     file_id: str, file_path: Path, filename: str, file_size: int, in_place: bool = False
 ) -> dict:
@@ -908,10 +940,9 @@ async def _register_source(
         source_mtime=file_path.stat().st_mtime if in_place else None,
     )
 
-    # Start MP3 conversion in background (for fast waveform loading)
-    asyncio.create_task(preconvert_to_mp3(file_id, file_path))
-    # ...and the energy envelope (music span + instant silence rescans).
-    start_envelope(file_id, file_path)
+    # MP3 conversion (fast waveform loading) and the energy envelope (music span + instant
+    # silence rescans) in the background, a few files at a time; the response doesn't wait.
+    asyncio.create_task(_prepare_source(file_id, file_path))
 
     return {
         "id": file_id,
@@ -999,9 +1030,9 @@ def _import_state() -> tuple[Optional[Path], Optional[str]]:
     return d, import_folder.dir_error(d, UPLOAD_DIR)
 
 
-def _source_changed(session: Session, real: Path) -> bool:
-    """True when ``real`` is no longer the file this session's caches and boundaries describe."""
-    stat = real.stat()
+def _source_changed(session: Session, stat: os.stat_result) -> bool:
+    """True when the file ``stat`` describes is no longer the one this session's caches and
+    boundaries describe."""
     return stat.st_size != session.source_size or stat.st_mtime != session.source_mtime
 
 
@@ -1081,7 +1112,7 @@ async def import_files(req: ImportRequest):
             existing = _session_for_source(real)
             replaces = None
             if existing is not None:
-                if not _source_changed(existing, real):
+                if not _source_changed(existing, real.stat()):
                     imported.append({
                         "id": existing.id,
                         "status": _session_status(existing),
@@ -1257,6 +1288,7 @@ async def get_scan(file_id: str, side_changes: Annotated[int, Query(ge=0, le=MAX
     session = session_store.get(file_id)
     if session is None:
         raise HTTPException(status_code=404, detail="File not found")
+    _require_source(session)
 
     # Never block: get_envelope joins a running task, and the cache file exists
     # before the task finishes (between the thread's os.replace and its return),

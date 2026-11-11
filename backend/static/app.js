@@ -333,6 +333,8 @@ function vinylApp() {
         searchMoreError: '',
         detailsSettled: false,    // True once every result's tracklist load finished/failed
         _detailInflight: {},      // `${searchSeq}:${releaseId}` -> in-flight detail fetch promise
+        _pendingPickId: null,     // Card clicked while its tracklist loads; a later pick clears it
+        _releaseIdCall: 0,        // Bumped per "exact pressing" lookup; only the latest resets releaseIdLoading
 
         // Smart Rescan
         expectedTracks: null,
@@ -1868,6 +1870,7 @@ function vinylApp() {
             }
             this.saveWorkspace();
             this.abReset();
+            this.releaseIdLoading = false;   // a lookup for the previous recording is dropped on arrival
             this.currentFileId = fileId;
             this.currentFile = this.uploadedFiles.find(f => f.id === fileId);
             if (this.currentFile && !(this.currentFile.musicDuration > 0)) {
@@ -1881,6 +1884,7 @@ function vinylApp() {
             this.resetSearchResults();
             this.detailsSettled = false;
             this.selectedRelease = null;
+            this._pendingPickId = null;
             this.titleSource = null;
             this.closeMovementsPanel();
             this.trackForm = null;
@@ -1977,6 +1981,10 @@ function vinylApp() {
             this.currentFile = null;
             this.detectedTracks = [];
             this.resetEditState();
+            // Replies of its search and release picks still in flight are dropped.
+            this.searchSeq++;
+            this._pendingPickId = null;
+            this.releaseIdLoading = false;
         },
 
         /** Put a soft-removed file back in its old queue position */
@@ -2058,6 +2066,11 @@ function vinylApp() {
         /** Return to the existing search UI while keeping all current cuts; searches only if it has no results. */
         tryDiscogsAgain() {
             if (this.analyzing || this.currentLocked) return;
+            if (!this.discogsConfigured) {
+                // Without a token a search (or a release lookup) can only fail: open the setup.
+                this.setupRequired = true;
+                return;
+            }
             if (!this.searchQuery.trim()) this.searchQuery = this.cleanFilename(this.currentFile?.filename || '');
             if (this.searchResults.length === 0) this.searchDiscogs();
             this.$nextTick(() => {
@@ -2133,6 +2146,7 @@ function vinylApp() {
             this.detectedTracks = [];
             this.resetEditState();
             this.selectedRelease = null;
+            this._pendingPickId = null;   // a card still loading must not bring a release back
             this.resetDonors();
             this.selectedSides = [];
             this.trackMappingReversed = false;
@@ -2154,6 +2168,7 @@ function vinylApp() {
             this.pauseWaveform();
             this.restoreEdits(snap, { rebuildRegions: false });
             this.selectedRelease = snap.selectedRelease;
+            this._pendingPickId = null;   // an Undo cancels a card still loading, even one restoring no release
             this.resetDonors();
             this.selectedSides = snap.selectedSides;
             this.suggestedSides = snap.suggestedSides;
@@ -2427,7 +2442,9 @@ function vinylApp() {
         },
 
         /**
-         * Card click: make sure the tracklist is loaded, then select.
+         * Card click: make sure the tracklist is loaded, then select.  The latest click
+         * wins: a later pick, Change release, a re-analysis (or its Undo) or a file switch
+         * while this card loads clears _pendingPickId, and its reply then only fills the card.
          */
         async chooseResult(result) {
             if (this.analyzing || this.currentLocked || result.opening) return;
@@ -2436,14 +2453,16 @@ function vinylApp() {
                 return;
             }
             const seq = this.searchSeq;
+            this._pendingPickId = result.id;
             result.opening = true;
             try {
                 const ok = await this.loadReleaseDetails(result.id, seq);
-                if (ok && seq === this.searchSeq) {
+                if (ok && seq === this.searchSeq && this._pendingPickId === result.id) {
                     const fresh = this.searchResults.find(r => r.id === result.id);
                     if (fresh) this.selectRelease(fresh);
                 }
             } finally {
+                if (this._pendingPickId === result.id) this._pendingPickId = null;
                 result.opening = false;
             }
         },
@@ -2470,9 +2489,17 @@ function vinylApp() {
             }
             this.releaseIdNotice = '';
             this.releaseIdLoading = true;
+            // A pick like a card click: a later pick, Change release or a file switch while
+            // this loads clears _pendingPickId, and the reply is then dropped.
+            const call = ++this._releaseIdCall;
+            const pick = `id:${call}`;
+            const fileId = this.currentFileId;
+            const superseded = () => this._pendingPickId !== pick || this.currentFileId !== fileId;
+            this._pendingPickId = pick;
             try {
                 const response = await fetch(`/api/release/${ref.id}`);
                 const data = await response.json().catch(() => ({}));
+                if (superseded()) return;
                 if (!response.ok || !Array.isArray(data.tracks)) {
                     this.releaseIdNotice = response.status === 404
                         ? `Discogs release ${ref.id} was not found (or Discogs is unavailable right now).`
@@ -2486,9 +2513,10 @@ function vinylApp() {
                 this.releaseIdInput = '';
                 this.selectRelease({ ...data, detailStatus: 'loaded' });
             } catch (error) {
-                this.releaseIdNotice = `Couldn't reach the server to load release ${ref.id}.`;
+                if (!superseded()) this.releaseIdNotice = `Couldn't reach the server to load release ${ref.id}.`;
             } finally {
-                this.releaseIdLoading = false;
+                if (this._pendingPickId === pick) this._pendingPickId = null;
+                if (this._releaseIdCall === call) this.releaseIdLoading = false;
             }
         },
 
@@ -3016,6 +3044,7 @@ function vinylApp() {
         selectRelease(release) {
             if (this.analyzing || this.currentLocked) return;
 
+            this._pendingPickId = null;   // this pick replaces any card still loading
             this.selectedRelease = release;
             this.loadAlbumDescription();
             this.prefixPartTitles = true;  // a per-release choice
@@ -3732,6 +3761,7 @@ function vinylApp() {
         changeRelease() {
             if (this.currentLocked) return;
             this.selectedRelease = null;
+            this._pendingPickId = null;   // a card still loading must not bring a release back
             this.titleSource = null;
             this.closeMovementsPanel();
             this.trackForm = null;
@@ -4407,7 +4437,9 @@ function vinylApp() {
                 const peaksResponse = await fetch(`/api/waveform-peaks/${this.currentFileId}`);
                 if (waveform !== this.waveform) return;
                 if (!peaksResponse.ok) {
-                    throw new Error('Failed to load waveform peaks');
+                    // e.g. 409/410: an imported file changed or vanished; say which and what to do
+                    const data = await peaksResponse.json().catch(() => ({}));
+                    throw new Error(data.detail || 'Failed to load waveform peaks');
                 }
                 const peaksData = await peaksResponse.json();
                 if (fileId !== this.currentFileId || waveform !== this.waveform) return;
@@ -6196,6 +6228,7 @@ function vinylApp() {
             this.resetSearchResults();
             this.detailsSettled = false;
             this.selectedRelease = null;
+            this._pendingPickId = null;
             this.resetDonors();
             this.searchQuery = '';
             this.processingProgress = 0;

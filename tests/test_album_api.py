@@ -89,3 +89,17 @@ def test_album_members_must_agree_on_album_description(album_env):
     assert response.status_code == 400, response.text
     assert 'album description' in response.json()['detail'].lower()
     assert all(not session.export_reserved for session in store.list())
+
+
+def test_album_member_whose_in_place_source_changed_is_refused_409(album_env):
+    """An imported (in place) recording re-recorded under the same name: its boundaries and
+    caches describe the old audio, so the group is refused before anything is reserved."""
+    client, store, body = album_env
+    member = store.get('1')
+    member.in_place = True
+    member.source_mtime = member.source_audio.stat().st_mtime
+    member.source_audio.write_bytes(b'a different, longer re-recording of the same side')
+    response = client.post('/api/process-album', json=body)
+    assert response.status_code == 409, response.text
+    assert 'Import it again' in response.json()['detail']
+    assert all(not session.export_reserved and session.boundaries == [] for session in store.list())
