@@ -2,6 +2,7 @@
 article, found through Wikidata by Discogs master / release id (exact ID links, no title guessing).
 """
 
+import logging
 import re
 import threading
 import time
@@ -11,6 +12,8 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 DIGITIZED_COMMENT = "Digitized from vinyl"
 
@@ -85,7 +88,8 @@ class AlbumDescriptions:
                 return cached
         try:
             result = self._fetch(release_id, master_id)
-        except _LookupFailed:
+        except _LookupFailed as failure:
+            logger.warning("Album description lookup failed for Discogs release %s: %s", release_id, failure)
             return DescriptionResult(STATUS_ERROR)
         with self._cache_lock:
             self._cache[release_id] = result
@@ -147,8 +151,11 @@ class AlbumDescriptions:
             titles = []
             for item_id in item_ids:
                 entity = data["entities"].get(item_id) or {}
-                title = entity.get("sitelinks", {}).get("enwiki", {}).get("title")
-                if title:
+                sitelinks = entity.get("sitelinks")
+                # An item without sitelinks may send them as an empty JSON list: no article.
+                title = sitelinks.get("enwiki", {}).get("title") if isinstance(sitelinks, dict) else None
+                # A non-string title is malformed data: treat it as no article.
+                if isinstance(title, str) and title:
                     titles.append(title)
         except (KeyError, TypeError, AttributeError):
             raise _LookupFailed("malformed Wikidata entities response")
@@ -182,8 +189,9 @@ class AlbumDescriptions:
                 url, params=params, headers={"User-Agent": DESCRIPTION_USER_AGENT},
                 timeout=min(DESCRIPTION_HTTP_TIMEOUT_S, remaining),
             )
-        except requests.RequestException as error:
-            raise _LookupFailed(str(error))
+        except OSError as error:   # requests' exceptions subclass OSError; so do socket/SSL failures
+            # Never the error's own text: it can hold the full URL (the album title) or a local CA path.
+            raise _LookupFailed(f"{type(error).__name__} contacting {urllib.parse.urlsplit(url).hostname}")
         if response.status_code != 404 and not 200 <= response.status_code < 300:
             raise _LookupFailed(f"HTTP {response.status_code}")
         return response

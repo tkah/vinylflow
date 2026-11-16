@@ -320,7 +320,7 @@
                     <h1 class="text-3xl font-bold text-white">
                     VinylFlow
                     </h1>
-                    <button @click="showSettings = !showSettings" class="px-4 py-2 bg-white bg-opacity-10 hover:bg-opacity-20 text-white rounded-lg transition">
+                    <button @click="showSettings ? closeSettings() : openSettings()" class="px-4 py-2 bg-white bg-opacity-10 hover:bg-opacity-20 text-white rounded-lg transition">
                         ⚙️ Settings
                     </button>
                 </div>
@@ -422,9 +422,9 @@
         </div>
 
         <!-- Settings Modal -->
-        <div x-show="showSettings" x-cloak @keydown.escape.window="showSettings = false" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+        <div x-show="showSettings" x-cloak @keydown.escape.window="closeSettings()" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
             <!-- Taller than a laptop window: scroll inside, Save/Cancel pinned to the bottom -->
-            <div @click.away="showSettings = false" class="bg-card rounded-lg p-6 pb-0 max-w-md w-full mx-4 overflow-y-auto" style="max-height: 90vh;">
+            <div @click.away="closeSettings()" class="bg-card rounded-lg p-6 pb-0 max-w-md w-full mx-4 overflow-y-auto" style="max-height: 90vh;">
                 <h2 class="text-2xl font-bold text-primary mb-4">Settings</h2>
                 <div class="space-y-4">
                     <div>
@@ -527,7 +527,8 @@
                             <input type="checkbox" x-model="config.album_description" class="w-4 h-4 rounded" style="accent-color: #E5A100;">
                             Add album description from Wikipedia
                         </label>
-                        <p class="text-xs mt-1" style="color: #8A8A86;">Saves the opening paragraph of the album's Wikipedia article in the Comment tag, followed by "Digitized from vinyl". It describes the album, not your pressing. Looks the album up by its Discogs number on Wikidata and Wikipedia.</p>
+                        <!-- #5E5E5A: AA grey (6.2:1 on the card), as on the search cards -->
+                        <p class="text-xs mt-1" style="color: #5E5E5A;">Saves the opening paragraph of the album's Wikipedia article in the Comment tag, followed by "Digitized from vinyl". It describes the album, not your pressing. Looks the album up by its Discogs number on Wikidata and Wikipedia.</p>
                     </div>
 
                     <!-- Discogs Token Section -->
@@ -545,7 +546,7 @@
                                         style="border-color: #8A8A86;"
                                     >
                                     <button
-                                        @click="submitSetup(); showSettings = false"
+                                        @click="submitSetup(); closeSettings()"
                                         :disabled="!setupToken || setupLoading"
                                         class="px-4 py-2 btn-primary rounded-md text-sm"
                                     >
@@ -561,7 +562,7 @@
 
                     <div class="flex gap-2 sticky bottom-0 bg-card py-4 border-t" style="border-color: #F0EFEB;">
                         <button @click="saveConfig()" class="flex-1 px-4 py-2 btn-primary rounded-lg">Save</button>
-                        <button @click="showSettings = false" class="flex-1 px-4 py-2 text-primary rounded-lg hover:bg-page" style="background-color: #F0EFEB;">Cancel</button>
+                        <button @click="closeSettings()" class="flex-1 px-4 py-2 text-primary rounded-lg hover:bg-page" style="background-color: #F0EFEB;">Cancel</button>
                     </div>
                 </div>
             </div>
@@ -854,8 +855,8 @@
                 <!-- Exact version: a Discogs release link or number skips the search -->
                 <div class="flex flex-wrap items-center gap-2 mb-4">
                     <label for="discogs-release-id" class="text-sm text-secondary">Know the exact pressing?</label>
-                    <input id="discogs-release-id" type="text" x-model="releaseIdInput" @keyup.enter="openReleaseById()"
-                           placeholder="Discogs release link or number, e.g. 2874426"
+                    <input id="discogs-release-id" type="text" x-model="releaseIdInput" @keyup.enter="openReleaseById()" aria-describedby="discogs-release-id-help discogs-release-id-notice"
+                           placeholder="Discogs release number or link, e.g. 2874426"
                            class="flex-1 min-w-0 px-3 py-1.5 border focus-primary rounded-lg text-sm" style="border-color: #8A8A86; min-width: 14rem;">
                     <button type="button" @click="openReleaseById()" :disabled="releaseIdLoading || analyzing || !releaseIdInput.trim()"
                             class="px-4 py-1.5 rounded-lg text-sm font-semibold border-2" style="border-color: #E5A100; color: #3D3D3D;"
@@ -864,7 +865,8 @@
                         <span x-show="releaseIdLoading" class="flex items-center gap-2"><span class="spinner"></span>Loading…</span>
                     </button>
                 </div>
-                <p x-show="releaseIdNotice" x-cloak role="alert" class="-mt-2 mb-4 p-2 rounded-lg text-sm text-primary" style="background-color: rgba(229, 161, 0, 0.15);" x-text="releaseIdNotice"></p>
+                <p id="discogs-release-id-help" class="-mt-2 mb-4 text-xs text-secondary">The release number is the number after /release/ in the release's Discogs address, not the catalog number.</p>
+                <p id="discogs-release-id-notice" x-show="releaseIdNotice" x-cloak role="alert" class="-mt-2 mb-4 p-2 rounded-lg text-sm text-primary" style="background-color: rgba(229, 161, 0, 0.15);" x-text="releaseIdNotice"></p>
 
                 <!-- Loading Animation -->
                 <div x-show="searchLoading" class="flex items-center justify-center gap-3 py-8">
@@ -946,12 +948,13 @@
                 </div>
 
                 <!-- Next page of the same query (at most SEARCH_MAX_PAGES fetches per search) -->
-                <div x-show="searchResults.length > 0 && !searchLoading && (searchHasMore || searchMoreError)" x-cloak class="mt-4 flex flex-wrap items-center gap-3">
+                <div x-show="searchResults.length > 0 && !searchLoading && (searchHasMore || searchMoreError || searchMoreNotice)" x-cloak class="mt-4 flex flex-wrap items-center gap-3">
                     <button x-show="searchHasMore" @click="loadMoreResults()" :disabled="searchMoreLoading" data-testid="load-more-results"
                             class="px-4 py-2 rounded-lg text-primary hover:bg-page disabled:cursor-not-allowed disabled:opacity-60" style="background-color: #F0EFEB;">
                         <span x-text="searchMoreLoading ? 'Loading more results…' : 'Load more results'"></span>
                     </button>
                     <p x-show="searchMoreError" class="text-sm text-primary" role="alert" x-text="searchMoreError"></p>
+                    <p x-show="searchMoreNotice" role="status" class="text-sm text-secondary" x-text="searchMoreNotice"></p>
                 </div>
             </div>
         </div>
@@ -977,7 +980,7 @@
                         <p class="font-bold text-primary" x-text="selectedRelease ? `${selectedRelease.artist} - ${selectedRelease.title}` : ''"></p>
                         <p class="text-sm text-secondary" x-text="selectedRelease ? `${selectedRelease.year} • ${selectedRelease.label}` : ''"></p>
                         <!-- Album description: text-secondary (10:1 on the tint) and #8A5F00 link (5:1); x-text only -->
-                        <div x-show="albumDescriptionVisible" x-cloak class="mt-2 text-sm text-secondary" data-testid="album-description">
+                        <div x-show="albumDescriptionVisible" x-cloak class="mt-2 text-sm text-secondary" data-testid="album-description" aria-live="polite">
                             <p class="font-medium">About the album (Wikipedia)</p>
                             <p x-show="albumDescription.status === 'loading'">Looking up album description…</p>
                             <template x-if="albumDescription.status === 'found'">
@@ -1171,9 +1174,9 @@
                     <div x-show="sidePresets.length > 0" class="flex flex-wrap gap-2 mb-3">
                         <template x-for="preset in sidePresets" :key="preset.label">
                             <button type="button" @click="applyPreset(preset.sides)" :disabled="analyzing || currentLocked"
-                                    class="px-4 py-2 rounded-lg border-2 transition text-left"
+                                    class="px-4 py-2 rounded-lg border-2 transition text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-1 focus-visible:ring-[#1E1E1E]"
                                     :style="sidesEqualSelection(preset.sides) ? 'border-color: #E5A100; color: #E5A100; background-color: rgba(229, 161, 0, 0.1);' : 'border-color: #8A8A86;'"
-                                    :class="{'hover:bg-card': !sidesEqualSelection(preset.sides), 'opacity-60 cursor-not-allowed': analyzing}">
+                                    :class="{'hover:bg-card': !sidesEqualSelection(preset.sides), 'opacity-60 cursor-not-allowed': analyzing || currentLocked}">
                                 <span class="text-sm font-semibold" x-text="preset.label"></span>
                                 <span class="text-xs ml-1" x-text="`${preset.trackCount} tracks • ${preset.totalSeconds !== null ? formatDuration(preset.totalSeconds) : 'length unknown'}`"></span>
                                 <span x-show="isMatchedScope(preset.sides)" class="block text-xs" style="color: #10B981;">✓ matches recording length</span>
@@ -1184,10 +1187,10 @@
                     <p x-show="sideChips.length > 1" class="mb-2 text-xs text-muted">Fine-tune by side:</p>
                     <div class="flex flex-wrap gap-2">
                         <template x-for="g in sideChips" :key="g.side">
-                            <button type="button" @click="toggleSide(g.side)" :disabled="analyzing || sideChips.length <= 1"
-                                    class="px-4 py-2 rounded-lg border-2 transition text-left"
+                            <button type="button" @click="toggleSide(g.side)" :disabled="analyzing || currentLocked || sideChips.length <= 1"
+                                    class="px-4 py-2 rounded-lg border-2 transition text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-1 focus-visible:ring-[#1E1E1E]"
                                     :style="selectedSides.includes(g.side) ? 'border-color: #E5A100; color: #E5A100;' : 'border-color: #8A8A86;'"
-                                    :class="{'hover:bg-card': !selectedSides.includes(g.side), 'opacity-60 cursor-not-allowed': analyzing}">
+                                    :class="{'hover:bg-card': !selectedSides.includes(g.side) && sideChips.length > 1, 'opacity-60 cursor-not-allowed': analyzing || currentLocked, 'cursor-default': !analyzing && !currentLocked && sideChips.length <= 1}">
                                 <span class="text-sm font-semibold" x-text="sideLabel(g.side)"></span>
                                 <span class="text-xs ml-1" x-text="`${g.tracks.length} tracks • ${g.totalSeconds !== null ? formatDuration(g.totalSeconds) : 'length unknown'}`"></span>
                                 <span x-show="isMatchedScope([g.side]) && sideChips.length > 1" class="block text-xs" style="color: #10B981;">✓ matches recording length</span>
@@ -1251,7 +1254,7 @@
                     <span x-text="clickLegendText()"></span>
                 </p>
                 <p x-show="expectedBoundaries.length > 0" x-cloak class="mt-1 text-xs text-muted flex items-center gap-2">
-                    <span class="inline-block w-0 h-3" style="border-left: 2px dashed rgba(217, 64, 50, 0.75);"></span>
+                    <span class="inline-block w-0 h-3" style="border-left: 2px dashed #9C2418;"></span>
                     Dashed lines: where Discogs track lengths put each break
                 </p>
             </div>
@@ -1274,10 +1277,10 @@
                                         :class="{'opacity-60 cursor-not-allowed': clickScanRunning()}" style="background-color: #F0EFEB;"
                                         :title="declick === 'off' ? 'Finds clicks and pops (scans at Medium because click removal is off)' : 'Finds clicks and pops at the current click removal strength'"
                                         x-text="clickScanButtonText()"></button>
-                                <button x-show="selectedRelease" @click="reverseMapping()" class="px-3 py-1.5 rounded-lg text-sm text-primary hover:bg-page" style="background-color: #F0EFEB;" title="Reverse the Discogs mapping order">↕️ Reverse</button>
-                                <button @click="snapToDiscogs()" :disabled="analyzing || !selectedRelease || targetTracks.length < 1"
+                                <button x-show="selectedRelease" @click="reverseMapping()" :disabled="analyzing" :class="{'opacity-60 cursor-not-allowed': analyzing}" class="px-3 py-1.5 rounded-lg text-sm text-primary hover:bg-page" style="background-color: #F0EFEB;" title="Reverse the Discogs mapping order">↕️ Reverse</button>
+                                <button @click="snapToDiscogs()" :disabled="analyzing || currentLocked || !selectedRelease || targetTracks.length < 1"
                                         class="px-3 py-1.5 btn-primary rounded-lg text-sm font-semibold"
-                                        :class="{'opacity-50 cursor-not-allowed': analyzing || !selectedRelease || targetTracks.length < 1}"
+                                        :class="{'opacity-50 cursor-not-allowed': analyzing || currentLocked || !selectedRelease || targetTracks.length < 1}"
                                         title="Place boundaries using the Discogs track lengths">🧲 Snap to Discogs</button>
                             </div>
                         </div>
@@ -1302,16 +1305,16 @@
                                         💡 Right-click the waveform to add splits, or right-click a track region to ignore it.
                                     </p>
                                     <div class="flex flex-wrap gap-2">
-                                        <button @click="smartRescan(targetTracks.length)" :disabled="analyzing || currentLocked" class="px-3 py-1.5 btn-primary rounded-lg text-sm font-semibold" :class="{'opacity-60 cursor-not-allowed': analyzing}">
+                                        <button x-show="targetTracks.length <= maxGuidedTracks" @click="smartRescan(targetTracks.length)" :disabled="analyzing || currentLocked" class="px-3 py-1.5 btn-primary rounded-lg text-sm font-semibold" :class="{'opacity-60 cursor-not-allowed': analyzing}">
                                             <span x-show="!analyzing" x-text="`🎯 Smart rescan for ${targetTracks.length} tracks`"></span>
                                             <span x-show="analyzing" class="flex items-center gap-2">
                                                 <div class="spinner"></div>
                                                 Rescanning…
                                             </span>
                                         </button>
-                                        <button @click="snapToDiscogs()" :disabled="analyzing || !selectedRelease || targetTracks.length < 1"
+                                        <button @click="snapToDiscogs()" :disabled="analyzing || currentLocked || !selectedRelease || targetTracks.length < 1"
                                                 class="px-3 py-1.5 btn-primary rounded-lg text-sm font-semibold"
-                                                :class="{'opacity-60 cursor-not-allowed': analyzing}"
+                                                :class="{'opacity-60 cursor-not-allowed': analyzing || currentLocked}"
                                                 title="Place boundaries using the Discogs track lengths">
                                             🧲 Snap to Discogs
                                         </button>
@@ -1342,15 +1345,15 @@
                                         <div>
                                             <template x-if="selectedRelease">
                                                 <div class="flex items-center gap-1">
-                                                    <select @change="onMappingSelect(idx, $event.target)" :title="mappedTrack(idx) ? trackOptionLabel(mappedTrack(idx)) : ''" class="w-full min-w-0 px-2 py-1.5 border focus-primary rounded-md text-sm" style="border-color: #8A8A86;">
+                                                    <select @change="onMappingSelect(idx, $event.target)" :disabled="analyzing" :class="{'opacity-60 cursor-not-allowed': analyzing}" :title="mappedTrack(idx) ? trackOptionLabel(mappedTrack(idx)) : ''" class="w-full min-w-0 px-2 py-1.5 border focus-primary rounded-md text-sm" style="border-color: #8A8A86;">
                                                         <template x-for="(dt, dtIdx) in (selectedRelease?.tracks || [])" :key="dtIdx">
                                                             <option :value="dtIdx" :selected="dtIdx === Number(customMapping[idx])" x-text="trackOptionLabel(dt)"></option>
                                                         </template>
                                                         <option value="custom" :disabled="currentLocked">➕ Custom track…</option>
                                                     </select>
-                                                    <button type="button" @click="openTrackForm(idx, 'edit')" :disabled="currentLocked || !mappedTrack(idx)"
+                                                    <button type="button" @click="openTrackForm(idx, 'edit')" :disabled="currentLocked || analyzing || !mappedTrack(idx)"
                                                             class="px-2 py-1 rounded text-xs text-primary shrink-0" style="background-color: #F0EFEB;"
-                                                            :class="{'opacity-50 cursor-not-allowed': currentLocked}"
+                                                            :class="{'opacity-50 cursor-not-allowed': currentLocked || analyzing}"
                                                             :aria-expanded="trackFormShown(idx) && trackForm.mode === 'edit'"
                                                             data-testid="rename-track" title="Rename this track (or remove a custom one)" aria-label="Rename this track">✏️</button>
                                                 </div>
@@ -1368,7 +1371,7 @@
                                         <div class="text-right font-semibold" :style="`color: ${deltaColor(trackDelta(track, idx))}`" x-text="deltaText(trackDelta(track, idx))"></div>
                                         <div class="text-right text-secondary" :title="clickTooltip(track)" data-testid="click-count" x-text="clickCountText(track)"></div>
                                         <div>
-                                            <select @change="setTrackDeclick(idx, $event.target.value)" :disabled="track.ignored" aria-label="Click removal for this track"
+                                            <select @change="setTrackDeclick(idx, $event.target.value)" :disabled="track.ignored || analyzing" :class="{'opacity-60 cursor-not-allowed': analyzing}" aria-label="Click removal for this track"
                                                     class="w-full px-1 py-1 border focus-primary rounded-md text-xs" style="border-color: #8A8A86;">
                                                 <option value="" :selected="!track.declick" x-text="declickDefaultLabel()"></option>
                                                 <template x-for="lvl in declickLevels" :key="lvl.id">
@@ -1384,7 +1387,7 @@
                                                 <span x-show="!track.editing">✏️ Adjust</span>
                                                 <span x-show="track.editing">✓ Done</span>
                                             </button>
-                                            <button @click="toggleTrackIgnored(track)" class="px-2 py-1 rounded text-xs text-primary" style="background-color: #F0EFEB;" :style="track.ignored ? 'background-color: #8A8A86; color: #FFFFFF;' : ''" title="Exclude this track from processing" x-text="track.ignored ? 'Ignored' : 'Ignore'"></button>
+                                            <button @click="toggleTrackIgnored(track)" :disabled="analyzing" :class="{'opacity-60 cursor-not-allowed': analyzing}" class="px-2 py-1 rounded text-xs text-primary" style="background-color: #F0EFEB;" :style="track.ignored ? 'background-color: #8A8A86; color: #FFFFFF;' : ''" title="Exclude this track from processing" x-text="track.ignored ? 'Ignored' : 'Ignore'"></button>
                                             <button @click="deleteTrack(track.number)" class="px-2 py-1 btn-danger rounded text-xs" title="Delete this track" aria-label="Delete this track">
                                                 <!-- Outline icon in currentColor (white): the 🗑️ emoji ignored the button's colour and showed grey on red -->
                                                 <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" style="display: block;"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
@@ -1413,15 +1416,15 @@
                                                 </div>
                                                 <p x-show="trackForm.error" x-cloak role="alert" class="mt-2 text-sm" style="color: #B3261E;" x-text="trackForm.error" data-testid="track-form-error"></p>
                                                 <div class="mt-3 flex flex-wrap gap-2">
-                                                    <button type="submit" class="px-3 py-1.5 btn-primary rounded-lg text-sm font-semibold" x-text="trackForm.mode === 'add' ? 'Add' : 'Save'"></button>
-                                                    <button type="button" x-show="trackForm.mode === 'edit' && trackForm.sharedWith?.length" @click="renameAllSharedTracks()"
+                                                    <button type="submit" :disabled="analyzing" :class="{'opacity-60 cursor-not-allowed': analyzing}" class="px-3 py-1.5 btn-primary rounded-lg text-sm font-semibold" x-text="trackForm.mode === 'add' ? 'Add' : 'Save'"></button>
+                                                    <button type="button" x-show="trackForm.mode === 'edit' && trackForm.sharedWith?.length" @click="renameAllSharedTracks()" :disabled="analyzing" :class="{'opacity-60 cursor-not-allowed': analyzing}"
                                                             class="px-3 py-1.5 rounded-lg text-sm text-primary focus-primary" style="background-color: #F0EFEB;"
                                                             x-text="`Rename all ${trackForm.sharedWith.length + 1}`" data-testid="rename-all-shared"></button>
                                                     <button type="button" @click="closeTrackForm()" class="px-3 py-1.5 rounded-lg text-sm text-primary" style="background-color: #F0EFEB;">Cancel</button>
-                                                    <button type="button" x-show="trackForm.mode === 'edit' && mappedTrack(idx)?.renamed" @click="resetTrackTitle()"
+                                                    <button type="button" x-show="trackForm.mode === 'edit' && mappedTrack(idx)?.renamed" @click="resetTrackTitle()" :disabled="analyzing" :class="{'opacity-60 cursor-not-allowed': analyzing}"
                                                             class="px-3 py-1.5 rounded-lg text-sm text-primary" style="background-color: #F0EFEB;"
                                                             x-text="`Reset to “${mappedTrack(idx)?.originalTitle}”`"></button>
-                                                    <button type="button" x-show="trackForm.mode === 'edit' && mappedTrack(idx)?.custom" @click="removeFormTrack()"
+                                                    <button type="button" x-show="trackForm.mode === 'edit' && mappedTrack(idx)?.custom" @click="removeFormTrack()" :disabled="analyzing" :class="{'opacity-60 cursor-not-allowed': analyzing}"
                                                             class="px-3 py-1.5 btn-danger rounded-lg text-sm">Remove custom track</button>
                                                 </div>
                                             </div>

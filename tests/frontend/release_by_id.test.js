@@ -13,6 +13,10 @@ assert.deepStrictEqual(parse('https://www.discogs.com/release/2874426-The-Fifth-
 assert.deepStrictEqual(parse('discogs.com/de/release/123'), { id: 123 });
 assert.deepStrictEqual(parse('https://www.discogs.com/sell/release/77?ev=rb'), { id: 77 });
 assert.deepStrictEqual(parse('https://www.discogs.com/master/45678-Some-Album'), { master: 45678 });
+// Language prefixes with an underscore, and the old slug-first links
+assert.deepStrictEqual(parse('https://www.discogs.com/pt_BR/release/123-x'), { id: 123 });
+assert.deepStrictEqual(parse('https://www.discogs.com/Artist-Title/release/2874426'), { id: 2874426 });
+assert.deepStrictEqual(parse('https://www.discogs.com/Artist-Title/master/55'), { master: 55 });
 assert.deepStrictEqual(parse('[m45678]'), { master: 45678 });
 for (const bad of ['', 'abc', 'https://example.com/release/1', 'discogs.com/artist/12']) assert.strictEqual(parse(bad), null, bad);
 

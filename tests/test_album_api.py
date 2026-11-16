@@ -81,7 +81,10 @@ def test_queue_keeps_terminal_album_errors_and_warnings_for_recovery(album_env):
     assert queued['0']['album_warnings'] == job.warnings
 
 
-def test_album_members_must_agree_on_album_description(album_env):
+def test_album_members_must_agree_on_album_description(album_env, monkeypatch):
+    # Members are compared by what they resolve to; with the saved setting off, True and False both
+    # resolve to off and agree. The setting is on here so the two requests really differ.
+    monkeypatch.setattr(api.config, 'album_description', True)
     client, store, body = album_env
     body['files'][0]['album_description'] = True
     body['files'][1]['album_description'] = False
@@ -103,3 +106,56 @@ def test_album_member_whose_in_place_source_changed_is_refused_409(album_env):
     assert response.status_code == 409, response.text
     assert 'Import it again' in response.json()['detail']
     assert all(not session.export_reserved and session.boundaries == [] for session in store.list())
+
+
+@pytest.fixture
+def setting_off_request_true(album_env, monkeypatch):
+    """The saved setting is off while the requests (frozen earlier in the browser) say true."""
+    monkeypatch.setattr(api.config, 'album_description', False)
+    client, store, body = album_env
+    for item in body['files']:
+        item['album_description'] = True
+    return client, store, body
+
+
+def test_album_job_with_the_setting_off_ignores_a_true_request(setting_off_request_true):
+    client, _, body = setting_off_request_true
+    assert client.post('/api/process-album', json=body).status_code == 200
+    job = api.album_jobs[body['job_id']]
+    assert [member.spec.album_description for member in job.members] == [False, False]
+
+
+def test_album_members_that_resolve_the_same_are_not_refused(album_env, monkeypatch):
+    """None and True both resolve to "on" with the setting on, so they agree."""
+    client, _, body = album_env
+    monkeypatch.setattr(api.config, 'album_description', True)
+    body['files'][0]['album_description'] = None
+    body['files'][1]['album_description'] = True
+    assert client.post('/api/process-album', json=body).status_code == 200
+    assert [member.spec.album_description for member in api.album_jobs[body['job_id']].members] == [True, True]
+
+
+def test_album_members_that_resolve_differently_are_refused(album_env, monkeypatch):
+    client, _, body = album_env
+    monkeypatch.setattr(api.config, 'album_description', True)
+    body['files'][0]['album_description'] = None
+    body['files'][1]['album_description'] = False
+    assert client.post('/api/process-album', json=body).status_code == 400
+
+
+def test_single_export_with_the_setting_off_ignores_a_true_request(setting_off_request_true, monkeypatch):
+    """The real background function runs; only the pipeline it calls in a worker thread is faked."""
+    import time
+    _, _, body = setting_off_request_true
+    specs = []
+
+    def fake_pipeline_run(session, spec, release_id, audio_processor, metadata_handler, on_progress):
+        specs.append(spec)
+    monkeypatch.setattr(api.pipeline, 'run', fake_pipeline_run)
+    with TestClient(api.app) as client:   # one event loop for the whole test, so the task created by the endpoint runs
+        assert client.post('/api/process', json=body['files'][0]).status_code == 200
+        deadline = time.monotonic() + 3
+        while not specs and time.monotonic() < deadline:
+            client.get('/api/queue')
+            time.sleep(0.05)
+    assert [spec.album_description for spec in specs] == [False]

@@ -360,11 +360,13 @@ class GuidedAnalyzeRequest(BaseModel):
 
 # Discogs search pages one query may fetch ("Load more"); must match SEARCH_MAX_PAGES in app.js.
 SEARCH_MAX_PAGES = 3
+# Largest Discogs page size one search request may ask for.
+SEARCH_MAX_RESULTS = 100
 
 
 class SearchRequest(BaseModel):
     query: str
-    max_results: int = 5
+    max_results: int = Field(5, ge=1, le=SEARCH_MAX_RESULTS)
     page: int = Field(1, ge=1, le=SEARCH_MAX_PAGES)
 
 
@@ -383,6 +385,8 @@ class TrackBoundary(BaseModel):
 
 CUSTOM_TRACK_POSITION = r"^[A-Z]+\d+(?:[.\-]\d+)?$"  # A1, B12, or a Discogs sub-track like B6.1
 MAX_CUSTOM_TRACKS = 99
+# Most tracks one guided detection / Smart Rescan places; must match MAX_GUIDED_TRACKS in app.js.
+MAX_EXPECTED_TRACKS = 99
 MAX_CUSTOM_TITLE = 200
 
 
@@ -474,7 +478,7 @@ class ProcessRequest(BaseModel):
     replaygain: bool = True      # write ReplayGain 2.0 track + album tags
     bit_depth: Optional[str] = None  # per-workspace depth; omitted uses the server default
     custom_tracks: Optional[List[CustomTrack]] = Field(default=None, max_length=MAX_CUSTOM_TRACKS)  # user-added tracks / renamed Discogs titles
-    album_description: Optional[bool] = None  # Wikipedia lead paragraph in the Comment tag; None = server setting
+    album_description: Optional[bool] = None  # Wikipedia lead paragraph in the Comment tag; False turns the lookup off, anything else follows the saved setting
     prefix_part_titles: bool = True  # title split (index) track parts "Work: Movement"; False = bare part title
     title_source: Optional[TitleSource] = None  # movements borrowed from another release
 
@@ -1212,8 +1216,8 @@ async def rescan_file(request: RescanRequest):
     analysis yields the expected number of tracks.  Falls back to the
     closest result when no setting matches exactly.
     """
-    if not 1 <= request.expected_tracks <= 99:
-        raise HTTPException(status_code=422, detail="expected_tracks must be between 1 and 99")
+    if not 1 <= request.expected_tracks <= MAX_EXPECTED_TRACKS:
+        raise HTTPException(status_code=422, detail=f"expected_tracks must be between 1 and {MAX_EXPECTED_TRACKS}")
 
     session = session_store.get(request.file_id)
     if session is None:
@@ -1339,8 +1343,8 @@ async def analyze_guided(request: GuidedAnalyzeRequest):
     when every length is known, and count-based detection when not.  Count-based
     detection may find fewer tracks than asked for: ``matched`` is then False.
     """
-    if not 1 <= request.expected_tracks <= 99:
-        raise HTTPException(status_code=422, detail="expected_tracks must be between 1 and 99")
+    if not 1 <= request.expected_tracks <= MAX_EXPECTED_TRACKS:
+        raise HTTPException(status_code=422, detail=f"expected_tracks must be between 1 and {MAX_EXPECTED_TRACKS}")
 
     if request.durations is not None and len(request.durations) != request.expected_tracks:
         raise HTTPException(status_code=422, detail="durations must have one entry per expected track")
@@ -2110,6 +2114,15 @@ def _validate_process_options(request: ProcessRequest) -> None:
         raise HTTPException(status_code=400, detail="Custom track positions must be unique.")
 
 
+def _resolve_album_description(requested: Optional[bool]) -> bool:
+    """Whether an export looks up the album description.
+
+    A request may only turn the lookup off: the saved setting is the consent to contact
+    Wikipedia, so a queued request frozen with True after the setting was switched off skips it.
+    """
+    return bool(config.album_description) and requested is not False
+
+
 def _output_spec(request: ProcessRequest, noise_profile=None) -> OutputSpec:
     """Capture server defaults and request overrides into an immutable export specification."""
     return OutputSpec(
@@ -2129,9 +2142,7 @@ def _output_spec(request: ProcessRequest, noise_profile=None) -> OutputSpec:
         custom_tracks=tuple((entry.position, entry.title) for entry in request.custom_tracks or []),
         prefix_part_titles=request.prefix_part_titles,
         title_source=_title_source_spec(request.title_source),
-        album_description=(
-            config.album_description if request.album_description is None else request.album_description
-        ),
+        album_description=_resolve_album_description(request.album_description),
     )
 
 
@@ -2171,9 +2182,11 @@ async def process_album(request: AlbumProcessRequest):
     positions = set()
     file_ids = set()
     for item in request.files:
-        if (item.release_id, item.output_format, item.album_gain, item.replaygain, item.album_description) != (
+        # Compare what each member resolves to, not what it sent: None and True agree while the setting is on.
+        if (item.release_id, item.output_format, item.album_gain, item.replaygain,
+                _resolve_album_description(item.album_description)) != (
                 reference.release_id, reference.output_format, reference.album_gain, reference.replaygain,
-                reference.album_description):
+                _resolve_album_description(reference.album_description)):
             raise HTTPException(status_code=400, detail="Use the same release, format, album gain, ReplayGain and album description choices for an album group.")
         session = session_store.get(item.file_id)
         if session is None:

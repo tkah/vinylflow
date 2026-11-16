@@ -367,3 +367,38 @@ def test_an_export_that_would_overwrite_its_source_fails_and_writes_nothing(tmp_
     assert [p.name for p in album.iterdir()] == [name], "no track, temp or cover file written"
     assert s.state == SessionState.FAILED
     assert events[-1].phase == "error" and "Choose a different output folder" in events[-1].message
+
+
+def test_a_crashing_description_lookup_warns_and_the_export_still_completes(session, tmp_path):
+    class ExplodingDescriptions:
+        def lookup(self, release_id, master_id):
+            raise RuntimeError("boom")
+
+    metadata = DescribingMetadata(FakeRelease(id=99), ExplodingDescriptions())
+    events = run_described(session, described_spec(tmp_path), metadata)
+    assert metadata.comments == [None, None]
+    warnings = [e for e in events if e.message.startswith("Warning:")]
+    assert len(warnings) == 1 and "Album description unavailable" in warnings[0].message
+    assert session.state == SessionState.COMPLETE
+
+
+def test_a_refused_overwrite_makes_no_description_lookup(tmp_path):
+    from album_description import DescriptionResult
+
+    album = tmp_path / "out" / "Test Artist - Test Album"
+    album.mkdir(parents=True)
+    src = album / "A1-track.aiff"
+    src.write_bytes(b"ORIGINAL-RECORDING" * 100)
+    s = SessionStore().create(
+        session_id="sess-src2", source_audio=src.resolve(), source_filename=src.name,
+        source_duration=120.0, source_size=src.stat().st_size, in_place=True,
+    )
+    s.set_boundaries([FakeBoundary(1, 0.0, 60.0), FakeBoundary(2, 60.0, 120.0)])
+    s.set_mappings({1: "A1", 2: "A2"})
+    descriptions = FakeDescriptions(DescriptionResult("found", "X", "T", "u"))
+    metadata = DescribingMetadata(FakeRelease(id=99), descriptions)
+    spec_aiff = OutputSpec(output_format="aiff", output_dir=tmp_path / "out", album_description=True)
+    with pytest.raises(RuntimeError, match="would overwrite the recording"):
+        pipeline.run(session=s, spec=spec_aiff, release_id=99, audio_processor=FakeAudio(),
+                     metadata_handler=metadata, on_progress=lambda event: None)
+    assert descriptions.lookups == [], "no request to Wikipedia for an export that is refused"

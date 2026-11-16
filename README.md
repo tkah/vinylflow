@@ -99,7 +99,7 @@ VinylFlow does it in **3 minutes**. Upload your recording, let it detect the tra
 ## Features
 
 - **Automatic silence detection** — intelligently finds track boundaries in your recording
-- **Duration-based splitting** — fallback for seamlessly mixed tracks with no gaps
+- **Guided splitting** — Discogs track lengths are matched to the gaps in your recording, so one wrong length doesn't shift later cuts; it also works on seamless mixes with no clear gaps, and even without lengths. Pick which sides the recording covers, and use *Snap to Discogs* to redo it after hand edits
 - **Discogs integration** — visual search with album artwork, metadata, and track listings
 - **Multiple output formats** — FLAC (lossless), MP3 (320kbps), or AIFF (lossless)
 - **Multiple input formats** — WAV and AIFF recordings supported
@@ -385,6 +385,8 @@ DEFAULT_FLAC_COMPRESSION=8
 
 **Config Priority**: `config/settings.json` (UI-editable) → `.env` (manual) → environment variables (Docker)
 
+Saving Settings writes every setting to `config/settings.json`, which then takes precedence over environment variables (for example, an `ALBUM_DESCRIPTION` value from your environment is frozen there after the first save).
+
 **Track Numbering**: Configurable via Settings (⚙️) or by setting `TRACK_NUMBERING` in `config/settings.json`:
 - `sequential_disc_per_lp` *(default)* — writes integer `DISCNUMBER` (A+B = disc 1, C+D = disc 2) and sequential `TRACKNUMBER` across both sides of each LP, with track/disc totals (`TRACKTOTAL`/`DISCTOTAL`, or `n/total` in ID3) and the original vinyl position preserved in a `VINYLPOSITION` tag. Single LPs appear as one disc; 2-LP sets appear as two. When several recordings of one release are exported together, numbering and totals span all of them. The disc comes from the side letter, so a release whose sides skip letters on Discogs (A, B, E, F) counts as 3 discs, and tracks on other media (`CD1`, `DVD1`) keep their position as `TRACKNUMBER` with no disc or totals.
 - `vinyl` — writes the vinyl position (e.g. `A1`, `B2`) directly as `TRACKNUMBER`, without totals. Preserves vinyl notation but some players (Jellyfin, Roon) may mis-sort tracks.
@@ -470,7 +472,7 @@ Pick the Discogs release first: its track lengths place the splits (a release wi
 - Vinyl-style track numbering (A1, A2, B1, B2)
 - FLAC, MP3, and AIFF output
 - WAV and AIFF input
-- Duration-based splitting fallback
+- Guided splitting by Discogs lengths, with a side picker and *Snap to Discogs*
 - WebSocket real-time progress
 - Docker one-command setup
 - **Web-based first-run setup** — no more hidden `.env` files!

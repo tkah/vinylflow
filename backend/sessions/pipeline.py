@@ -15,6 +15,7 @@ need the calling event loop to stay responsive while ffmpeg runs.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import traceback
@@ -30,7 +31,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from album_description import STATUS_ERROR, STATUS_FOUND, compose_comment
+from album_description import STATUS_ERROR, STATUS_FOUND, DescriptionResult, compose_comment
 from audio_processor import (
     OUTPUT_FORMATS,
     target_bit_depth,
@@ -46,6 +47,8 @@ from metadata_handler import MetadataHandler, with_borrowed_work, with_custom_tr
 
 from .events import OutputSpec, ProcessingRun, ProgressEvent
 from .session import Session, SessionState
+
+logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[ProgressEvent], None]
 
@@ -100,12 +103,6 @@ def run(
 
         tracks = _build_tracks(session)
 
-        comment = None
-        if spec.album_description:
-            comment = _lookup_album_comment(
-                metadata_handler, primary_release_id, primary_master_id, on_progress
-            )
-
         album_folder = Path(spec.output_dir) / metadata_handler.create_album_folder_name(release)
         ext = OUTPUT_FORMATS[spec.output_format]["extension"]
         # Every position this export covers (an album job's members included): numbering,
@@ -126,6 +123,13 @@ def run(
         ]
         if any(_same_file(path, session.source_audio) for pair in targets for path in pair):
             raise RuntimeError(OVERWRITES_SOURCE)
+
+        # After the overwrite check: a refused export must not contact Wikipedia.
+        comment = None
+        if spec.album_description:
+            comment = _lookup_album_comment(
+                metadata_handler, primary_release_id, primary_master_id, on_progress
+            )
 
         album_folder.mkdir(parents=True, exist_ok=True)
 
@@ -247,7 +251,12 @@ def _lookup_album_comment(metadata_handler, release_id, master_id, on_progress):
     on_progress(
         ProgressEvent(phase="fetching_description", fraction=0.25, message="Fetching album description...")
     )
-    result = metadata_handler.album_descriptions.lookup(release_id, master_id)
+    try:
+        result = metadata_handler.album_descriptions.lookup(release_id, master_id)
+    except Exception:
+        # The lookup promises never to raise; an unexpected bug in it must still not fail an export.
+        logger.exception("Album description lookup crashed for Discogs release %s", release_id)
+        result = DescriptionResult(STATUS_ERROR)
     if result.status == STATUS_FOUND:
         return compose_comment(result.text)
     if result.status == STATUS_ERROR:

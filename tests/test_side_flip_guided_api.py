@@ -192,3 +192,10 @@ def test_a_bug_in_the_alignment_is_an_error_not_a_fallback(recording, monkeypatc
     assert response.status_code == 500
     assert messages[-1]['type'] == 'error'
 
+
+
+@pytest.mark.parametrize("expected_tracks", [0, api.MAX_EXPECTED_TRACKS + 1])
+def test_expected_tracks_outside_the_limit_is_422_with_the_limit_in_the_text(recording, expected_tracks):
+    response = guided({'file_id': recording, 'expected_tracks': expected_tracks, 'durations': [100] * max(expected_tracks, 1)})
+    assert response.status_code == 422
+    assert f"between 1 and {api.MAX_EXPECTED_TRACKS}" in response.json()['detail']

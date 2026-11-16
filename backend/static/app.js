@@ -17,8 +17,11 @@ const TRACK_COLORS = [
 const IGNORED_TRACK_COLOR = 'rgba(120, 120, 120, 0.15)';
 // Shortest track a drag / inline edit may produce (seconds)
 const MIN_TRACK_LENGTH = 1;
-// Ghost marker (Discogs-expected boundary) colour
-const EXPECTED_MARKER_COLOR = 'rgba(217, 64, 50, 0.75)';
+// Dashed ghost markers on the waveform: where the Discogs lengths expect each break (not draggable).
+// Opaque #9C2418; contrast (WCAG): 7.4:1 on the card (#FAF9F6), 5.1:1 at worst on a 30 % region tint
+// over the card, and 3.3:1 at worst over a region tint on the waveform bars (#93C5FD), so 3:1 for
+// graphics holds everywhere. (#B02A1E gave only 2.8:1 over the pink and purple regions on the bars.)
+const EXPECTED_MARKER_COLOR = '#9C2418';
 // Longest title shown in a waveform region label
 const REGION_TITLE_MAX = 28;
 // Version the allowlisted editing state; no audio, source paths, or credentials are stored.
@@ -32,6 +35,9 @@ const PREVIEW_AUDIO_NOTICE = "Playing the preview \u2014 this browser can't play
 const SEARCH_PAGE_SIZE = 12;
 // Fetches per query, the first included; must match SEARCH_MAX_PAGES in backend/api.py.
 const SEARCH_MAX_PAGES = 3;
+
+// Most tracks one guided detection places. Must match MAX_EXPECTED_TRACKS in backend/api.py.
+const MAX_GUIDED_TRACKS = 99;
 // Additional workspace fields are optional when reading saves made before Plan 05.
 const WORKSPACE_ADDITIONS = { searchResults: [], onlyWithLengths: false, detailsSettled: false, currentZoom: 50,
     searchedQuery: '', searchPage: 0, searchHasMore: false, prefixPartTitles: true, titleSource: null };
@@ -66,19 +72,42 @@ function markRaw(obj) {
     return obj;
 }
 
+// A Discogs id: 1-10 digits, no leading zero (so 0, m0 and release/0 are not references).
+const DISCOGS_ID = '[1-9]\\d{0,9}';
+const DISCOGS_BARE_RELEASE = new RegExp(`^\\[?r?(${DISCOGS_ID})\\]?$`, 'i');
+const DISCOGS_BARE_MASTER = new RegExp(`^\\[?m(${DISCOGS_ID})\\]?$`, 'i');
+// Website link: scheme and www./m. optional, any path prefix segments (language, sell, old
+// Artist-Title slug), then release/<id> or master/<id> ending the input or followed by - / ? #.
+const DISCOGS_WEB_LINK = new RegExp(
+    `^(?:https?://)?(?:www\\.|m\\.)?discogs\\.com/(?:[^\\s/?#]+/)*(release|master)/(${DISCOGS_ID})(?:[-/?#]\\S*)?$`, 'i');
+// API link: api.discogs.com/releases/<id> or /masters/<id>, ending the input or followed by / ? #.
+const DISCOGS_API_LINK = new RegExp(
+    `^(?:https?://)?api\\.discogs\\.com/(release|master)s/(${DISCOGS_ID})(?:[/?#]\\S*)?$`, 'i');
+
 /**
  * A Discogs release reference typed or pasted by the user: "2874426", "r2874426",
- * "[r2874426]" or a discogs.com/release/... link (any language prefix or slug).
+ * "[r2874426]", "m123" (master), or a link that is the whole input: discogs.com/release/<id>
+ * or /master/<id> (optional http(s)://, www. or m.; any path before it such as /pt_BR/,
+ * /sell/ or the old artist-slug form; a "-slug", "/", "?" or "#" may follow the id), or
+ * api.discogs.com/releases/<id> / masters/<id>. Ids have at most 10 digits and are never 0;
+ * anything else (other hosts, text around the link, longer ids) is null. One wrapping layer
+ * (<>, quotes, parentheses) and trailing . , ; : ! ? ) are stripped first, for links pasted from prose.
  * Returns {id}, {master: id} for a master release (not one exact version), or null.
  */
 function parseDiscogsRelease(text) {
-    const s = String(text || '').trim();
-    let m = s.match(/^\[?r?(\d{1,10})\]?$/i);
+    let s = String(text || '').trim();
+    // Pasted from prose: drop one wrapping layer (<>, quotes, parentheses) and trailing punctuation.
+    // Punctuation after the wrapper goes first ("…/release/5",), but not ")", which may close it.
+    s = s.replace(/[.,;:!?]+$/, '');
+    const wrapped = s.match(/^(?:<(.*)>|"(.*)"|'(.*)'|\((.*)\))$/s);
+    if (wrapped) s = (wrapped[1] ?? wrapped[2] ?? wrapped[3] ?? wrapped[4]).trim();
+    s = s.replace(/[.,;:!?)]+$/, '');
+    let m = s.match(DISCOGS_BARE_RELEASE);
     if (m) return { id: Number(m[1]) };
-    m = s.match(/discogs\.com\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?(?:sell\/)?(release|master)\/(\d{1,10})/i);
-    if (m) return m[1].toLowerCase() === 'release' ? { id: Number(m[2]) } : { master: Number(m[2]) };
-    m = s.match(/^\[?m(\d{1,10})\]?$/i);
+    m = s.match(DISCOGS_BARE_MASTER);
     if (m) return { master: Number(m[1]) };
+    m = s.match(DISCOGS_WEB_LINK) || s.match(DISCOGS_API_LINK);
+    if (m) return m[1].toLowerCase() === 'release' ? { id: Number(m[2]) } : { master: Number(m[2]) };
     return null;
 }
 
@@ -230,6 +259,7 @@ function vinylApp() {
         // UI State
         dragging: false,
         showSettings: false,
+        settingsSnapshot: null,   // config as saved, taken when Settings opens; Cancel / Escape / click-away restore it
         uploadProgress: 0,
         uploadFinalizing: false,
         uploadNotice: '',
@@ -310,6 +340,7 @@ function vinylApp() {
         trackForm: null,          // Inline custom-track / rename form under a row: {fileId, idx, mode: 'add'|'edit', position, title, error}
         expectedBoundaries: [],   // Seconds where Discogs lengths put each break (ghost markers)
         boundariesEdited: false,  // True once the user hand-edits boundaries (until detection replaces them)
+        boundaryEditCount: 0,     // Bumped by every hand edit and Undo restore, so a guided reply started before one is discarded
         editBanner: false,        // Show "You've adjusted boundaries by hand" choice
         snapUndo: null,           // Snapshot taken before Snap to Discogs
         snapNotice: '',
@@ -331,6 +362,7 @@ function vinylApp() {
         searchHasMore: false,     // Discogs has another page and the fetch limit allows it
         searchMoreLoading: false,
         searchMoreError: '',
+        searchMoreNotice: '',     // After a Load more that added nothing: "No more results." (last page) or "No new results on this page." (Load more stays)
         detailsSettled: false,    // True once every result's tracklist load finished/failed
         _detailInflight: {},      // `${searchSeq}:${releaseId}` -> in-flight detail fetch promise
         _pendingPickId: null,     // Card clicked while its tracklist loads; a later pick clears it
@@ -1298,6 +1330,25 @@ function vinylApp() {
             }
         },
 
+        /** Open the Settings modal; its fields edit `config` in place, so remember what was saved. */
+        openSettings() {
+            this.settingsSnapshot = { ...this.config };
+            this.showSettings = true;
+        },
+
+        /**
+         * Close Settings without saving (Cancel, Escape, click-away). The modal edits `config`
+         * directly and exports read it (e.g. album_description), so an unsaved tick must not
+         * outlive the modal: put the saved copy back. Called from window-level handlers too,
+         * hence the guard when it is already closed.
+         */
+        closeSettings() {
+            if (!this.showSettings) return;
+            if (this.settingsSnapshot) this.config = this.settingsSnapshot;
+            this.settingsSnapshot = null;
+            this.showSettings = false;
+        },
+
         /**
          * Save configuration to API
          */
@@ -1322,6 +1373,7 @@ function vinylApp() {
                     this.albumGain = !!data.album_gain;
                     this.syncCleanupFromConfig(data);
                 }
+                this.settingsSnapshot = null;   // saved: nothing to roll back
                 this.showSettings = false;
                 this.loadAlbumDescription();   // the setting may have just been switched on or off
                 this.notify('Settings saved.', { type: 'success' });
@@ -2169,6 +2221,8 @@ function vinylApp() {
             this.restoreEdits(snap, { rebuildRegions: false });
             this.selectedRelease = snap.selectedRelease;
             this._pendingPickId = null;   // an Undo cancels a card still loading, even one restoring no release
+            // The preview shows the release that was selected when it loaded; a different one needs its own
+            if ((this.selectedRelease?.id ?? null) !== this.albumDescription.releaseId) this.loadAlbumDescription();
             this.resetDonors();
             this.selectedSides = snap.selectedSides;
             this.suggestedSides = snap.suggestedSides;
@@ -2198,6 +2252,7 @@ function vinylApp() {
          * Put a snapshotEdits() result back and rebuild the regions
          */
         restoreEdits(snap, { rebuildRegions = true } = {}) {
+            this.boundaryEditCount++;   // an Undo replaces the boundaries outside detection
             this.detectedTracks = snap.tracks.map(t => ({ ...t }));
             this.customMapping = [...snap.mapping];
             this.trackMappingReversed = snap.reversed;
@@ -2222,8 +2277,8 @@ function vinylApp() {
         async smartRescan(target) {
             target = parseInt(target, 10);
             if (!this.currentFileId || this.analyzing || this.currentLocked) return;
-            if (!target || target < 1 || target > 99) {
-                this.rescanNotice = 'Enter how many songs the recording contains (1–99) first.';
+            if (!target || target < 1 || target > MAX_GUIDED_TRACKS) {
+                this.rescanNotice = `Enter how many songs the recording contains (1–${MAX_GUIDED_TRACKS}) first.`;
                 return;
             }
 
@@ -2341,6 +2396,7 @@ function vinylApp() {
             this.searchHasMore = false;
             this.searchMoreLoading = false;
             this.searchMoreError = '';
+            this.searchMoreNotice = '';
         },
 
         /**
@@ -2353,6 +2409,7 @@ function vinylApp() {
             const page = this.searchPage + 1;
             this.searchMoreLoading = true;
             this.searchMoreError = '';
+            this.searchMoreNotice = '';
             try {
                 const response = await fetch('/api/search', {
                     method: 'POST',
@@ -2374,6 +2431,8 @@ function vinylApp() {
                     this.detailsSettled = false;
                     this.searchResults = [...this.searchResults, ...added];
                     this.loadAllReleaseDetails(seq, added.map(r => r.id));
+                } else {
+                    this.searchMoreNotice = this.searchHasMore ? 'No new results on this page.' : 'No more results.';
                 }
             } catch (error) {
                 if (seq !== this.searchSeq) return;
@@ -2447,7 +2506,11 @@ function vinylApp() {
          * while this card loads clears _pendingPickId, and its reply then only fills the card.
          */
         async chooseResult(result) {
-            if (this.analyzing || this.currentLocked || result.opening) return;
+            if (result.opening) return;   // a second click on the card already opening is no new pick
+            if (this.analyzing || this.currentLocked) {
+                this._pendingPickId = null;   // refused, but it was the latest click: an older card must not land
+                return;
+            }
             if (result.tracks) {
                 this.selectRelease(result);
                 return;
@@ -2468,6 +2531,7 @@ function vinylApp() {
         },
 
         parseDiscogsRelease,
+        maxGuidedTracks: MAX_GUIDED_TRACKS,
         normalizeWorkTitle,
         workTitlesMatch: (first, second) => workTitleMatchScore(first, second) > 0,
         slotGroups,
@@ -2942,6 +3006,9 @@ function vinylApp() {
                 editing: false,
                 ignored: false
             }));
+            // An open Rename / custom-track form reads customMapping at Save; a detection resets that
+            // mapping, so the form would retitle another track. Every detection install comes through here.
+            this.trackForm = null;
             this.boundariesEdited = false;
             this.editBanner = false;
             this.snapUndo = null;
@@ -2964,6 +3031,7 @@ function vinylApp() {
          * Record that the user changed boundaries by hand
          */
         markEdited() {
+            this.boundaryEditCount++;
             this.boundariesEdited = true;
             this.snapUndo = null;
             this.snapNotice = '';
@@ -2997,35 +3065,45 @@ function vinylApp() {
             };
             this.editBanner = false;
 
+            const fileId = this.currentFileId;
+            const editCount = this.boundaryEditCount;
             const ok = await this.redetectForTargets();
+            if (this.currentFileId !== fileId) return;
             if (ok) {
                 this.snapUndo = snapshot;
                 this.snapNotice = 'Snapped to Discogs.';
+            } else if (this.detectedTracks.length === 0 && snapshot.tracks.length > 0 && this.boundaryEditCount === editCount) {
+                // Found nothing (redetectForTargets already warned): keep the hand edits rather
+                // than leave an empty editor with nothing to undo.
+                this.rescanNotice = '';
+                await this.restoreSnapshotWithWaveform(snapshot);
             }
+        },
+
+        /**
+         * Put a snapshot of the edits back and build the waveform it needs: a detection that
+         * found nothing leaves none, and restoreEdits only redraws regions on an existing one.
+         */
+        async restoreSnapshotWithWaveform(snapshot) {
+            this.restoreEdits(snapshot, { rebuildRegions: false });
+            if (this.waveform) {
+                this.addTrackRegions();
+                return;
+            }
+            await this.$nextTick();
+            await this.initWaveform();
         },
 
         /**
          * Restore the boundaries and mapping from before the last snap
          */
-        undoSnap() {
+        async undoSnap() {
             const snap = this.snapUndo;
             if (!snap) return;
 
-            this.detectedTracks = snap.tracks;
-            this.customMapping = snap.mapping;
-            this.trackMappingReversed = snap.reversed;
-            this.expectedBoundaries = snap.expected;
-            this.boundariesEdited = snap.edited;
-            this.snapUndo = null;
-            this.snapNotice = '';
+            this.rescanNotice = '';   // "Placed N tracks" described the snap, not the restored edits
+            await this.restoreSnapshotWithWaveform(snap);
             this.rescanNotice = '';
-            this.editBanner = false;
-            this.trackCountMismatch = !!this.selectedRelease &&
-                this.activeTrackCount !== this.targetTracks.length;
-
-            if (this.waveformRegions && this.waveform) {
-                this.addTrackRegions();
-            }
         },
 
         /**
@@ -3042,9 +3120,10 @@ function vinylApp() {
          * recording covers and (re)run detection for that many tracks.
          */
         selectRelease(release) {
+            // Latest click wins even when refused: an older card still loading must not land later
+            this._pendingPickId = null;
             if (this.analyzing || this.currentLocked) return;
 
-            this._pendingPickId = null;   // this pick replaces any card still loading
             this.selectedRelease = release;
             this.loadAlbumDescription();
             this.prefixPartTitles = true;  // a per-release choice
@@ -3095,7 +3174,14 @@ function vinylApp() {
                 result = { status: 'error' };
             }
             // Stale reply: another release was selected, or the setting was switched off meanwhile.
-            if (this.selectedRelease?.id !== releaseId || this.config.album_description !== true) return;
+            if (this.selectedRelease?.id !== releaseId || this.config.album_description !== true) {
+                // Still showing this release's "loading" (cleared and restored by Undo meanwhile): nothing
+                // else will reload it, so reset and let the next check start a new lookup.
+                if (this.albumDescription.releaseId === releaseId && this.albumDescription.status === 'loading') {
+                    this.albumDescription = { releaseId: null, status: 'idle', text: '', title: '', url: '' };
+                }
+                return;
+            }
             this.albumDescription = {
                 releaseId, status: result.status || 'error',
                 text: result.text || '', title: result.title || '', url: result.url || ''
@@ -3131,6 +3217,36 @@ function vinylApp() {
             const count = targets.length;
             if (count < 1 || !this.currentFileId || this.analyzing || this.currentLocked) return false;
 
+            if (count > MAX_GUIDED_TRACKS) {
+                // Also a toast: rescanNotice only renders once tracks are detected, and a first pick has none.
+                const text = `The chosen sides hold ${count} tracks; detection places at most ${MAX_GUIDED_TRACKS} at a time.`
+                    + (this.sideChips.length > 1 ? ' Pick a disc or side.' : '');
+                this.clearExpectedMarkers();   // they belonged to the previous sides
+                this.rescanNotice = `⚠️ ${text}`;
+                this.notify(text, { type: 'warning' });
+                return false;
+            }
+
+            // The waveform, inline inputs and context menu stay live while this runs: a reply is only
+            // installed if the recording, the release and the hand edits are still what they were.
+            const fileId = this.currentFileId;
+            const releaseId = this.selectedRelease?.id ?? null;
+            const editCount = this.boundaryEditCount;
+            const superseded = () => this.currentFileId !== fileId
+                || (this.selectedRelease?.id ?? null) !== releaseId
+                || this.boundaryEditCount !== editCount;
+            const discardSuperseded = () => {
+                this.processingMessage = '';
+                // Same recording and release, so the markers on screen belong to other sides now and
+                // the tracks may no longer match the release: stale markers go, the ask-first banner
+                // offers the choice. A different recording or release is none of this one's business.
+                if (this.currentFileId === fileId && (this.selectedRelease?.id ?? null) === releaseId) {
+                    this.clearExpectedMarkers();
+                    this.editBanner = this.detectedTracks.length > 0;
+                }
+                return false;
+            };
+
             let succeeded = false;
             this.analyzing = true;
             this.rescanNotice = '';
@@ -3142,7 +3258,7 @@ function vinylApp() {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        file_id: this.currentFileId,
+                        file_id: fileId,
                         expected_tracks: count,
                         durations: targets.map(t => this.parseTrackDuration(t.duration)),
                         side_breaks: targets.flatMap((track, index) => {
@@ -3155,6 +3271,7 @@ function vinylApp() {
                 });
                 const data = await response.json();
 
+                if (superseded()) return discardSuperseded();
                 if (!response.ok || !data.tracks) {
                     throw new Error(data.detail || 'Boundary detection failed');
                 }
@@ -3166,19 +3283,25 @@ function vinylApp() {
                 });
                 this.processingMessage = '';
 
-                const file = this.uploadedFiles.find(f => f.id === this.currentFileId);
+                const file = this.uploadedFiles.find(f => f.id === fileId);
                 if (file) {
                     file.status = 'analyzed';
                 }
-                this.applyScan(this.currentFileId, data);
+                this.applyScan(fileId, data);
 
                 if (this.selectedRelease) {
                     this.resetMappingToTargets();
                 }
 
+                // initWaveform keeps an existing waveform, and with it the old regions
                 this.destroyWaveform();
-                await this.$nextTick();
-                await this.initWaveform();
+                if (data.tracks.length === 0) {
+                    // No waveform either, or a retry's tracks would get no regions
+                    this.notify('No tracks were found in this recording. Try another release or adjust the silence settings.', { type: 'warning' });
+                } else {
+                    await this.$nextTick();
+                    await this.initWaveform();
+                }
 
                 if (data.method === 'durations') {
                     const snapped = (data.boundaries || []).filter(b => b.snapped).length;
@@ -3188,11 +3311,14 @@ function vinylApp() {
                         ? `✅ Placed ${data.tracks.length} tracks by track count (Discogs lengths unavailable).`
                         : `⚠️ Couldn't find exactly ${count} tracks — closest result is ${data.tracks.length}. Right-click the waveform to add or remove splits manually.`;
                 }
-                succeeded = true;
+                // Nothing found is not a success: the caller must not offer an Undo of it
+                succeeded = data.tracks.length > 0;
             } catch (error) {
+                if (superseded()) return discardSuperseded();
                 console.error('Guided detection failed:', error);
                 this.rescanNotice = '❌ Boundary detection failed: ' + error.message;
                 this.processingMessage = '';
+                this.clearExpectedMarkers();   // they belonged to the previous sides
             } finally {
                 this.analyzing = false;
             }
@@ -3759,9 +3885,11 @@ function vinylApp() {
          * detection/waveform so another release can be picked.
          */
         changeRelease() {
-            if (this.currentLocked) return;
+            // A running detection would install its tracks and markers on a release that is gone
+            if (this.analyzing || this.currentLocked) return;
             this.selectedRelease = null;
             this._pendingPickId = null;   // a card still loading must not bring a release back
+            this.releaseIdLoading = false;   // a pasted-link lookup in flight is dropped (its _releaseIdCall stays latest-only)
             this.titleSource = null;
             this.closeMovementsPanel();
             this.trackForm = null;
@@ -3780,6 +3908,7 @@ function vinylApp() {
          * Reverse track mapping order
          */
         reverseMapping() {
+            if (this.analyzing) return;   // a running detection's reply would reset the mapping
             this.trackMappingReversed = !this.trackMappingReversed;
 
             if (this.trackMappingReversed) {
@@ -3809,6 +3938,7 @@ function vinylApp() {
          * Map detected track idx to release track dtIdx (dropdown handler)
          */
         setMapping(idx, value) {
+            if (this.analyzing) return;
             const mapping = [...this.customMapping];
             mapping[idx] = Number(value);
             this.customMapping = mapping;
@@ -3862,7 +3992,7 @@ function vinylApp() {
 
         /** Open the inline form for row idx: 'add' a custom track, or 'edit' (rename / remove) the mapped one. */
         openTrackForm(idx, mode) {
-            if (!this.selectedRelease || this.currentLocked) return;
+            if (!this.selectedRelease || this.currentLocked || this.analyzing) return;
             if (this.trackForm && this.trackForm.idx === idx && this.trackForm.mode === mode &&
                 this.trackForm.fileId === this.currentFileId) { this.trackForm = null; return; }
             const mapped = this.mappedTrack(idx);
@@ -3990,7 +4120,7 @@ function vinylApp() {
 
         /** Returns an error message, or '' when row idx now maps to the new custom track. */
         addCustomTrack(idx, positionText, titleText) {
-            if (!this.selectedRelease || this.currentLocked) return 'Not available right now.';
+            if (!this.selectedRelease || this.currentLocked || this.analyzing) return 'Not available right now.';
             const position = String(positionText || '').trim().toUpperCase();
             const title = String(titleText || '').trim();
             if (!CUSTOM_POSITION_RE.test(position)) return 'Position needs a side letter and a number, like B5.';
@@ -4021,7 +4151,7 @@ function vinylApp() {
         /** Give release track releaseIdx a new title (or reset it when it equals the Discogs one). */
         renameTrack(releaseIdx, titleText) {
             const track = this.selectedRelease?.tracks?.[releaseIdx];
-            if (!track || this.currentLocked) return 'Not available right now.';
+            if (!track || this.currentLocked || this.analyzing) return 'Not available right now.';
             const title = String(titleText || '').trim();
             if (!title) return 'Enter a title.';
             if (title.length > CUSTOM_TITLE_MAX) return `Keep the title under ${CUSTOM_TITLE_MAX} characters.`;
@@ -4049,7 +4179,7 @@ function vinylApp() {
         editCustomTrack(releaseIdx, positionText, titleText) {
             const tracks = this.selectedRelease?.tracks || [];
             const track = tracks[releaseIdx];
-            if (!track?.custom || this.currentLocked) return 'Not available right now.';
+            if (!track?.custom || this.currentLocked || this.analyzing) return 'Not available right now.';
             const position = String(positionText || '').trim().toUpperCase();
             const title = String(titleText || '').trim();
             if (!CUSTOM_POSITION_RE.test(position)) return 'Position needs a side letter and a number, like B5.';
@@ -4088,7 +4218,7 @@ function vinylApp() {
         /** Put a renamed Discogs track's title back. */
         resetRenamedTrack(releaseIdx) {
             const track = this.selectedRelease?.tracks?.[releaseIdx];
-            if (!track?.renamed || this.currentLocked) return 'Not available right now.';
+            if (!track?.renamed || this.currentLocked || this.analyzing) return 'Not available right now.';
             const before = { fileId: this.currentFileId, release: this.selectedRelease,
                 mapping: [...this.customMapping], sides: [...this.selectedSides] };
             this.editReleaseCopy(release => {
@@ -4105,7 +4235,7 @@ function vinylApp() {
         /** Remove a custom track no other row maps to; row idx falls back to the track before it. */
         removeCustomTrack(releaseIdx, idx) {
             const track = this.selectedRelease?.tracks?.[releaseIdx];
-            if (!track?.custom || this.currentLocked) return 'Not available right now.';
+            if (!track?.custom || this.currentLocked || this.analyzing) return 'Not available right now.';
             const others = this.customMapping.some((m, i) => i !== idx && Number(m) === releaseIdx &&
                 !this.detectedTracks[i]?.ignored);
             if (others) return `Another track is mapped to ${track.position}. Map it elsewhere first.`;
@@ -5024,6 +5154,7 @@ function vinylApp() {
          * Toggle track ignored status and update region color
          */
         toggleTrackIgnored(track) {
+            if (this.analyzing) return;
             track.ignored = !track.ignored;
 
             if (this.waveformRegions) {
@@ -5135,6 +5266,7 @@ function vinylApp() {
         },
 
         setTrackDeclick(idx, value) {
+            if (this.analyzing) return;
             const t = this.detectedTracks[idx];
             if (!t) return;
             t.declick = value ? this.normDeclick(value) : null;

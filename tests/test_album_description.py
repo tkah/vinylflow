@@ -142,6 +142,24 @@ def test_master_hit_without_enwiki_is_none_and_skips_release_fallback():
     assert web.searched() == ["haswbstatement:P1954=10"]
 
 
+@pytest.mark.parametrize("sitelinks", [[], {}], ids=["empty-list", "empty-object"])
+def test_an_item_whose_sitelinks_are_empty_is_none_not_error(sitelinks):
+    """wbgetentities can send an empty sitelinks as a JSON list; that is "no article", not a
+    malformed reply (an error is never cached, so the preview would offer Retry forever)."""
+    web = FakeWeb(
+        search={"haswbstatement:P1954=10": FakeResponse(200, search_payload("Q1", "Q2"))},
+        entities=FakeResponse(200, {"entities": {"Q1": {"id": "Q1", "sitelinks": sitelinks},
+                                                 "Q2": {"sitelinks": {"enwiki": {"title": "Only"}}}}}),
+        summaries={SUMMARY_PREFIX + "Only": FakeResponse(200, summary_payload())},
+    )
+    assert AlbumDescriptions(http_get=web).lookup(1, 10).status == "found"
+    web = FakeWeb(
+        search={"haswbstatement:P1954=10": FakeResponse(200, search_payload("Q1"))},
+        entities=FakeResponse(200, {"entities": {"Q1": {"id": "Q1", "sitelinks": sitelinks}}}),
+    )
+    assert AlbumDescriptions(http_get=web).lookup(1, 10).status == "none"
+
+
 def test_two_qids_with_enwiki_is_ambiguous_none():
     web = FakeWeb(
         search={"haswbstatement:P1954=10": FakeResponse(200, search_payload("Q1", "Q2"))},
@@ -316,3 +334,44 @@ def test_every_request_has_user_agent_and_timeout():
     for _url, _params, headers, timeout in web.calls:
         assert headers["User-Agent"] == DESCRIPTION_USER_AGENT
         assert timeout and timeout > 0
+
+
+@pytest.mark.parametrize("title", [["x"], 5, {"a": 1}], ids=["list", "int", "dict"])
+def test_a_non_string_article_title_is_none_not_an_exception(title):
+    web = FakeWeb(
+        search={"haswbstatement:P1954=10": FakeResponse(200, search_payload("Q1"))},
+        entities=FakeResponse(200, {"entities": {"Q1": {"sitelinks": {"enwiki": {"title": title}}}}}),
+    )
+    assert AlbumDescriptions(http_get=web).lookup(1, 10).status == "none"
+
+
+def test_any_oserror_from_http_get_is_an_error_not_an_exception():
+    """requests' exceptions are OSErrors; so are socket and SSL failures raised by a patched getter."""
+    web = happy_web()
+    web.search = {"haswbstatement:P1954=10": OSError("network unreachable")}
+    assert AlbumDescriptions(http_get=web).lookup(1, 10).status == "error"
+
+
+def test_a_failed_lookup_logs_its_reason_with_the_release_id(caplog):
+    web = happy_web()
+    web.search = {"haswbstatement:P1954=10": FakeResponse(500, {})}
+    with caplog.at_level("WARNING", logger="album_description"):
+        assert AlbumDescriptions(http_get=web).lookup(1234, 10).status == "error"
+    assert any("1234" in record.getMessage() and "HTTP 500" in record.getMessage() for record in caplog.records)
+
+
+def test_a_connection_failure_logs_class_and_host_but_not_the_url_or_a_path(caplog):
+    """requests puts the full URL (with the album title) and local paths (a CA bundle) in its error text."""
+    title = "Secret Album Title"
+    web = FakeWeb(
+        search={"haswbstatement:P1954=10": FakeResponse(200, search_payload("Q1"))},
+        entities=FakeResponse(200, entities_payload(Q1=title)),
+        summaries={SUMMARY_PREFIX + "Secret_Album_Title": requests.ConnectionError(
+            f"HTTPSConnectionPool: Max retries exceeded with url: /api/rest_v1/page/summary/Secret_Album_Title "
+            f"(could not load /Users/you/certs/ca.pem)")},
+    )
+    with caplog.at_level("WARNING", logger="album_description"):
+        assert AlbumDescriptions(http_get=web).lookup(4321, 10).status == "error"
+    logged = " ".join(record.getMessage() for record in caplog.records)
+    assert "ConnectionError" in logged and "en.wikipedia.org" in logged and "4321" in logged
+    assert "Secret" not in logged and "/Users/" not in logged and "ca.pem" not in logged

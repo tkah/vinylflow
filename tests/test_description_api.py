@@ -81,9 +81,43 @@ def process_request(**extra):
     return api.ProcessRequest(file_id="f", release_id=1, track_mapping=[], **extra)
 
 
+# A request may only turn the lookup off: a request frozen with True (queued export) must not
+# contact Wikipedia once the saved setting is off. (Was: True in the request overrode a saved False.)
 @pytest.mark.parametrize("config_value,request_value,expected", [
-    (True, None, True), (False, None, False), (False, True, True), (True, False, False)])
+    (True, None, True), (False, None, False), (False, True, False), (True, False, False), (True, True, True)])
 def test_output_spec_resolves_album_description(monkeypatch, config_value, request_value, expected):
     monkeypatch.setattr(api.config, "album_description", config_value)
     spec = api._output_spec(process_request(album_description=request_value))
     assert spec.album_description is expected
+
+
+def test_real_discogs_release_searches_wikidata_by_its_master_id(monkeypatch):
+    """A real ``DiscogsRelease`` built from a Discogs payload (not a fake carrying master_id)
+    reaches the first Wikidata search as ``haswbstatement:P1954=<master_id>``."""
+    import discogs_client
+    from album_description import AlbumDescriptions
+    from metadata_handler import DiscogsRelease
+
+    data = {"id": 42, "master_id": 7, "title": "Album", "year": 1970, "artists": [{"name": "Artist", "id": 1}],
+            "labels": [{"name": "Label", "id": 2}], "tracklist": [{"position": "A1", "title": "One", "duration": "4:00"}],
+            "genres": [], "styles": [], "images": [], "extraartists": [], "formats": []}
+    raw = discogs_client.Release(discogs_client.Client("VinylFlow-tests"), data)
+    release = DiscogsRelease(raw)
+    assert release.master_id == 7
+
+    calls = []
+
+    def fake_http_get(url, params=None, headers=None, timeout=None):
+        calls.append(params)
+
+        class Reply:
+            status_code = 200
+
+            def json(self):
+                return {"query": {"search": []}}
+        return Reply()
+
+    install(monkeypatch, True, release=release)
+    api.metadata_handler.album_descriptions = AlbumDescriptions(http_get=fake_http_get)
+    assert client.get("/api/release/42/description").json()["status"] == "none"
+    assert calls[0]["srsearch"] == "haswbstatement:P1954=7"
