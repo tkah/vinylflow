@@ -213,9 +213,36 @@ test('storage access errors do not prevent recovery of the live queue', async ()
         const instance = app(); instance.currentFileId = null; instance.currentFile = null;
         global.fetch = async () => ({ ok: true, json: async () => ({ uploaded: [file()], processing: [] }) });
         await instance.loadWorkspaces();
-        assert.strictEqual(instance.recoverableFiles.length, 1);
+        // The live queue still loads; with no saved work there is nothing to offer as "resume".
+        assert.deepStrictEqual(instance.uploadedFiles.map(entry => entry.id), ['one']);
+        assert.deepStrictEqual(instance.recoverableFiles, []);
         assert.match(instance.workspaceNotice, /saving is unavailable/);
     } finally { window.localStorage = localStorage; }
+});
+test('only recordings with saved work or a running export are offered to resume', async () => {
+    storage.clear();
+    // A batch import of untouched recordings: the Queue lists them, the Resume banner must not.
+    const before = app();
+    before.uploadedFiles = [file(), file('two'), file('three'), file('four'), file('five'), file('six')];
+    before.detectedTracks = [];
+    before.saveWorkspace();                       // 'one' was opened (auto-search only): not started
+    before.currentFileId = 'two'; before.currentFile = before.uploadedFiles[1];
+    before.selectedRelease = { id: 7, artist: 'Artist', title: 'Album', tracks: [{ position: 'A1', title: 'Song' }] };
+    before.saveWorkspace();                       // 'two' has a release picked
+    before.currentFileId = 'three'; before.currentFile = before.uploadedFiles[2];
+    before.selectedRelease = null; before.detectedTracks = [{ ...track }];
+    before.saveWorkspace();                       // 'three' has detected tracks (silence-only detection)
+    before.currentFileId = 'six'; before.currentFile = before.uploadedFiles[5];
+    before.saveWorkspace();                       // 'six' has tracks too, but its export completed below
+    const after = app(); after.currentFileId = null; after.currentFile = null;
+    global.fetch = async () => ({ ok: true, json: async () => ({ uploaded: [file(), file('two'), file('three'),
+        file('four'), { ...file('five'), status: 'processing' }, { ...file('six'), status: 'completed' }],
+        processing: [] }) });
+    await after.loadWorkspaces();
+    assert.deepStrictEqual(after.recoverableFiles.map(entry => entry.id), ['two', 'three', 'five']);
+    // The open recording is never offered, started or not.
+    after.selectFile('two');
+    assert.deepStrictEqual(after.recoverableFiles.map(entry => entry.id), ['three', 'five']);
 });
 test('directional cursors distinguish each side and a shared boundary', () => {
     const instance = app();

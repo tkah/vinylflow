@@ -803,9 +803,17 @@ function vinylApp() {
                     this[field] === null || typeof state[field] === typeof this[field]));
         },
 
-        /** Live queue items that can be resumed, including imports abandoned before any editing. */
+        /**
+         * Unfinished recordings with work to come back to: a release picked or tracks detected, or an
+         * export still running. Untouched ones (e.g. a batch import, or a file opened only for the
+         * automatic Discogs search) are left to the Queue, which lists every recording.
+         */
         get recoverableFiles() {
-            return this.uploadedFiles.filter(file => file.id !== this.currentFileId && file.status !== 'completed');
+            return this.uploadedFiles.filter(file => {
+                if (file.id === this.currentFileId || file.status === 'completed') return false;
+                const state = this.workspaces[file.id];
+                return this.isLocked(file.id) || !!(state && (state.selectedRelease || state.detectedTracks.length));
+            });
         },
 
         /** Resume editing without detection/search/export side effects; rebuild only the waveform. */
