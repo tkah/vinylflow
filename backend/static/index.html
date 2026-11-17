@@ -1260,12 +1260,16 @@
             </div>
         </div>
 
-        <fieldset :disabled="currentLocked" class="contents">
-        <!-- Track Controls & Additional Content -->
+        <!-- Track Controls & Additional Content.
+             An export locks the editing controls below with narrower disabled fieldsets
+             (display: contents, so they add no box) and a few explicit :disabled bindings,
+             leaving playback (row ▶️ ⇤ ⇥, the A/B player) usable: a disabled fieldset
+             disables every control inside it, so a Pause there could not stop the audio. -->
         <div class="max-w-7xl mx-auto px-4 py-6 sm:px-6 lg:px-8">
             <div class="space-y-6">
                     <!-- Merged track table: detection + Discogs mapping -->
                     <div x-show="detectedTracks.length > 0" x-cloak class="bg-card rounded-lg shadow p-6">
+                        <fieldset :disabled="currentLocked" class="contents">
                         <div class="flex flex-wrap justify-between items-center gap-2 mb-4">
                             <h3 class="text-lg font-semibold text-primary">
                                 Tracks (<span x-text="activeTrackCount"></span> of <span x-text="detectedTracks.length"></span> active)
@@ -1323,6 +1327,7 @@
                                 </div>
                             </div>
                         </div>
+                        </fieldset>
 
                         <div class="track-table-scroll">
                             <div class="track-grid text-xs font-semibold text-secondary pb-2" style="border-bottom: 1px solid #8A8A86;">
@@ -1343,6 +1348,7 @@
                                         <div class="track-swatch" :style="`background-color: ${trackSwatchColor(track, idx)}`"></div>
                                         <div class="font-medium text-primary" :class="{ 'line-through text-muted': track.ignored }" x-text="track.number"></div>
                                         <div>
+                                            <fieldset :disabled="currentLocked" class="contents">
                                             <template x-if="selectedRelease">
                                                 <div class="flex items-center gap-1">
                                                     <select @change="onMappingSelect(idx, $event.target)" :disabled="analyzing" :class="{'opacity-60 cursor-not-allowed': analyzing}" :title="mappedTrack(idx) ? trackOptionLabel(mappedTrack(idx)) : ''" class="w-full min-w-0 px-2 py-1.5 border focus-primary rounded-md text-sm" style="border-color: #8A8A86;">
@@ -1359,18 +1365,22 @@
                                                 </div>
                                             </template>
                                             <span x-show="!selectedRelease" class="text-muted">—</span>
+                                            </fieldset>
                                         </div>
                                         <div class="text-secondary"><span x-text="formatTime(track.start)"></span> – <span x-text="formatTime(track.end)"></span></div>
                                         <div class="text-right">
+                                            <fieldset :disabled="currentLocked" class="contents">
                                             <input type="text" inputmode="decimal" :value="formatDuration(track.duration)" aria-label="Track length"
                                                    title="Type a length (m:ss) to move the end to start + length"
                                                    @change="setTrackLength(idx, $event.target.value, $event.target)" @keydown.enter="$event.target.blur()"
                                                    class="w-full px-1 py-0.5 border rounded text-right text-sm text-secondary focus-primary" style="border-color: #D6D3CC;">
+                                            </fieldset>
                                         </div>
                                         <div class="text-right text-secondary" x-text="discogsLength(idx) !== null ? formatDuration(discogsLength(idx)) : '—'"></div>
                                         <div class="text-right font-semibold" :style="`color: ${deltaColor(trackDelta(track, idx))}`" x-text="deltaText(trackDelta(track, idx))"></div>
                                         <div class="text-right text-secondary" :title="clickTooltip(track)" data-testid="click-count" x-text="clickCountText(track)"></div>
                                         <div>
+                                            <fieldset :disabled="currentLocked" class="contents">
                                             <select @change="setTrackDeclick(idx, $event.target.value)" :disabled="track.ignored || analyzing" :class="{'opacity-60 cursor-not-allowed': analyzing}" aria-label="Click removal for this track"
                                                     class="w-full px-1 py-1 border focus-primary rounded-md text-xs" style="border-color: #8A8A86;">
                                                 <option value="" :selected="!track.declick" x-text="declickDefaultLabel()"></option>
@@ -1378,22 +1388,24 @@
                                                     <option :value="lvl.id" :selected="track.declick === lvl.id" x-text="lvl.label"></option>
                                                 </template>
                                             </select>
+                                            </fieldset>
                                         </div>
                                         <div class="flex gap-1.5 justify-end">
                                             <button @click="auditionCut(idx, 'start')" :disabled="!waveform" class="px-2 py-1 rounded text-xs text-primary" style="background-color: #F0EFEB;" title="Hear the start cut">⇤</button>
                                             <button @click="auditionCut(idx, 'end')" :disabled="!waveform" class="px-2 py-1 rounded text-xs text-primary" style="background-color: #F0EFEB;" title="Hear the end cut">⇥</button>
                                             <button @click="toggleTrackPlay(idx)" :disabled="track.ignored || !waveform" class="px-2 py-1 btn-primary rounded text-xs" :class="{'opacity-50 cursor-not-allowed': track.ignored}" :title="(isPlaying && playheadIdx === idx) ? 'Pause' : 'Play this track in the waveform'" x-text="(isPlaying && playheadIdx === idx) ? '⏸' : '▶️'"></button>
-                                            <button @click="track.editing = !track.editing" :disabled="track.ignored" class="px-2 py-1 rounded text-xs text-primary" style="background-color: #F0EFEB;" :class="{'opacity-50 cursor-not-allowed': track.ignored}">
+                                            <button @click="track.editing = !track.editing" :disabled="currentLocked || track.ignored" class="px-2 py-1 rounded text-xs text-primary" style="background-color: #F0EFEB;" :class="{'opacity-50 cursor-not-allowed': currentLocked || track.ignored}">
                                                 <span x-show="!track.editing">✏️ Adjust</span>
                                                 <span x-show="track.editing">✓ Done</span>
                                             </button>
-                                            <button @click="toggleTrackIgnored(track)" :disabled="analyzing" :class="{'opacity-60 cursor-not-allowed': analyzing}" class="px-2 py-1 rounded text-xs text-primary" style="background-color: #F0EFEB;" :style="track.ignored ? 'background-color: #8A8A86; color: #FFFFFF;' : ''" title="Exclude this track from processing" x-text="track.ignored ? 'Ignored' : 'Ignore'"></button>
-                                            <button @click="deleteTrack(track.number)" class="px-2 py-1 btn-danger rounded text-xs" title="Delete this track" aria-label="Delete this track">
+                                            <button @click="toggleTrackIgnored(track)" :disabled="currentLocked || analyzing" :class="{'opacity-60 cursor-not-allowed': currentLocked || analyzing}" class="px-2 py-1 rounded text-xs text-primary" style="background-color: #F0EFEB;" :style="track.ignored ? 'background-color: #8A8A86; color: #FFFFFF;' : ''" title="Exclude this track from processing" x-text="track.ignored ? 'Ignored' : 'Ignore'"></button>
+                                            <button @click="deleteTrack(track.number)" :disabled="currentLocked" :class="{'opacity-50 cursor-not-allowed': currentLocked}" class="px-2 py-1 btn-danger rounded text-xs" title="Delete this track" aria-label="Delete this track">
                                                 <!-- Outline icon in currentColor (white): the 🗑️ emoji ignored the button's colour and showed grey on red -->
                                                 <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" style="display: block;"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
                                             </button>
                                         </div>
                                     </div>
+                                    <fieldset :disabled="currentLocked" class="contents">
                                     <form x-show="trackFormShown(idx)" x-cloak @submit.prevent="submitTrackForm()" @keydown.escape="closeTrackForm()"
                                           class="mt-2 p-3 bg-page rounded-lg" style="max-width: 640px;" data-testid="track-form">
                                         <template x-if="trackFormShown(idx)">
@@ -1440,6 +1452,7 @@
                                             <input type="number" step="0.1" :value="track.end" @change="updateTrackEnd(idx, $event.target.value)" class="w-full px-3 py-2 border focus-primary rounded-md text-sm" style="border-color: #8A8A86;">
                                         </div>
                                     </div>
+                                    </fieldset>
                                 </div>
                             </template>
                         </div>
@@ -1452,6 +1465,7 @@
                             <span class="text-sm text-secondary truncate ml-4" x-text="selectedRelease ? `${selectedRelease.artist} - ${selectedRelease.title}` : ''"></span>
                         </div>
 
+                        <fieldset :disabled="currentLocked" class="contents">
                         <!-- Output Format Selector -->
                         <div class="mb-4 p-4 bg-page rounded-lg">
                             <label class="block text-sm font-medium text-secondary mb-2">Output Format</label>
@@ -1468,8 +1482,11 @@
                             </div>
                         </div>
 
+                        </fieldset>
+
                         <!-- Audio processing: every option that changes or tags the audio, plus the A/B test -->
                         <div class="mb-4 p-4 bg-page rounded-lg" x-effect="abCheckStale()" data-testid="audio-panel">
+                            <fieldset :disabled="currentLocked" class="contents">
                             <h4 class="text-sm font-medium text-secondary">Audio processing</h4>
                             <p class="mt-1 text-xs text-muted">Optional clean-up and loudness options. Each one is remembered as your default.</p>
 
@@ -1566,9 +1583,12 @@
                                 <p class="mt-2 text-xs text-muted">Lets players even out volume without changing the audio (track + album).</p>
                             </div>
 
-                            <!-- A/B test on one track -->
+                            </fieldset>
+
+                            <!-- A/B test on one track: choosing and rendering lock during an export, the player never does -->
                             <div class="mt-5 pt-4 border-t" style="border-color: #3D3D3D;">
                             <h5 class="text-sm font-medium text-secondary mb-2">Test on one track</h5>
+                            <fieldset :disabled="currentLocked" class="contents">
                             <div class="flex flex-wrap items-center gap-3">
                                 <select @change="abSelectTrack($event.target.value)" :disabled="abRendering || abActiveIdx().length === 0"
                                         class="px-2 py-1.5 border focus-primary rounded-md text-sm" style="border-color: #8A8A86; max-width: 100%;">
@@ -1578,6 +1598,7 @@
                                 </select>
                                 <button type="button" @click="abRender()" :disabled="!abCanRender()" class="px-4 py-2 btn-primary rounded-lg text-sm">Render test</button>
                             </div>
+                            </fieldset>
                             <p x-show="!abAnyProcessing()" class="mt-2 text-xs text-muted">Turn on the rumble filter, hum removal, click &amp; pop removal, hiss reduction or album gain to test</p>
                             <p x-show="abRendering" x-cloak class="mt-2 text-sm text-secondary flex items-center gap-2"><span class="spinner"></span> Rendering… (this processes the whole track)</p>
                             <p x-show="abError" x-cloak class="mt-2 text-sm" style="color: #B3261E;" x-text="abError"></p>
@@ -1646,8 +1667,6 @@
                     </div>
             </div>
         </div>
-
-        </fieldset>
     </div>
 
         <!-- Footer -->
