@@ -843,7 +843,7 @@
         </div>
         <fieldset :disabled="currentLocked" class="contents">
         <!-- Discogs Search (step 1 after upload) -->
-        <div id="discogs-search" x-show="currentFile && !selectedRelease" x-cloak class="max-w-7xl mx-auto px-4 pb-2 sm:px-6 lg:px-8">
+        <div id="discogs-search" x-show="currentFile && !selectedRelease" x-effect="noteReleaseIdHelpShown()" x-cloak class="max-w-7xl mx-auto px-4 pb-2 sm:px-6 lg:px-8">
             <div class="bg-card rounded-lg shadow p-6">
                 <h3 class="text-lg font-semibold text-primary mb-1">🔍 Find the release on Discogs</h3>
                 <p class="text-sm text-secondary mb-4">Pick the release first &mdash; its track count and lengths guide track detection.</p>
@@ -865,7 +865,7 @@
                         <span x-show="releaseIdLoading" class="flex items-center gap-2"><span class="spinner"></span>Loading…</span>
                     </button>
                 </div>
-                <p id="discogs-release-id-help" class="-mt-2 mb-4 text-xs text-secondary">The release number is the number after /release/ in the release's Discogs address, not the catalog number.</p>
+                <p id="discogs-release-id-help" x-show="showReleaseIdHelp" class="-mt-2 mb-4 text-xs text-secondary">The release number is the number after /release/ in the release's Discogs address, not the catalog number.</p>
                 <p id="discogs-release-id-notice" x-show="releaseIdNotice" x-cloak role="alert" class="-mt-2 mb-4 p-2 rounded-lg text-sm text-primary" style="background-color: rgba(229, 161, 0, 0.15);" x-text="releaseIdNotice"></p>
 
                 <!-- Loading Animation -->

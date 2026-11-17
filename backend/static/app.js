@@ -41,6 +41,17 @@ const MAX_GUIDED_TRACKS = 99;
 // Additional workspace fields are optional when reading saves made before Plan 05.
 const WORKSPACE_ADDITIONS = { searchResults: [], onlyWithLengths: false, detailsSettled: false, currentZoom: 50,
     searchedQuery: '', searchPage: 0, searchHasMore: false, prefixPartTitles: true, titleSource: null };
+// The "number after /release/" help line shows for this many recordings, then only after a failed lookup.
+const RELEASE_ID_HELP_STORAGE_KEY = 'vinylflow.releaseIdHelp.v1';
+const RELEASE_ID_HELP_MAX_RECORDINGS = 5;
+
+/** Recording ids that have shown the release-number help; storage may be missing, denied or corrupt. */
+function loadReleaseIdHelpSeen() {
+    try {
+        const seen = JSON.parse(window.localStorage.getItem(RELEASE_ID_HELP_STORAGE_KEY) || '[]');
+        return Array.isArray(seen) ? seen.filter(id => typeof id === 'string').slice(0, RELEASE_ID_HELP_MAX_RECORDINGS) : [];
+    } catch (error) { return []; }
+}
 // Wheel/pinch zoom speed: zoom factor = exp(-deltaY * rate); one 100 px wheel notch ≈ x1.35
 const WHEEL_ZOOM_RATE = 0.003;
 // Custom tracks (must match CustomTrack in backend/api.py): new positions are A1/B12; titles <= 200 chars.
@@ -275,6 +286,7 @@ function vinylApp() {
         searchNotice: '',
         releaseIdInput: '',      // exact Discogs release: ID or pasted link
         releaseIdNotice: '',
+        releaseIdHelpSeen: loadReleaseIdHelpSeen(),
         releaseIdLoading: false,
         trackCountMismatch: false,
         autoRetryAttempts: 0,
@@ -2546,6 +2558,26 @@ function vinylApp() {
         borrowedPositions,
         defaultMovementSplit,
         ALL_DONOR_TRACKS: MOVEMENTS_ALL_DONOR_TRACKS,
+
+        /** Help for the release-number field: the first few recordings, and whenever a lookup went wrong. */
+        get showReleaseIdHelp() {
+            return !!this.releaseIdNotice || this.releaseIdHelpSeen.length < RELEASE_ID_HELP_MAX_RECORDINGS ||
+                this.releaseIdHelpSeen.includes(this.currentFileId);
+        },
+
+        /**
+         * Count the open recording once while the search card shows (a file with no release yet).
+         * Runs from an x-effect on the card, so it re-checks on every file or release change.
+         */
+        noteReleaseIdHelpShown() {
+            const fileId = this.currentFileId;
+            if (!this.currentFile || this.selectedRelease || !fileId) return;
+            if (this.releaseIdHelpSeen.includes(fileId) || this.releaseIdHelpSeen.length >= RELEASE_ID_HELP_MAX_RECORDINGS) return;
+            this.releaseIdHelpSeen = [...this.releaseIdHelpSeen, fileId];
+            try {
+                window.localStorage.setItem(RELEASE_ID_HELP_STORAGE_KEY, JSON.stringify(this.releaseIdHelpSeen));
+            } catch (error) { /* Without storage the help simply shows again after a reload. */ }
+        },
 
         /** Select the exact release the user named by ID or link, skipping search. */
         async openReleaseById() {
