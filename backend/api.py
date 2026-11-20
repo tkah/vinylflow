@@ -500,6 +500,7 @@ class ConfigUpdate(BaseModel):
     hiss_strength: Optional[str] = None      # remembered strength (light | medium | strong)
     album_gain: Optional[bool] = None
     replaygain: Optional[bool] = None
+    hide_support_ask: Optional[bool] = None
     album_description: Optional[bool] = None
 
 
@@ -2448,6 +2449,7 @@ async def get_config():
         "output_dir": config.default_output_dir,
         "import_dir": str(_import_dir()) if _import_dir() else None,  # read-only
         "track_numbering": config.track_numbering,
+        "hide_support_ask": config.hide_support_ask,
         "output_format": config.output_format,
         "bit_depth": config.bit_depth,
         "rumble_filter": config.rumble_filter,
@@ -2528,6 +2530,9 @@ async def update_config(updates: ConfigUpdate):
     if updates.replaygain is not None:
         config.replaygain = updates.replaygain
         config.save_replaygain(updates.replaygain)
+    if updates.hide_support_ask is not None:
+        config.hide_support_ask = updates.hide_support_ask
+        config.save_hide_support_ask(updates.hide_support_ask)
     if updates.album_description is not None:
         config.album_description = updates.album_description
         config.save_album_description(updates.album_description)

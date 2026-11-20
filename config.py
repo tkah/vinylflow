@@ -12,12 +12,13 @@ from dotenv import load_dotenv
 
 # Change this constant to flip the default for new installs.
 # "sequential_disc_per_lp" — A+B share disc 1, C+D share disc 2, etc. TRACKNUMBER
-#                            is sequential across both sides of each LP. Single LP
-#                            appears as 1 disc. VINYLPOSITION custom tag preserved.
-# "vinyl"                  — TRACKNUMBER="A1" (legacy behaviour, no DISCNUMBER written).
+#                            is sequential across both sides of each LP, with track
+#                            and disc totals. Single LP appears as 1 disc.
+#                            VINYLPOSITION custom tag preserved.
+# "vinyl"                  — TRACKNUMBER="A1" (legacy behaviour, no DISCNUMBER or totals written).
 DEFAULT_TRACK_NUMBERING = "sequential_disc_per_lp"
 TRACK_NUMBERING_SCHEMES = ("sequential_disc_per_lp", "vinyl")
-# What a value that isn't a scheme has always acted as.
+# The default before it changed: what an older settings.json without a saved choice was using.
 LEGACY_TRACK_NUMBERING = "vinyl"
 OUTPUT_FORMATS = ("flac", "mp3", "aiff")
 BIT_DEPTHS = ("source", "24")
@@ -147,6 +148,9 @@ class Config:
         self.replaygain = self._as_bool(
             json_settings.get("REPLAYGAIN", os.getenv("REPLAYGAIN")), True
         )
+        # The "support VinylFlow" note shown after an export, until the user turns it off
+        self.hide_support_ask = json_settings.get('HIDE_SUPPORT_ASK') is True
+
         # Wikipedia lead paragraph in the Comment tag: off by default (no outbound traffic unasked)
         self.album_description = self._as_bool(
             json_settings.get("ALBUM_DESCRIPTION", os.getenv("ALBUM_DESCRIPTION")), False
@@ -161,10 +165,20 @@ class Config:
         return str(value).strip().lower() in ("1", "true", "yes", "on")
 
     def _resolve_track_numbering(self, json_settings: dict) -> str:
-        """The numbering scheme; an unknown value warns and keeps acting as ``vinyl``."""
+        """The numbering scheme, keeping an older install on the scheme it was using.
+
+        A non-empty settings.json without a scheme comes from before the default changed:
+        new installs record the default on their first save (``_write_settings``). Pin
+        ``vinyl`` there once, so the next record sorts with the rest of the library. A
+        missing or unreadable file loads as empty, so it is never rewritten here. Unknown
+        values keep acting as ``vinyl``, as they always have.
+        """
         scheme = json_settings.get("TRACK_NUMBERING") or os.getenv("TRACK_NUMBERING")
         if not scheme:
-            return DEFAULT_TRACK_NUMBERING
+            if not json_settings:
+                return DEFAULT_TRACK_NUMBERING
+            self._write_settings({"TRACK_NUMBERING": LEGACY_TRACK_NUMBERING})
+            return LEGACY_TRACK_NUMBERING
         if scheme not in TRACK_NUMBERING_SCHEMES:
             print(f"Warning: unknown TRACK_NUMBERING {scheme!r}, using {LEGACY_TRACK_NUMBERING!r}")
             return LEGACY_TRACK_NUMBERING
@@ -242,6 +256,10 @@ class Config:
                     settings = json.load(f)
             except Exception:
                 pass
+        if not settings and not os.getenv("TRACK_NUMBERING"):
+            # A new install's first save: record the default, or the next start would take
+            # this file for one from before it changed (``_resolve_track_numbering``).
+            settings["TRACK_NUMBERING"] = DEFAULT_TRACK_NUMBERING
         settings.update(updates)
         try:
             with open(settings_path, 'w') as f:
@@ -301,6 +319,9 @@ class Config:
 
     def save_replaygain(self, enabled: bool) -> bool:
         return self._write_settings({'REPLAYGAIN': bool(enabled)})
+
+    def save_hide_support_ask(self, hidden: bool) -> bool:
+        return self._write_settings({'HIDE_SUPPORT_ASK': bool(hidden)})
 
     def save_album_description(self, enabled: bool) -> bool:
         return self._write_settings({'ALBUM_DESCRIPTION': bool(enabled)})

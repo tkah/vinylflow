@@ -507,6 +507,12 @@ original app belong at [olimic1000/vinylflow](https://github.com/olimic1000/viny
 
 ---
 
+## Support VinylFlow
+
+VinylFlow is free and open source, built in spare time. If it saves you time, you can [buy us a coffee](https://buymeacoffee.com/olimic1000) — it helps keep the project going.
+
+---
+
 ## License
 
 [MIT](LICENSE) — free to use, modify, and distribute.

@@ -476,6 +476,7 @@ function vinylApp() {
             hiss_strength: 'light',
             album_gain: false,
             replaygain: true,
+            hide_support_ask: false,
             album_description: false   // global like output_dir: not a workspace field
         },
 
@@ -967,6 +968,31 @@ function vinylApp() {
         },
 
         /** The recording in the editor is read-only while it is locked; others stay editable. */
+        /** The support note in the "Processing Complete" card: after every export until turned off */
+        get showSupportAsk() {
+            return !!this.successMessage && !this.config.hide_support_ask;
+        },
+
+        /**
+         * "Don't show this again" on the support note.  Saved in settings.json, not
+         * localStorage: the desktop window starts with empty web storage every launch.
+         * Sends only this key, so unsaved edits in the Settings dialog are not saved with it;
+         * an open Settings dialog's snapshot gets it too, so Cancel does not bring the note back.
+         */
+        async hideSupportAsk() {
+            this.config.hide_support_ask = true;
+            if (this.settingsSnapshot) this.settingsSnapshot.hide_support_ask = true;
+            try {
+                await fetch('/api/config', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ hide_support_ask: true })
+                });
+            } catch (error) {
+                console.error('Failed to save support note choice:', error);
+            }
+        },
+
         get currentLocked() {
             return !!this.currentFileId && this.isLocked(this.currentFileId);
         },
@@ -1422,7 +1448,9 @@ function vinylApp() {
          * (possibly stale) hiss_strength is left out.
          */
         configPayload() {
-            const { restoration_level, ...rest } = this.config;
+            // hide_support_ask is saved only by hideSupportAsk(): a Settings save from a config that
+            // failed to load (defaults) must not bring the support note back
+            const { restoration_level, hide_support_ask, ...rest } = this.config;
             if (rest.hiss_reduction && rest.hiss_reduction !== 'off') delete rest.hiss_strength;
             return rest;
         },
