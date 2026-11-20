@@ -402,3 +402,18 @@ def test_a_refused_overwrite_makes_no_description_lookup(tmp_path):
         pipeline.run(session=s, spec=spec_aiff, release_id=99, audio_processor=FakeAudio(),
                      metadata_handler=metadata, on_progress=lambda event: None)
     assert descriptions.lookups == [], "no request to Wikipedia for an export that is refused"
+
+
+def test_an_unwritable_output_folder_makes_no_description_lookup(session, tmp_path):
+    """The folder is created before the lookup, so an export that cannot write never contacts Wikipedia."""
+    from album_description import DescriptionResult
+
+    blocker = tmp_path / "not-a-folder"
+    blocker.write_text("a file where the output folder should be")   # mkdir under a file raises
+    descriptions = FakeDescriptions(DescriptionResult("found", "X", "T", "u"))
+    metadata = DescribingMetadata(FakeRelease(id=99), descriptions)
+    spec = OutputSpec(output_format="flac", output_dir=blocker, replaygain=False, album_description=True)
+    with pytest.raises(OSError):
+        pipeline.run(session=session, spec=spec, release_id=99, audio_processor=FakeAudio(),
+                     metadata_handler=metadata, on_progress=lambda event: None)
+    assert descriptions.lookups == [], "no request to Wikipedia when the output folder cannot be created"

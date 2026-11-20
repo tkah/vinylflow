@@ -119,7 +119,8 @@ async function scenario(name, body) {
     await scenario('a re-analysis (which clears the release) started while a car', async () => {
             const server = fakeServer();
             const app = mkApp();
-            app.analyzeFile = async () => {};
+            // The re-analysis must find tracks: one that finds nothing puts the previous release back
+            app.analyzeFile = async () => { app.setDetectedTracks([{ number: 1, start: 0, end: 200 }]); };
             app.searchResults = [card(1)];
             app.selectedRelease = fullRelease(9);
             const click = app.chooseResult(app.searchResults[0]);
@@ -128,6 +129,22 @@ async function scenario(name, body) {
             server.answer(1);
             await click;
             assert.strictEqual(app.selectedRelease, null, 'the card must not select after the re-analysis cleared the release');
+    });
+
+    // ---- a re-analysis that finds nothing puts the release back; the card must not replace it ----
+    await scenario('a re-analysis that finds nothing while a card loads', async () => {
+            const server = fakeServer();
+            const app = mkApp();
+            app.analyzeFile = async () => {};   // finds nothing
+            app.searchResults = [card(1)];
+            app.selectedRelease = fullRelease(9);
+            app.detectedTracks = [{ number: 1, start: 0, end: 200, duration: 200, editing: false, ignored: false }];
+            const click = app.chooseResult(app.searchResults[0]);
+            await app.reanalyzeFile();
+            assert.strictEqual(app.selectedRelease.id, 9, 'finding nothing restores the release');
+            server.answer(1);
+            await click;
+            assert.strictEqual(app.selectedRelease.id, 9, 'the card must not replace the restored release');
     });
 
     // ---- ...nor replace the release the re-analysis Undo put back ----

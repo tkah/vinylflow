@@ -2057,6 +2057,7 @@ function vinylApp() {
             this.searchSeq++;
             this._pendingPickId = null;
             this.releaseIdLoading = false;
+            this.searchLoading = false;
         },
 
         /** Put a soft-removed file back in its old queue position */
@@ -2154,6 +2155,14 @@ function vinylApp() {
         },
 
         /**
+         * The "no tracks yet" action: with a release selected, retry guided detection for its
+         * sides; without one, detect by silence only (Skip Discogs).
+         */
+        retryOrSkipDetection() {
+            return this.selectedRelease ? this.redetectForTargets() : this.analyzeFile();
+        },
+
+        /**
          * Analyze file for silence detection
          */
         async analyzeFile() {
@@ -2192,6 +2201,7 @@ function vinylApp() {
                 // No tracks, no waveform: initWaveform keeps an existing one, so a retry's tracks
                 // would get no regions.
                 if (this.detectedTracks.length) await this.initWaveform();
+                else this.notify('No tracks were found in this recording. Try another release or adjust the silence settings.', { type: 'warning' });
             } catch (error) {
                 console.error('Analysis failed:', error);
                 this.notifyError('Analysis failed', error);
@@ -2229,6 +2239,12 @@ function vinylApp() {
             this.destroyWaveform();
             await this.analyzeFile();
 
+            if (this.currentFileId === fileId && this.detectedTracks.length === 0 && snapshot.tracks.length > 0) {
+                // Found nothing (analyzeFile already said so, or why it failed). Nobody confirmed the reset, so put
+                // the previous boundaries and release back; there is nothing to undo.
+                await this.restoreReanalyze(fileId, snapshot);
+                return;
+            }
             if (this.currentFileId === fileId && this.detectedTracks.length > 0) {
                 this.notifyUndo('Re-analyzed. Boundaries and release were reset.',
                     () => this.restoreReanalyze(fileId, snapshot), { fileId });
@@ -2527,7 +2543,7 @@ function vinylApp() {
          */
         async chooseResult(result) {
             if (result.opening) return;   // a second click on the card already opening is no new pick
-            if (this.analyzing || this.currentLocked) {
+            if (this.refusePickWhileBusy()) {
                 this._pendingPickId = null;   // refused, but it was the latest click: an older card must not land
                 return;
             }
@@ -2581,7 +2597,9 @@ function vinylApp() {
 
         /** Select the exact release the user named by ID or link, skipping search. */
         async openReleaseById() {
-            if (this.analyzing || this.currentLocked || this.releaseIdLoading) return;
+            if (this.releaseIdLoading) return;
+            // Enter in an empty box is no pick: it gets the hint below, not a "wait" toast
+            if (this.releaseIdInput.trim() && this.refusePickWhileBusy()) return;
             const ref = parseDiscogsRelease(this.releaseIdInput);
             if (!ref) {
                 this.releaseIdNotice = 'Paste a Discogs release link (discogs.com/release/…) or type its number, e.g. 2874426.';
@@ -2614,6 +2632,7 @@ function vinylApp() {
                     this.releaseIdNotice = `Release ${ref.id} has no tracklist on Discogs, so it can't guide the splits.`;
                     return;
                 }
+                if (this.refusePickWhileBusy()) return;   // keep the link in the box to try again
                 this.releaseIdInput = '';
                 this.selectRelease({ ...data, detailStatus: 'loaded' });
             } catch (error) {
@@ -3156,13 +3175,30 @@ function vinylApp() {
         },
 
         /**
+         * True (with a warning toast saying why) while a release pick must be refused: the
+         * recording is exporting or its tracks are being detected.
+         */
+        refusePickWhileBusy() {
+            if (this.currentLocked) {
+                this.notify('This recording is exporting. Pick a release when the export has finished.', { type: 'warning', timeout: 5000 });
+                return true;
+            }
+            if (this.analyzing) {
+                this.notify('Wait for track detection to finish before picking a release.', { type: 'warning', timeout: 5000 });
+                return true;
+            }
+            return false;
+        },
+
+        /**
          * Select a release from search results, resolve which side(s) the
          * recording covers and (re)run detection for that many tracks.
          */
         selectRelease(release) {
+            if (!Array.isArray(release?.tracks)) return;   // nothing to select; leaves a pick still loading alone
             // Latest click wins even when refused: an older card still loading must not land later
             this._pendingPickId = null;
-            if (this.analyzing || this.currentLocked) return;
+            if (this.refusePickWhileBusy()) return;
 
             this.selectedRelease = release;
             this.loadAlbumDescription();
@@ -3357,6 +3393,8 @@ function vinylApp() {
                 if (superseded()) return discardSuperseded();
                 console.error('Guided detection failed:', error);
                 this.rescanNotice = '❌ Boundary detection failed: ' + error.message;
+                // rescanNotice only renders in the track table, which needs tracks
+                this.notifyError('Boundary detection failed', error);
                 this.processingMessage = '';
                 this.clearExpectedMarkers();   // they belonged to the previous sides
             } finally {

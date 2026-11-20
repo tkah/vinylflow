@@ -124,14 +124,15 @@ def run(
         if any(_same_file(path, session.source_audio) for pair in targets for path in pair):
             raise RuntimeError(OVERWRITES_SOURCE)
 
-        # After the overwrite check: a refused export must not contact Wikipedia.
+        album_folder.mkdir(parents=True, exist_ok=True)
+
+        # After the overwrite check and the mkdir: an export that is refused or cannot write must
+        # not contact Wikipedia.
         comment = None
         if spec.album_description:
             comment = _lookup_album_comment(
                 metadata_handler, primary_release_id, primary_master_id, on_progress
             )
-
-        album_folder.mkdir(parents=True, exist_ok=True)
 
         on_progress(
             ProgressEvent(

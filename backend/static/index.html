@@ -786,10 +786,11 @@
                         <h2 class="text-lg font-bold text-primary mb-1" x-text="currentFile?.filename"></h2>
                         <p class="text-secondary text-sm" x-text="formatSize(currentFile?.size) + ' • ' + formatDuration(currentFile?.duration)"></p>
 
-                        <!-- Skip Discogs: silence-only detection (secondary action) -->
+                        <!-- No tracks yet (secondary action): Skip Discogs (silence-only detection), or with a
+                             release selected, retry its guided detection -->
                         <template x-if="!detectedTracks.length && currentFile">
-                            <button @click="analyzeFile()" :disabled="analyzing || currentLocked" class="mt-3 px-3 py-1.5 rounded-lg text-xs text-secondary hover:bg-page" style="background-color: #F0EFEB;" :class="{'opacity-60 cursor-not-allowed': analyzing}">
-                                <span x-show="!analyzing">Skip Discogs — detect tracks by silence only</span>
+                            <button @click="retryOrSkipDetection()" :disabled="analyzing || currentLocked" class="mt-3 px-3 py-1.5 rounded-lg text-xs text-secondary hover:bg-page" style="background-color: #F0EFEB;" :class="{'opacity-60 cursor-not-allowed': analyzing}">
+                                <span x-show="!analyzing" x-text="selectedRelease ? 'Retry track detection' : 'Skip Discogs — detect tracks by silence only'"></span>
                                 <span x-show="analyzing" class="flex items-center gap-2">
                                     <div class="spinner"></div>
                                     Detecting tracks…

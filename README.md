@@ -169,7 +169,7 @@ A full album recorded at 24-bit/96 kHz is about 1.5 GB, and uploading it through
 
 - To use a folder you already have, set `IMPORT_FOLDER=/path/to/your/recordings` in `.env` and run `docker compose up -d` again.
 - The folder is mounted **read-only**: VinylFlow never modifies, moves or deletes your recordings. Removing a file from the queue (or the automatic temp clean-up) only deletes VinylFlow's own preview and analysis files.
-- Subfolders are listed (up to 3 levels). A file that was changed in the last few seconds shows as "Still copying…" until the copy finishes.
+- Subfolders are listed (up to 3 levels). A file that was changed in the last few seconds shows as "Still copying…" until the copy finishes. A file already in the queue can be imported again; it reuses the existing entry, unless the file changed on disk since, which starts a fresh entry in place of the old one. The list marks files "In queue" or "Complete".
 - Desktop app: the import folder is `~/Music/VinylFlow/Incoming`, and **Choose files…** opens any WAV/AIFF on your computer in place.
 
 ## 3. First-Run Setup
@@ -286,7 +286,7 @@ DEFAULT_OUTPUT_DIR=~/Music/VinylFlow
 
 **Notes:**
 - The `output/` and `temp_uploads/` directories are created automatically
-- To import recordings in place instead of uploading them, add `VINYLFLOW_IMPORT_DIR=~/Music/VinylFlow/Incoming` (or any folder) to `.env`
+- To import recordings in place instead of uploading them, add `VINYLFLOW_IMPORT_DIR=~/Music/VinylFlow/Incoming` (or any folder) to `.env`; the import folder can't be changed from the web UI
 - You can adjust silence detection and other settings in `.env` (see [Configuration](#configuration) below)
 - To stop the server, press `Ctrl+C` in the terminal
 
@@ -385,10 +385,12 @@ DEFAULT_FLAC_COMPRESSION=8
 
 **Config Priority**: `config/settings.json` (UI-editable) → `.env` (manual) → environment variables (Docker)
 
+**Album description (off by default)**: Settings (⚙️) → "Add album description from Wikipedia", or `ALBUM_DESCRIPTION=true`. When on, the Comment tag holds the album's English Wikipedia opening paragraph followed by "Digitized from vinyl" on a new line; the Release card previews it before you export. Only the VinylFlow backend makes the requests, to Wikidata and Wikipedia, and the only thing sent about your record is the Discogs master (or release) number of the selected release, used to find the article. If no single article is found, or Wikipedia can't be reached, the comment stays "Digitized from vinyl" and the export still succeeds. With the setting off, nothing is requested.
+
 Saving Settings writes every setting to `config/settings.json`, which then takes precedence over environment variables (for example, an `ALBUM_DESCRIPTION` value from your environment is frozen there after the first save).
 
 **Track Numbering**: Configurable via Settings (⚙️) or by setting `TRACK_NUMBERING` in `config/settings.json`:
-- `sequential_disc_per_lp` *(default)* — writes integer `DISCNUMBER` (A+B = disc 1, C+D = disc 2) and sequential `TRACKNUMBER` across both sides of each LP, with track/disc totals (`TRACKTOTAL`/`DISCTOTAL`, or `n/total` in ID3) and the original vinyl position preserved in a `VINYLPOSITION` tag. Single LPs appear as one disc; 2-LP sets appear as two. When several recordings of one release are exported together, numbering and totals span all of them. The disc comes from the side letter, so a release whose sides skip letters on Discogs (A, B, E, F) counts as 3 discs, and tracks on other media (`CD1`, `DVD1`) keep their position as `TRACKNUMBER` with no disc or totals.
+- `sequential_disc_per_lp` *(default)* — writes integer `DISCNUMBER` (A+B = disc 1, C+D = disc 2) and sequential `TRACKNUMBER` across both sides of each LP, with track/disc totals (`TRACKTOTAL`/`DISCTOTAL`, or `n/total` in ID3) and the original vinyl position preserved in a `VINYLPOSITION` tag. Numbering follows the release's tracklist, so a side exported on its own continues after side A and a skipped track leaves a gap. Single LPs appear as one disc; 2-LP sets appear as two. When several recordings of one release are exported together, numbering and totals span all of them. The disc comes from the side letter, so a release whose sides skip letters on Discogs (A, B, E, F) counts as 3 discs, and tracks on other media (`CD1`, `DVD1`) keep their position as `TRACKNUMBER` with no disc or totals.
 - `vinyl` — writes the vinyl position (e.g. `A1`, `B2`) directly as `TRACKNUMBER`, without totals. Preserves vinyl notation but some players (Jellyfin, Roon) may mis-sort tracks.
 
 ### Silence Detection Tips
@@ -441,7 +443,7 @@ Check if port 8000 is in use: `lsof -i :8000` (Mac/Linux) or `netstat -ano | fin
 Make sure the `output/` directory exists and has write permissions: `chmod -R 755 ./output`
 
 **Discogs search returns no results?**
-Your API token might be invalid or revoked. Click the Settings (⚙️) button and update your token, or generate a new one at [discogs.com/settings/developers](https://www.discogs.com/settings/developers)
+Edit the search box (the file name is only a starting point) and press Enter. If it keeps failing, your API token might be invalid or revoked. Click the Settings (⚙️) button and update your token, or generate a new one at [discogs.com/settings/developers](https://www.discogs.com/settings/developers)
 
 **Tracks not splitting correctly?**
 Pick the Discogs release first: its track lengths place the splits (a release with no lengths still works: its sides are found first and the pauses within them place the cuts), and **Snap to Discogs** re-places them after hand edits. If the pressing is missing a track, use **Custom track…** in that track's Discogs dropdown. Songs that run straight into each other (common on classical records) have no pause to find, so those breaks land only near the right spot. Drag them into place and audition the cut. Without a release, adjust silence detection in Settings (⚙️) or use Smart Rescan with the number of songs.
