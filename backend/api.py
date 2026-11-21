@@ -43,6 +43,7 @@ from audio_processor import (
     SUPPORTED_INPUT_EXTENSIONS,
     OUTPUT_FORMATS,
     ENVELOPE_FRAME_S,
+    parse_channels,
     run_ffmpeg,
     build_export_filters,
     hiss_filter,
@@ -1643,7 +1644,6 @@ def _rt_render(source: Path, start: float, end: float, chain: Optional[str], out
     return False
 
 
-_CHANNELS_RE = re.compile(r"Audio:.*?\d+ Hz, (mono|stereo|\d+ channels)")
 _MAX_VOL_RE = re.compile(r"max_volume:\s*(-?inf|-?\d+(?:\.\d+)?)\s*dB")
 
 
@@ -1651,8 +1651,8 @@ def _rt_channels(source: Path) -> int:
     """1 for a mono source, else 2 (anything else is rendered as stereo)."""
     try:
         res = run_ffmpeg(["-hide_banner", "-i", str(source)], capture_output=True, timeout=60)
-        m = _CHANNELS_RE.search(res.stderr or "")
-        return 1 if m and m.group(1) == "mono" else 2
+        # parse_channels: ffmpeg 7 says "mono", ffmpeg 6.1 "1 channels" for the same file
+        return 1 if parse_channels(res.stderr) == 1 else 2
     except Exception:
         return 2
 

@@ -13,14 +13,13 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from audio_processor import run_ffmpeg
+from audio_processor import parse_channels, run_ffmpeg
 from track_boundaries import MUSIC_FLOOR_DB, gaps_from_envelope
 
 # Bump when the algorithm changes so cached results are discarded.
@@ -97,15 +96,12 @@ def silent_ranges(
     return sorted(out)
 
 
-_CHANNELS_RE = re.compile(r"Audio:.*?\d+ Hz, (mono|stereo|\d+ channels)")
-
-
 def source_channels(source) -> int:
     """1 for a mono source, else 2 (anything wider is analysed as stereo)."""
     try:
         res = run_ffmpeg(["-hide_banner", "-i", str(source)], capture_output=True, timeout=60)
-        m = _CHANNELS_RE.search(res.stderr or "")
-        return 1 if m and m.group(1) == "mono" else 2
+        # parse_channels: ffmpeg 7 says "mono", ffmpeg 6.1 "1 channels" for the same file
+        return 1 if parse_channels(res.stderr) == 1 else 2
     except Exception:
         return 2
 
