@@ -17,7 +17,7 @@ assert.strictEqual(a0.parseLengthInput(' 3:45.5 '), 225.5);
 assert.strictEqual(a0.parseLengthInput('1:02:03'), 3723);
 assert.strictEqual(a0.parseLengthInput('245'), 245);
 assert.strictEqual(a0.parseLengthInput('12.5'), 12.5);
-for (const bad of ['', 'abc', '3:75', '3:', ':45', '1:2:3:4']) assert.strictEqual(a0.parseLengthInput(bad), null, bad);
+for (const bad of ['', 'abc', '3:75', '3:', ':45', '1:2:3:4', '1:75:00']) assert.strictEqual(a0.parseLengthInput(bad), null, bad);
 
 // Contiguous cuts (the usual case): shortening track 1 moves track 2's start with it
 let a = app([trk(1, 10, 300), trk(2, 300, 600), trk(3, 600, 900)]);
@@ -34,11 +34,19 @@ a = app([trk(1, 10, 300), trk(2, 304, 600)]);
 a.setTrackLength(0, '4:00');
 assert.deepStrictEqual([a.detectedTracks[0].end, a.detectedTracks[1].start], [250, 304]);
 
-// Too long for the space before the next track's end: limited, and the user is told
-a = app([trk(1, 10, 300), trk(2, 300, 600)]);
-a.setTrackLength(0, '20:00');
-assert.ok(a.detectedTracks[0].end <= 600 - 1 + 1e-6 && a.detectedTracks[1].start === a.detectedTracks[0].end);
-assert.match(a.toasts.at(-1).m, /can only be/);
+// Too long for the space before the next track's end ("10:00" meant "1:00"): refused, not clamped; the next
+// track must not shrink to a second.  (This used to assert the clamp: the typo collapsed track 2.)
+a = app([trk(1, 10, 100), trk(2, 100, 200)]);
+let lengthInput = { value: '10:00' };
+assert.strictEqual(a.setTrackLength(0, '10:00', lengthInput), false);
+assert.deepStrictEqual(a.detectedTracks.map(t => [t.start, t.end]), [[10, 100], [100, 200]]);
+assert.strictEqual(a.boundariesEdited, false);
+assert.strictEqual(a.toasts.at(-1).type, 'warning'); assert.match(a.toasts.at(-1).m, /track 2/i);
+assert.strictEqual(lengthInput.value, '1:30', 'the field shows the current length');
+// ... but a length that still leaves the next track a second or more is fine
+a = app([trk(1, 10, 100), trk(2, 100, 200)]);
+assert.ok(a.setTrackLength(0, '3:00'));
+assert.deepStrictEqual([a.detectedTracks[0].end, a.detectedTracks[1].start], [190, 190]);
 
 // The last track grows up to the end of the recording, never past it
 a = app([trk(1, 10, 300)]); a.playDuration = 340;

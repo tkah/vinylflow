@@ -75,7 +75,8 @@ def recording(tmp_path, monkeypatch):
 
 
 def use_decode(monkeypatch, decode):
-    monkeypatch.setattr(api.audio_processor, "compute_envelope", decode)
+    monkeypatch.setattr(api.audio_processor, "compute_envelope_and_peaks",
+                        lambda path: (decode(path), {"peaks": [0.0], "length": 1, "duration": 0.01}))
     return decode
 
 

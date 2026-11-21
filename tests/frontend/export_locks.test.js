@@ -253,12 +253,16 @@ test('a decode error on the original WAV reloads the preview exactly once, keepi
     assert.strictEqual(wave.loads.length, 2, 'never loops');
     assert.match(instance.playerNotice, /Audio playback error: preview failed too/);
 });
-test('a WaveSurfer error on the precise URL also falls back; unrelated media errors do not', async () => {
+test('only a decode/unsupported media error falls back; a bare WaveSurfer error does not', async () => {
+    // Changed from "a WaveSurfer error on the precise URL also falls back": the vendored WaveSurfer
+    // re-emits EVERY media error (network, aborted, ...) as emit('error', undefined), so that event alone
+    // is no evidence of a format problem. Only the media element's own code 3/4 is (PR 23 review).
     const { instance, wave } = await startWaveform();
-    wave.media.error = { code: 2 }; wave.media.listeners.error(); await tick();
+    wave.media.error = { code: 2 }; wave.handlers.error(undefined); wave.media.listeners.error(); await tick();
     assert.strictEqual(wave.loads.length, 1, 'network errors are not a format problem');
-    wave.handlers.error(new Error('decode')); await tick();
-    assert.strictEqual(wave.loads.length, 2);
+    assert.match(instance.playerNotice, /Audio playback error: .*network/);
+    wave.media.error = { code: 3 }; wave.handlers.error(undefined); wave.media.listeners.error(); await tick();
+    assert.strictEqual(wave.loads.length, 2, 'WaveSurfer re-emit first, then our media listener: one reload');
 });
 test('an error on the preview URL keeps the normal error notice and does not reload', async () => {
     const { instance, wave } = await startWaveform({ canPlay: '' });

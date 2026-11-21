@@ -576,8 +576,39 @@ _envelope_tasks: dict = {}
 _envelope_errors: dict = {}  # file_id -> message of the last failed scan (cleared on success)
 
 
+def _write_cache_atomically(cache_path: Path, write) -> None:
+    """Write a session cache via a temp file + atomic rename so a reader never
+    sees a half-written file.  Best-effort: the session dir may have been
+    removed while we were decoding."""
+    part_path = cache_path.with_name(f"{cache_path.stem}.{uuid.uuid4().hex[:8]}.part")
+    try:
+        with open(part_path, "wb") as f:
+            write(f)
+        os.replace(part_path, cache_path)
+    except OSError:
+        part_path.unlink(missing_ok=True)
+
+
+def _decode_and_cache(file_id: str, file_path: Path):
+    """Blocking: the one decode per recording.  Writes envelope.npy and
+    peaks_v2.json together and returns ``(envelope, peaks)``.  Two racing
+    callers write identical deterministic content, so the atomic renames
+    make that harmless."""
+    import numpy as np
+
+    db, peaks = audio_processor.compute_envelope_and_peaks(file_path)
+    if not get_session_path(file_id).is_dir():
+        return db, peaks   # the recording was removed while it decoded: leave its dir gone
+    _write_cache_atomically(get_session_path(file_id, "envelope.npy"), lambda f: np.save(f, db))
+    _write_cache_atomically(
+        get_session_path(file_id, "peaks_v2.json"), lambda f: f.write(json.dumps(peaks).encode("utf-8"))
+    )
+    return db, peaks
+
+
 def _load_or_compute_envelope(file_id: str, file_path: Path):
-    """Blocking: load envelope.npy if cached, else decode and cache it."""
+    """Blocking: load envelope.npy if cached, else decode and cache it
+    (together with the waveform peaks, from the same decode)."""
     import numpy as np
 
     cache_path = get_session_path(file_id, "envelope.npy")
@@ -587,19 +618,7 @@ def _load_or_compute_envelope(file_id: str, file_path: Path):
         except Exception:
             cache_path.unlink(missing_ok=True)  # corrupt cache: recompute
 
-    db = audio_processor.compute_envelope(file_path)
-
-    # Write via a temp file + atomic rename so a reader never sees a
-    # half-written cache.  Caching is best-effort (the session dir may have
-    # been removed while we were decoding).
-    part_path = get_session_path(file_id, f"envelope.{uuid.uuid4().hex[:8]}.part")
-    try:
-        with open(part_path, "wb") as f:
-            np.save(f, db)
-        os.replace(part_path, cache_path)
-    except OSError:
-        part_path.unlink(missing_ok=True)
-    return db
+    return _decode_and_cache(file_id, file_path)[0]
 
 
 async def _run_envelope(file_id: str, file_path: Path):
@@ -1890,9 +1909,18 @@ async def get_restoration_test_audio(file_id: str, name: str):
     return FileResponse(path, media_type="audio/flac")
 
 
+def _cached_peaks_response(cache_path: Path):
+    """Stream the cached peaks file as is: at 10 ms per bin it is ~13 MB for a 4 h album, and
+    parsing then re-serialising that would block the event loop.  The file is replaced
+    atomically, so a reader never sees a partial one."""
+    from fastapi.responses import FileResponse
+
+    return FileResponse(cache_path, media_type="application/json")
+
+
 @app.get("/api/waveform-peaks/{file_id}")
 async def get_waveform_peaks(file_id: str):
-    """Generate waveform peaks for visualization."""
+    """Equal-width waveform peaks (<= 10 ms per bin) for visualization."""
 
     session = session_store.get(file_id)
     if session is None:
@@ -1901,22 +1929,27 @@ async def get_waveform_peaks(file_id: str):
 
     file_path = session.source_audio
 
-    # Old peaks.json has only 3,000 bins per recording, losing sub-second
-    # timing on albums. Existing sessions must regenerate the detailed waveform.
+    # peaks_v2.json replaces the old peaks.json (3,000 bins per recording, which
+    # lost sub-second timing on albums); an old cache is simply ignored.
     peaks_cache_path = get_session_path(file_id, "peaks_v2.json")
     if peaks_cache_path.exists():
-        with open(peaks_cache_path, "r") as f:
-            cached_data = json.load(f)
-            return JSONResponse(content=cached_data)
+        return _cached_peaks_response(peaks_cache_path)
 
     try:
-        response_data = await asyncio.to_thread(audio_processor.compute_waveform_peaks, file_path)
-
-        with open(peaks_cache_path, "w") as f:
-            json.dump(response_data, f)
+        # Prep's decode writes the peaks too: wait for it (or its cache) rather than
+        # starting a second decode.  Decoding here is only the rare leftover: the envelope
+        # was cached (or loaded) but its peaks write failed.  Sessions live in memory, so
+        # no older on-disk session lacks peaks; concurrent requests in that case each decode,
+        # and a recording removed during it still gets this reply (nothing is written).
+        await get_envelope(session)
+        if peaks_cache_path.exists():
+            return _cached_peaks_response(peaks_cache_path)
+        _, response_data = await asyncio.to_thread(_decode_and_cache, file_id, file_path)
 
         return JSONResponse(content=response_data)
 
+    except HTTPException:
+        raise   # 404: the recording was removed while waiting for its decode
     except CalledProcessError as e:
         stderr = e.stderr.decode("utf-8", errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
         raise HTTPException(status_code=500, detail=f"FFmpeg failed: {stderr}")
