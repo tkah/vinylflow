@@ -8,7 +8,7 @@ from collections import OrderedDict
 import pytest
 from fastapi.testclient import TestClient
 
-from metadata_handler import MetadataHandler
+from metadata_handler import MetadataHandler, ReleaseNotFound
 
 
 class _Obj:
@@ -103,6 +103,7 @@ def make(client):
     h._release_cache_lock = threading.Lock()
     h._donor_cache = {}
     h._donor_cache_lock = threading.Lock()
+    h._donor_inflight = {}
     h.rate_calls = 0
     real = h._rate_limit
 
@@ -145,8 +146,9 @@ def test_basic_donor_skips_self_and_formats_result():
             "country": "US",
             "format": "Vinyl, LP",
             "matched": 3,
-            "total": 3,
+            "missing": 3,
             "lengths": {"0": "3:00", "1": "4:00", "2": "5:00"},
+            "positions": {"0": "A1", "1": "A2", "2": "A3"},
         }
     ]
 
@@ -202,11 +204,114 @@ def test_donors_without_lengths_are_dropped():
     assert make(c).find_length_donors(1) == []
 
 
-def test_unknown_release_raises_lookup_error():
+class FakeHTTPError(Exception):
+    """Like discogs_client's HTTPError: carries the response status."""
+
+    def __init__(self, status_code):
+        super().__init__(f"{status_code} error")
+        self.status_code = status_code
+
+
+def test_missing_release_raises_release_not_found():
+    h = make(FakeClient({}, []))
+    h.client.release = lambda rid: (_ for _ in ()).throw(FakeHTTPError(404))
+    with pytest.raises(ReleaseNotFound):
+        h.find_length_donors(5)
+
+
+def test_discogs_error_on_target_is_not_reported_as_not_found():
+    # Changed from "any failure -> LookupError": a Discogs outage must not read as "no such release".
     h = make(FakeClient({}, []))
     h.client.release = lambda rid: (_ for _ in ()).throw(RuntimeError("boom"))
-    with pytest.raises(LookupError):
+    with pytest.raises(Exception) as caught:
         h.find_length_donors(5)
+    assert not isinstance(caught.value, ReleaseNotFound)
+
+
+def failing_client(client, failing_ids):
+    """Make `client.release` fail (like a network error) for the given ids."""
+    real = client.release
+
+    def release(rid):
+        if rid in failing_ids:
+            client.release_calls.append(rid)
+            raise ConnectionError("discogs down")
+        return real(rid)
+
+    client.release = release
+    return client
+
+
+def test_failed_donor_fetch_is_not_cached_as_no_donors():
+    c = failing_client(scenario([ver(2), ver(3)], {2: raw_release(2, FULL), 3: raw_release(3, FULL)}), {2})
+    h = make(c)
+    first = h.find_length_donors(1)
+    assert [d["release_id"] for d in first] == [3]
+    assert h._donor_cache == {}  # incomplete lookup: nothing remembered
+    c.release = FakeClient(c.releases, c.versions).release  # Discogs is back
+    h.find_length_donors(1, want=10)
+    assert 2 in c.release_calls and c.release_calls.count(2) == 1
+    assert {d["release_id"] for d in h._donor_cache[1]} == {2, 3}
+
+
+def test_all_donor_fetches_failing_raises_and_caches_nothing():
+    c = failing_client(scenario([ver(2), ver(3)], {}), {2, 3})
+    h = make(c)
+    with pytest.raises(Exception) as caught:
+        h.find_length_donors(1)
+    assert not isinstance(caught.value, ReleaseNotFound)
+    assert h._donor_cache == {}
+
+
+def test_concurrent_lookups_for_one_release_share_one_run():
+    gate = threading.Event()
+    c = scenario([ver(2)], {2: raw_release(2, FULL)})
+    real_master = c.master
+
+    def slow_master(mid):
+        gate.wait(5)
+        return real_master(mid)
+
+    c.master = slow_master
+    h = make(c)
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(h.find_length_donors(1))) for _ in range(2)]
+    threads[0].start()
+    import time
+    time.sleep(0.2)  # the first caller is now inside the version listing
+    threads[1].start()
+    time.sleep(0.2)
+    gate.set()
+    for t in threads:
+        t.join(5)
+    assert len(results) == 2 and results[0] == results[1] != []
+    assert c.log.count("versions.pages") == 1
+    assert c.release_calls.count(2) == 1
+
+
+def test_second_caller_runs_its_own_lookup_when_the_first_failed():
+    c = failing_client(scenario([ver(2)], {2: raw_release(2, FULL)}), {2})
+    h = make(c)
+    with pytest.raises(Exception):
+        h.find_length_donors(1)
+    assert h._donor_inflight == {}  # the guard is released on failure
+    c.release = FakeClient(c.releases, c.versions).release
+    assert [d["release_id"] for d in h.find_length_donors(1)] == [2]
+
+
+def test_donor_that_fills_nothing_is_dropped_and_ranking_counts_fills():
+    # Release 1 already knows One's length; only Two and Three are missing.
+    releases = {1: raw_release(1, [("One", "3:00"), ("Two", ""), ("Three", "")], master_id=77)}
+    only_known = [("One", "3:10"), ("Two", ""), ("Three", "")]  # fills nothing
+    one_fill = [("One", "3:10"), ("Two", "4:00"), ("Three", "")]
+    two_fills = [("One", "3:10"), ("Two", "4:00"), ("Three", "5:00")]
+    releases.update({2: raw_release(2, only_known), 3: raw_release(3, one_fill), 4: raw_release(4, two_fills)})
+    c = FakeClient(releases, [ver(1), ver(2), ver(3), ver(4)])
+    out = make(c).find_length_donors(1, want=10)
+    assert [d["release_id"] for d in out] == [4, 3]
+    assert out[0]["lengths"] == {"1": "4:00", "2": "5:00"}  # no length for the track that already has one
+    assert (out[0]["matched"], out[0]["missing"]) == (2, 2)
+    assert (out[1]["matched"], out[1]["missing"]) == (1, 2)
 
 
 # --- endpoint -------------------------------------------------------------
@@ -222,7 +327,7 @@ def test_endpoint_returns_donors_and_broadcasts_progress(monkeypatch):
     class H:
         def find_length_donors(self, rid, on_progress=None, **kw):
             on_progress(2, 12, 1)
-            return [{"release_id": 9, "matched": 1, "total": 2, "lengths": {"0": "1:00"}}]
+            return [{"release_id": 9, "matched": 1, "missing": 2, "lengths": {"0": "1:00"}}]
 
     monkeypatch.setattr(api, "metadata_handler", H())
     monkeypatch.setattr(api, "broadcast_message", fake_broadcast)
@@ -248,12 +353,45 @@ def test_endpoint_discogs_error_is_clean_502(monkeypatch):
 
 
 def test_endpoint_unknown_release_404(monkeypatch):
+    # Changed from LookupError: only the dedicated ReleaseNotFound means 404.
     from backend import api
 
     class H:
         def find_length_donors(self, *a, **kw):
-            raise LookupError("Release not found or Discogs unavailable")
+            raise ReleaseNotFound("Release not found")
 
     monkeypatch.setattr(api, "metadata_handler", H())
     with TestClient(api.app) as client:
         assert client.get("/api/release/5/length-donors").status_code == 404
+
+
+@pytest.mark.parametrize("error", [KeyError("tracklist"), IndexError("x"), LookupError("odd")])
+def test_endpoint_malformed_payload_is_502_not_404(monkeypatch, error):
+    from backend import api
+
+    class H:
+        def find_length_donors(self, *a, **kw):
+            raise error
+
+    monkeypatch.setattr(api, "metadata_handler", H())
+    with TestClient(api.app) as client:
+        r = client.get("/api/release/5/length-donors")
+    assert r.status_code == 502
+    assert "tracklist" not in r.json()["detail"]
+
+
+def test_release_with_every_length_makes_no_master_or_version_calls():
+    # Nothing to fill: the lookup must not spend a single master/version request.
+    c = FakeClient({1: raw_release(1, FULL, master_id=77)}, [ver(1), ver(2)])
+    h = make(c)
+    assert h.find_length_donors(1) == []
+    assert c.log == [] and c.release_calls == [1]
+
+
+def test_donor_reports_the_discogs_position_of_every_track_it_fills():
+    # The client maps lengths by position: its tracklist may be split or carry custom tracks,
+    # so the server's track indexes alone would put a length on the wrong track.
+    c = scenario([ver(2)], {2: raw_release(2, [("One", "3:00"), ("Two", ""), ("Three", "5:00")])})
+    out = make(c).find_length_donors(1)
+    assert out[0]["lengths"] == {"0": "3:00", "2": "5:00"}
+    assert out[0]["positions"] == {"0": "A1", "2": "A3"}

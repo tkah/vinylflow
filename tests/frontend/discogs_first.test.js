@@ -497,7 +497,7 @@ const fullRelease = (id, tracks = [track('A1', '5:00'), track('A2', '6:00')]) =>
     // 'result', 'preset' and 'g' are x-for loop variables
     const keywords = new Set(['true', 'false', 'null', 'undefined', 'Math', 'result', 'preset', 'g', 'event', '$event', 'this', 'x',
         // Fork: more x-for loop variables (and the Number global) in the fork's release card markup
-        'sc', 'entry', 'option', 'start', 'boundary', 'row', 'rowIndex', 'd', 'Number']);
+        'sc', 'entry', 'option', 'start', 'boundary', 'row', 'rowIndex', 'd', 'donor', 'source', 'sourceIndex', 'Number']);
     const fresh = vinylApp();
     const unknown = new Set();
     for (const expression of expressions) {

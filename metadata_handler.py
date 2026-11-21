@@ -89,6 +89,10 @@ class TagSet:
     performers: Tuple[Tuple[str, str], ...] = ()  # (name, instrument)
 
 
+class ReleaseNotFound(Exception):
+    """Discogs answered that the release does not exist (HTTP 404)."""
+
+
 class DiscogsTrack:
     """Represents a track from Discogs release."""
 
@@ -190,7 +194,8 @@ class DiscogsRelease:
         # on any key the payload lacks, one more Discogs request. Plain fakes set attributes.
         payload = getattr(release, "data", None)
         if not isinstance(payload, dict):
-            payload = {"genres": getattr(release, "genres", None), "extraartists": getattr(release, "credits", None)}
+            payload = {"genres": getattr(release, "genres", None), "extraartists": getattr(release, "credits", None),
+                       "images": getattr(release, "images", None)}
         self.genres = list(payload.get("genres") or [])
         self.credits = parse_credits(payload.get("extraartists"))
 
@@ -203,7 +208,8 @@ class DiscogsRelease:
         self.format = formats[0]["name"] if formats else ""
 
         # Get images
-        self.images = getattr(release, "images", [])
+        # (raw payload as well: a missing key would make discogs_client refetch the release)
+        self.images = payload.get("images") or []
         self.cover_url = self.images[0]["uri"] if self.images else None
 
         # Parse tracklist
@@ -495,6 +501,7 @@ class MetadataHandler:
         self._release_cache_lock = threading.Lock()
         self._donor_cache: dict = {}
         self._donor_cache_lock = threading.Lock()
+        self._donor_inflight: dict = {}  # release id -> Event set when its running lookup ends
         # Independent of the Discogs token, so ``reinitialize`` leaves it (and its cache) alone.
         self.album_descriptions = AlbumDescriptions()
 
@@ -631,6 +638,15 @@ class MetadataHandler:
         Returns:
             DiscogsRelease or None
         """
+        try:
+            return self._load_release(release_id)
+        except Exception as e:
+            print(f"Failed to fetch release {release_id}: {e}")
+            return None
+
+    def _load_release(self, release_id: int) -> DiscogsRelease:
+        """``get_release_by_id`` that lets the Discogs error through (so a 404 can be told
+        from an outage); same bounded cache."""
         key = int(release_id)
         with self._release_cache_lock:
             cached = self._release_cache.get(key)
@@ -638,12 +654,8 @@ class MetadataHandler:
                 self._release_cache.move_to_end(key)
                 return cached
 
-        try:
-            self._rate_limit()
-            release = DiscogsRelease(self.client.release(key))
-        except Exception as e:
-            print(f"Failed to fetch release {release_id}: {e}")
-            return None
+        self._rate_limit()
+        release = DiscogsRelease(self.client.release(key))
 
         with self._release_cache_lock:
             self._release_cache[key] = release
@@ -694,23 +706,46 @@ class MetadataHandler:
         release id.  ``on_progress(checked, budget, found)`` is called from the
         calling thread.
 
-        Returns dicts: release_id, label, year, country, format, matched,
-        total, lengths ({"<target index>": "m:ss"}), best coverage first.
-        A donor is kept when at least one matched track has a length.
-        Raises on Discogs errors while listing versions.
+        Returns dicts: release_id, label, year, country, format, matched (lengths
+        it can supply), missing (tracks of this release without a length),
+        lengths ({"<target index>": "m:ss"}, only for tracks missing one), positions
+        ({"<target index>": Discogs position}, same keys), most
+        fills first.  A donor that fills nothing is dropped.  Raises
+        ``ReleaseNotFound`` for a 404 on the release itself, and other
+        exceptions on Discogs errors (listing versions, or every donor fetch
+        failing).  A lookup in which some fetch failed is not cached.
         """
         key = int(release_id)
-        with self._donor_cache_lock:
-            cached = self._donor_cache.get(key)
-        if cached is not None:
-            return [dict(d) for d in cached]
+        while True:
+            with self._donor_cache_lock:
+                cached = self._donor_cache.get(key)
+                if cached is not None:
+                    return [dict(d) for d in cached]
+                running = self._donor_inflight.get(key)
+                if running is None:
+                    self._donor_inflight[key] = threading.Event()
+                    break
+            # Another thread is already looking up this release: wait, then read its cached result
+            # (or, if it failed and cached nothing, run our own lookup on the next pass).
+            running.wait()
+        try:
+            return self._find_length_donors_uncached(key, max_fetches, want, on_progress)
+        finally:
+            with self._donor_cache_lock:
+                self._donor_inflight.pop(key).set()
 
-        release = self.get_release_by_id(key)
-        if release is None:
-            raise LookupError("Release not found or Discogs unavailable")
+    def _find_length_donors_uncached(self, key, max_fetches, want, on_progress) -> List[dict]:
+        try:
+            release = self._load_release(key)
+        except Exception as e:
+            if getattr(e, "status_code", None) == 404:
+                raise ReleaseNotFound(f"Release {key} not found") from e
+            raise
+        # Only tracks without a usable length can be filled; the rest keep their own.
+        missing = [i for i, t in enumerate(release.tracks) if not t.duration_seconds]
         total = len(release.tracks)
         master_id = getattr(release, "master_id", None)
-        if not master_id or total == 0:
+        if not master_id or total == 0 or not missing:
             with self._donor_cache_lock:
                 self._donor_cache[key] = []
             return []
@@ -743,8 +778,10 @@ class MetadataHandler:
         candidates.sort(key=lambda v: (not same_format(v), year_gap(v)))
 
         targets = [t.title for t in release.tracks]
+        missing_set = set(missing)
         donors = []
         fetches = 0
+        failed_fetches = 0
         for v in candidates:
             vid = int(v["id"])
             with self._release_cache_lock:
@@ -757,9 +794,13 @@ class MetadataHandler:
             if not is_cached:
                 notify(fetches, len(donors))
             if donor is None:
+                failed_fetches += 1
                 continue
             matches = match_tracklists(targets, donor.tracks)
-            lengths = {str(m.target_index): m.length for m in matches if m.length}
+            lengths = {
+                str(m.target_index): m.length
+                for m in matches if m.length and m.target_index in missing_set
+            }
             if not lengths:
                 continue
             donors.append(
@@ -771,22 +812,31 @@ class MetadataHandler:
                     "country": v.get("country") or "",
                     "format": v.get("format") or donor.format or "",
                     "matched": len(lengths),
-                    "total": total,
+                    "missing": len(missing),
                     "lengths": lengths,
+                    # Discogs position of each filled track: the client's tracklist may differ in shape
+                    # (split parts, custom tracks), so it maps by position, not by index
+                    "positions": {key: release.tracks[int(key)].position for key in lengths},
                     "_same": same_format(v),
                     "_gap": year_gap(v),
                 }
             )
-            if sum(1 for d in donors if d["matched"] == total) >= want:
+            if sum(1 for d in donors if d["matched"] == len(missing)) >= want:
                 break
             if not is_cached:
                 notify(fetches, len(donors))
 
+        if fetches and failed_fetches == fetches and not donors:
+            # Every Discogs fetch failed: that is an outage, not "no pressing has the lengths"
+            raise RuntimeError("Discogs could not be reached for any other pressing")
+
         donors.sort(key=lambda d: (-d["matched"], not d["_same"], d["_gap"]))
         result = [{k: v for k, v in d.items() if not k.startswith("_")} for d in donors]
         notify(fetches, len(result))
-        with self._donor_cache_lock:
-            self._donor_cache[key] = result
+        if not failed_fetches:
+            # An incomplete lookup (a fetch failed) is not remembered: a retry may find more
+            with self._donor_cache_lock:
+                self._donor_cache[key] = result
         return [dict(d) for d in result]
 
     def download_cover_art(self, url: str, output_path: Path, max_size=1400) -> bool:

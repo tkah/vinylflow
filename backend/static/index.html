@@ -1024,9 +1024,12 @@
                         <a x-show="selectedRelease?.id" :href="selectedRelease ? `https://www.discogs.com/release/${selectedRelease.id}` : '#'"
                            target="_blank" rel="noopener noreferrer" data-testid="release-discogs-link"
                            class="mt-1 inline-block text-sm underline hover:no-underline" style="color: #8A5F00;">View on Discogs ↗</a>
-                        <p x-show="lengthsBorrowedFrom" x-cloak class="mt-1 text-xs text-muted">
-                            Lengths borrowed from <span x-text="borrowedLabel(lengthsBorrowedFrom)"></span>
-                            (<a :href="lengthsBorrowedFrom ? `https://www.discogs.com/release/${lengthsBorrowedFrom.release_id}` : '#'" target="_blank" rel="noopener" class="underline">view on Discogs</a>)
+                        <p x-show="lengthsBorrowedFrom.length > 0" x-cloak class="mt-1 text-xs text-muted" data-testid="lengths-borrowed">
+                            Lengths borrowed from
+                            <template x-for="(source, sourceIndex) in lengthsBorrowedFrom" :key="sourceIndex">
+                                <span><span x-text="sourceIndex > 0 ? ' and ' : ''"></span><span x-text="borrowedLabel(source)"></span>
+                                (<a :href="`https://www.discogs.com/release/${source.release_id}`" target="_blank" rel="noopener" class="underline">view on Discogs</a>)</span>
+                            </template>
                         </p>
                         <p x-show="movementsLine" x-cloak class="mt-1 text-xs text-muted" data-testid="movements-line">
                             <span x-text="movementsLine"></span>
@@ -1149,28 +1152,29 @@
                 </div>
 
                 <!-- Borrow track lengths from another pressing -->
-                <div x-show="showBorrowLengths" x-cloak class="mb-4 p-4 bg-page rounded-lg">
+                <div id="borrow-lengths" x-show="showBorrowLengths" x-cloak class="mb-4 p-4 bg-page rounded-lg">
                     <div class="flex flex-wrap items-center justify-between gap-2">
                         <p class="text-sm text-secondary" x-text="borrowLengthsMessage"></p>
-                        <button type="button" @click="findLengthDonors()" :disabled="donors.status === 'searching' || analyzing"
-                                class="px-4 py-2 rounded-lg border-2 text-sm hover:bg-card"
+                        <button type="button" @click="findLengthDonors()" :disabled="donors.status === 'searching' || analyzing || currentLocked"
+                                class="px-4 py-2 rounded-lg border-2 text-sm hover:bg-card focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-1 focus-visible:ring-[#1E1E1E]"
                                 style="border-color: #E5A100; color: #3D3D3D;"
-                                :class="{'opacity-60 cursor-not-allowed': donors.status === 'searching' || analyzing}">Find lengths from other pressings</button>
+                                :class="{'opacity-60 cursor-not-allowed': donors.status === 'searching' || analyzing || currentLocked}">Find lengths from other pressings</button>
                     </div>
                     <p x-show="donors.status === 'searching'" x-cloak class="mt-2 text-sm text-secondary flex items-center gap-2" role="status">
                         <span class="spinner"></span> <span x-text="donorProgressText"></span>
                     </p>
                     <p x-show="donors.status === 'error'" x-cloak class="mt-2 text-sm" style="color: #B3261E;" role="alert" x-text="donors.error"></p>
-                    <p x-show="donors.status === 'done' && donors.list.length === 0" x-cloak class="mt-2 text-sm text-muted">No other pressing with matching track lengths found</p>
-                    <div x-show="donors.status === 'done' && donors.list.length > 0" x-cloak class="mt-2 space-y-2">
-                        <template x-for="d in donors.list" :key="d.release_id">
+                    <p x-show="donors.status === 'done' && visibleDonors.length === 0" x-cloak class="mt-2 text-sm text-secondary" role="status">No other pressing with matching track lengths found.</p>
+                    <div x-show="donors.status === 'done' && visibleDonors.length > 0" x-cloak class="mt-2 space-y-2">
+                        <template x-for="donor in visibleDonors" :key="donor.release_id">
                             <div class="flex flex-wrap items-center justify-between gap-2 p-2 rounded-lg bg-card">
                                 <div class="text-sm">
-                                    <span x-text="donorTitle(d)"></span>
-                                    <span class="ml-2 text-xs text-muted" x-text="`${d.matched}/${d.total} matched`"></span>
+                                    <span x-text="donorTitle(donor)"></span>
+                                    <span class="ml-2 text-xs text-muted" x-text="donorFillText(donor)"></span>
                                 </div>
-                                <button type="button" @click="applyDonor(d)" :disabled="analyzing || currentLocked"
-                                        class="px-3 py-1.5 btn-primary rounded-lg text-sm" :class="{'opacity-60 cursor-not-allowed': analyzing}">Use these lengths</button>
+                                <button type="button" @click="applyDonor(donor)" :disabled="analyzing || currentLocked"
+                                        class="px-3 py-1.5 btn-primary rounded-lg text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-1 focus-visible:ring-[#1E1E1E]"
+                                        :class="{'opacity-60 cursor-not-allowed': analyzing || currentLocked}">Use these lengths</button>
                             </div>
                         </template>
                     </div>
