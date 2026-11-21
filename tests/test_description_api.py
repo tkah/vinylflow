@@ -121,3 +121,24 @@ def test_real_discogs_release_searches_wikidata_by_its_master_id(monkeypatch):
     api.metadata_handler.album_descriptions = AlbumDescriptions(http_get=fake_http_get)
     assert client.get("/api/release/42/description").json()["status"] == "none"
     assert calls[0]["srsearch"] == "haswbstatement:P1954=7"
+
+
+def test_release_without_images_key_does_not_refetch_from_discogs():
+    """discogs_client refreshes a Release (one more, unthrottled request) when an attribute's key is
+    missing from its payload; ``images`` must come from the raw payload dict instead."""
+    import json
+    from pathlib import Path
+
+    import discogs_client
+    from metadata_handler import DiscogsRelease
+
+    data = json.loads((Path(__file__).parent / "fixtures" / "discogs_release_848848.json").read_text())
+    data.pop("images", None)
+    raw = discogs_client.Release(discogs_client.Client("VinylFlow-tests"), data)
+    refreshes = []
+    raw.refresh = lambda *_: refreshes.append(1)
+
+    release = DiscogsRelease(raw)
+
+    assert refreshes == []
+    assert release.images == [] and release.cover_url is None

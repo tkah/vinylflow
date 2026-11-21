@@ -69,7 +69,7 @@ from track_boundaries import (
     music_span,
     smooth_envelope,
 )
-from metadata_handler import MetadataHandler
+from metadata_handler import MetadataHandler, ReleaseNotFound
 from backend.sessions import (
     OutputSpec,
     TitleSourceSpec,
@@ -2063,7 +2063,7 @@ async def get_length_donors(release_id: int):
         donors = await asyncio.to_thread(
             metadata_handler.find_length_donors, release_id, on_progress=on_progress
         )
-    except LookupError as e:
+    except ReleaseNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.warning("length-donors lookup failed for %s: %s", release_id, e)
