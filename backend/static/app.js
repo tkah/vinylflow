@@ -19,8 +19,10 @@ const IGNORED_TRACK_COLOR = 'rgba(120, 120, 120, 0.15)';
 const MIN_TRACK_LENGTH = 1;
 // Dashed ghost markers on the waveform: where the Discogs lengths expect each break (not draggable).
 // Opaque #9C2418; contrast (WCAG): 7.4:1 on the card (#FAF9F6), 5.1:1 at worst on a 30 % region tint
-// over the card, and 3.3:1 at worst over a region tint on the waveform bars (#93C5FD), so 3:1 for
-// graphics holds everywhere. (#B02A1E gave only 2.8:1 over the pink and purple regions on the bars.)
+// over the card, and 3.3:1 at worst over a region tint on the unplayed bars (#93C5FD), so 3:1 for
+// graphics holds there. (#B02A1E gave only 2.8:1 over the pink and purple regions on the bars.) Over
+// the played bars (#1d4ed8) it is only 1.2-1.6:1; there the marker is told apart by its dashed line
+// running above and between the bars, not by contrast with them.
 const EXPECTED_MARKER_COLOR = '#9C2418';
 // Longest title shown in a waveform region label
 const REGION_TITLE_MAX = 28;
@@ -261,6 +263,14 @@ const CLICK_STRIP_COLOR = '217, 64, 50';
 // A/B "Removed" boost: audio element -> { ctx, source, gain } (one MediaElementSource per element)
 const _abBoostNodes = new WeakMap();
 
+// What a media element's error code means, for the notice when WaveSurfer re-emits it without a message.
+const MEDIA_ERROR_MESSAGES = {
+    1: 'playback was aborted',
+    2: 'a network error interrupted the audio download',
+    3: 'the audio could not be decoded',
+    4: 'the audio format is not supported',
+};
+
 function vinylApp() {
     return {
         // WebSocket connection
@@ -311,7 +321,7 @@ function vinylApp() {
         playheadIdx: -1,       // index of the track under the playhead (-1 = gap / none)
         playerNotice: '',
         playerInfo: '',        // muted, persistent note (preview fallback); playerNotice is for errors
-        _audioSource: null,    // {waveform, fileId, precise, peaks, duration, fellBack} of the loaded audio
+        _audioSource: null,    // {waveform, fileId, precise, peaks, duration, fellBack, settled, generation} of the loaded audio (raw)
         playerBuffering: false,
         waveView: { start: 0, end: 1 },   // visible part of the waveform (fractions), for the scrollbar
         _waveScroller: null,
@@ -4441,65 +4451,121 @@ function vinylApp() {
             return track.ignored ? IGNORED_TRACK_COLOR : this.getTrackColor(idx);
         },
 
-        /**
-         * Update track start time (inline Adjust)
-         */
-        updateTrackStart(idx, value) {
-            const newStart = parseFloat(value);
-            const track = this.detectedTracks[idx];
-            if (!track || isNaN(newStart) || newStart < 0) return;
-            this.applyTrackBounds(idx, newStart, track.end);
-            this.syncRegionsAround(idx);
+        /** End of the recording in seconds (Infinity while it is not known yet) */
+        recordingEnd() {
+            return this.playDuration || this.currentFile?.duration || Infinity;
         },
 
         /**
-         * Update track end time (inline Adjust)
+         * Why a typed Start/End/Length would break the track table, or '' when it is fine.
+         * Typing is held to a stricter rule than dragging (which clamps): a typo such as End "5"
+         * on a track starting at 10 must be refused, not turned into a 1 s track, and an edit
+         * must not squeeze a neighbour (ignored or not: it keeps its cut points) below
+         * MIN_TRACK_LENGTH.  A neighbour only counts when the edit shrinks it.  start/end are
+         * already capped at the recording's end.
          */
-        updateTrackEnd(idx, value) {
-            const newEnd = parseFloat(value);
+        typedBoundsProblem(idx, start, end, which = 'end') {
             const track = this.detectedTracks[idx];
-            if (!track || isNaN(newEnd) || newEnd < 0) return;
-            this.applyTrackBounds(idx, track.start, newEnd);
-            this.syncRegionsAround(idx);
+            const previous = this.detectedTracks[idx - 1];
+            const next = this.detectedTracks[idx + 1];
+            if (end <= start) {
+                return which === 'start'
+                    ? `Track ${track.number}: the start must be before its end.`
+                    : `Track ${track.number}: the end must be after its start.`;
+            }
+            if (end - start < MIN_TRACK_LENGTH - 1e-6) {
+                return `Track ${track.number} must last at least ${MIN_TRACK_LENGTH} s.`;
+            }
+            if (next && end > next.start && next.end - end < MIN_TRACK_LENGTH - 1e-6) {
+                return `That would leave track ${next.number} shorter than ${MIN_TRACK_LENGTH} s.`;
+            }
+            if (previous && start < previous.end && start - previous.start < MIN_TRACK_LENGTH - 1e-6) {
+                return `That would leave track ${previous.number} shorter than ${MIN_TRACK_LENGTH} s.`;
+            }
+            return '';
+        },
+
+        /**
+         * Typed Start/End (inline Adjust): apply, or refuse with a warning.  The field always ends up
+         * showing the stored value, so text that was not applied (or was capped) never stays on screen.
+         */
+        applyTypedBounds(idx, which, value, input) {
+            const track = this.detectedTracks[idx];
+            if (!track) return false;
+            const typed = parseFloat(value);
+            let changed = false;
+            if (!isNaN(typed) && typed >= 0) {
+                const start = which === 'start' ? typed : track.start;
+                const end = which === 'end' ? typed : track.end;   // applyTrackBounds caps it at the recording's end
+                const problem = this.typedBoundsProblem(idx, start, end, which);
+                if (problem) {
+                    this.notify(problem, { type: 'warning', timeout: 5000 });
+                } else {
+                    changed = this.applyTrackBounds(idx, start, end);
+                    this.syncRegionsAround(idx);
+                }
+            }
+            if (input) input.value = track[which];
+            return changed;
+        },
+
+        /** Update track start time (inline Adjust) */
+        updateTrackStart(idx, value, input = null) {
+            return this.applyTypedBounds(idx, 'start', value, input);
+        },
+
+        /** Update track end time (inline Adjust) */
+        updateTrackEnd(idx, value, input = null) {
+            return this.applyTypedBounds(idx, 'end', value, input);
         },
 
         /** "3:45", "3:45.5", "1:02:03" or plain seconds -> seconds; null if unreadable. */
         parseLengthInput(text) {
-            const s = String(text ?? '').trim();
-            if (/^\d+(\.\d+)?$/.test(s)) return parseFloat(s);
-            const m = s.match(/^(?:(\d+):)?(\d{1,2}):(\d{1,2}(?:\.\d+)?)$/);
-            if (!m) return null;
-            const secs = (m[1] ? parseInt(m[1], 10) * 3600 : 0) + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
-            return m[1] || parseFloat(m[3]) < 60 ? secs : null;
+            const trimmed = String(text ?? '').trim();
+            if (/^\d+(\.\d+)?$/.test(trimmed)) return parseFloat(trimmed);
+            const match = trimmed.match(/^(?:(\d+):)?(\d{1,2}):(\d{1,2}(?:\.\d+)?)$/);
+            if (!match) return null;
+            const [, hours, minutes, seconds] = match;
+            // With hours, minutes and seconds must be below 60; "3:75" is not a length
+            if (parseFloat(seconds) >= 60 || (hours && parseInt(minutes, 10) >= 60)) return null;
+            return (hours ? parseInt(hours, 10) * 3600 : 0) + parseInt(minutes, 10) * 60 + parseFloat(seconds);
         },
 
         /**
          * Typed length (e.g. from a streaming service): keep the start, end = start + length.
          * A next track that began exactly at the old end follows the cut, so nothing falls
-         * between them; overlaps are limited exactly like dragging.
+         * between them.  A length that would collapse the track or squeeze a neighbour under
+         * MIN_TRACK_LENGTH is refused (typedBoundsProblem); one past the recording's end is
+         * capped there, and the notice says so.
          */
         setTrackLength(idx, text, input = null) {
             const track = this.detectedTracks[idx];
             if (!track) return false;
             const length = this.parseLengthInput(text);
-            const reset = () => { if (input) input.value = this.formatDuration(track.duration); };
+            const showLength = () => { if (input) input.value = this.formatDuration(track.duration); };
             if (!(length >= MIN_TRACK_LENGTH)) {
-                reset();
+                showLength();
                 this.notify('Type a length like 3:45 (minutes:seconds).', { type: 'warning', timeout: 4000 });
                 return false;
             }
             const next = this.detectedTracks[idx + 1];
             const touching = !!next && Math.abs(next.start - track.end) < 0.05;
-            const recording = this.playDuration || this.currentFile?.duration || Infinity;   // never past the recording
-            const changed = this.applyTrackBounds(idx, track.start, Math.min(track.start + length, recording));
+            const newEnd = Math.min(track.start + length, this.recordingEnd());   // never past the recording
+            const problem = this.typedBoundsProblem(idx, track.start, newEnd);
+            if (problem) {
+                showLength();
+                this.notify(problem, { type: 'warning', timeout: 5000 });
+                return false;
+            }
+            const changed = this.applyTrackBounds(idx, track.start, newEnd);
             if (changed && touching && track.end < next.start) {
                 next.start = track.end;
                 next.duration = next.end - next.start;
             }
             if (changed) this.syncRegionsAround(idx);
-            reset();
-            if (changed && Math.abs(track.duration - length) > 0.05) {
-                this.notify(`Track ${track.number} can only be ${this.formatDuration(track.duration)} here (the next track or the end of the recording is in the way).`, { type: 'info', timeout: 5000 });
+            showLength();
+            if (newEnd - track.start < length - 0.05) {
+                this.notify(`Track ${track.number} can only be ${this.formatDuration(track.duration)} here (the end of the recording is in the way).`, { type: 'info', timeout: 5000 });
             }
             return changed;
         },
@@ -4522,24 +4588,31 @@ function vinylApp() {
             const endMoved = Math.abs(end - track.end) > EPS;
             if (!startMoved && !endMoved) return false;
 
+            // Never past the end of the recording (typed Start/End, Length and region updates all land here).
+            // Where a neighbour is already shorter than MIN the edit stops at its cut (a neighbour
+            // that short is left alone, not used to jump the edit backwards).
+            const limit = this.recordingEnd();
+            const endBound = next ? Math.max(next.start, next.end - MIN) : Infinity;
+            const startBound = prev ? Math.min(prev.end, prev.start + MIN) : 0;
             start = Math.max(0, start);
             if (startMoved && endMoved) {
-                // Whole-region drag: keep the length, stop at the neighbours' minimum
+                // Whole-region drag: keep the length, stop at the recording's end and the neighbours
                 const len = end - start;
-                if (next && end > next.end - MIN) { end = next.end - MIN; start = end - len; }
-                if (prev && start < prev.start + MIN) { start = prev.start + MIN; end = start + len; }
+                if (end > limit) { start -= end - limit; end = limit; }
+                if (end > endBound) { end = endBound; start = end - len; }
+                if (start < startBound) { start = startBound; end = start + len; }
                 if (start < 0) { end -= start; start = 0; }
             } else if (endMoved) {
-                if (next) end = Math.min(end, next.end - MIN);
+                end = Math.min(end, limit, endBound);
                 end = Math.max(end, start + MIN);
             } else {
-                if (prev) start = Math.max(start, prev.start + MIN);
+                start = Math.max(start, startBound);
                 start = Math.min(start, end - MIN);
             }
 
             const valid = end - start >= MIN - EPS &&
-                (!next || next.end - Math.max(next.start, end) >= MIN - EPS) &&
-                (!prev || Math.min(prev.end, start) - prev.start >= MIN - EPS);
+                (!next || end <= next.start || next.end - end >= MIN - EPS) &&
+                (!prev || start >= prev.end || start - prev.start >= MIN - EPS);
             if (!valid) return false;
 
             const changed = Math.abs(start - track.start) > EPS || Math.abs(end - track.end) > EPS;
@@ -4608,7 +4681,7 @@ function vinylApp() {
                 this.waveform = markRaw(WaveSurfer.create({
                     container: '#waveform',
                     waveColor: '#93c5fd',
-                    progressColor: '#1d4ed8',
+                    progressColor: '#1d4ed8',   // darker than waveColor: the played part is visible
                     cursorColor: '#1e40af',
                     height: 'auto',
                     normalize: false,   // peaks arrive pre-scaled (scalePeaksToRecording)
@@ -4623,11 +4696,17 @@ function vinylApp() {
                 // With MediaElement + provided peaks, load() resolves without
                 // fetching the audio — a later fetch failure only surfaces as
                 // an 'error' event, which must clear the loading spinner.
+                // WaveSurfer re-emits EVERY media error here as emit('error', undefined) (network and
+                // aborted ones too), and so does a throw inside its load/ready path: only the media
+                // element's own code (still set at this point) says the WAV cannot be played.
                 this.waveform.on('error', (err) => {
                     console.error('Waveform error:', err);
-                    if (this.fallBackToPreview(waveform, fileId)) return;
+                    if (waveform !== this.waveform) return;
+                    const code = waveform.getMediaElement?.()?.error?.code;
+                    // A fallback in flight absorbs the twin of its own failure, whatever the code now says
+                    if ((code === 3 || code === 4 || this.fallbackInFlight(waveform)) && this.fallBackToPreview(waveform, fileId)) return;
                     this.waveformLoading = false;
-                    this.showPlayerNotice('Audio playback error: ' + ((err && err.message) || err || 'unknown'));
+                    this.showPlayerNotice('Audio playback error: ' + ((err && err.message) || err || MEDIA_ERROR_MESSAGES[code] || 'unknown'));
                 });
 
                 // Transport state follows the real player events
@@ -4645,7 +4724,7 @@ function vinylApp() {
                     this.seekTo(time);
                 });
                 const media = this.waveform.getMediaElement();
-                media.preload = 'auto';
+                media.preload = 'metadata';   // stream on demand; 'auto' would buffer hundreds of MB of the original WAV on every rebuild
                 const mediaListeners = {
                     // DECODE (3) / SRC_NOT_SUPPORTED (4) on the original WAV: retry once with the MP3 preview
                     error: () => {
@@ -4794,8 +4873,9 @@ function vinylApp() {
                 // Browsers that cannot play WAV at all go straight to the MP3 preview.
                 const preciseOk = !!(media.canPlayType && media.canPlayType('audio/wav'));
                 const peaks = [scalePeaksToRecording(peaksData.peaks)];
-                this._audioSource = { waveform, fileId, precise: preciseOk, peaks,
-                    duration: knownDuration, fellBack: false };
+                // Raw: Alpine must not wrap the ~240k-element peaks in a proxy for WaveSurfer
+                this._audioSource = markRaw({ waveform, fileId, precise: preciseOk, peaks,
+                    duration: knownDuration, fellBack: false, settled: true, generation: 0 });
                 this.playerInfo = preciseOk ? '' : PREVIEW_AUDIO_NOTICE;
                 await this.waveform.load(this.audioUrl(fileId, preciseOk), peaks, knownDuration);
 
@@ -4958,6 +5038,12 @@ function vinylApp() {
             return precise ? `/api/audio/${fileId}?precise=true` : `/api/audio/${fileId}`;
         },
 
+        /** True while a preview-fallback reload of this waveform is still loading */
+        fallbackInFlight(waveform) {
+            const source = this._audioSource;
+            return !!source && source.waveform === waveform && source.fellBack && !source.settled;
+        },
+
         /**
          * The original WAV failed to play: reload the pinned MP3 preview once, keeping peaks,
          * zoom, playhead and paused state. Returns true when it took over the error.
@@ -4972,6 +5058,7 @@ function vinylApp() {
             source.precise = false;
             source.fellBack = true;
             source.settled = false;
+            source.generation++;   // a play() started on the WAV is now stale
             const resume = this.isPlaying;
             this.isPlaying = false;
             this.playerInfo = PREVIEW_AUDIO_NOTICE;
@@ -5329,14 +5416,27 @@ function vinylApp() {
          * Start playback, reporting failures inline instead of silently
          */
         startPlayback() {
-            if (!this.waveform) return;
+            const waveform = this.waveform;
+            if (!waveform) return;
             this.abPause();   // one player at a time
+            // A play() started on the WAV can reject after the preview fallback took over (and
+            // restarted playback itself); that says nothing about the preview.
+            const generation = this._audioSource?.generation;
             try {
-                const p = this.waveform.play();
-                if (p && typeof p.then === 'function') {
-                    p.then(() => { this.playerNotice = ''; }, (err) => {
+                const started = waveform.play();
+                if (started && typeof started.then === 'function') {
+                    started.then(() => { if (this.waveform === waveform) this.playerNotice = ''; }, (err) => {
+                        // A reply for a waveform that was destroyed or replaced meanwhile (file switch,
+                        // re-analysis, Snap) says nothing about the current one
+                        if (this.waveform !== waveform || this._audioSource?.generation !== generation) return;
+                        // WaveSurfer 7.8.10 rejects play() with AbortError when it is paused before
+                        // playback starts: the user's own action, not a failure
+                        if (err && err.name === 'AbortError') return;
                         console.error('Playback failed:', err);
                         this.isPlaying = false;
+                        // A load failure can leave the media element "playing"; stop it so the
+                        // next click plays instead of pausing
+                        waveform.pause();
                         this.showPlayerNotice('Could not start playback: ' + ((err && err.message) || err || 'unknown error'));
                     });
                 } else {
@@ -5344,6 +5444,7 @@ function vinylApp() {
                 }
             } catch (err) {
                 console.error('Playback failed:', err);
+                this.isPlaying = false;
                 this.showPlayerNotice('Could not start playback: ' + ((err && err.message) || err));
             }
         },
@@ -5974,7 +6075,7 @@ function vinylApp() {
          */
         onGlobalKeydown(e) {
             if (e.code !== 'Space' && e.key !== ' ') return;
-            if (e.repeat || e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+            if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
             if (this.showSettings || this.setupRequired) return;
             const el = e.target;
             const tag = el && el.tagName ? String(el.tagName).toUpperCase() : '';
@@ -5982,6 +6083,8 @@ function vinylApp() {
             const abPlaying = this.abAnyPlaying();
             if (!abPlaying && !this.waveform) return;
             e.preventDefault();
+            // A held key repeats keydown: keep the page from scrolling, but toggle only once
+            if (e.repeat) return;
             // A focused button (e.g. ▶️ just clicked) would also "click" on
             // keyup and toggle straight back — swallow that keyup.
             this._spaceToggled = true;
@@ -6108,6 +6211,7 @@ function vinylApp() {
         },
 
         destroyWaveform() {
+            this.waveformLoading = false;   // an in-flight initWaveform returns silently once stale
             this.removeClickStrip();
             if (this.waveform) {
                 this.waveform.destroy();

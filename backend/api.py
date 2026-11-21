@@ -1909,9 +1909,18 @@ async def get_restoration_test_audio(file_id: str, name: str):
     return FileResponse(path, media_type="audio/flac")
 
 
+def _cached_peaks_response(cache_path: Path):
+    """Stream the cached peaks file as is: at 10 ms per bin it is ~13 MB for a 4 h album, and
+    parsing then re-serialising that would block the event loop.  The file is replaced
+    atomically, so a reader never sees a partial one."""
+    from fastapi.responses import FileResponse
+
+    return FileResponse(cache_path, media_type="application/json")
+
+
 @app.get("/api/waveform-peaks/{file_id}")
 async def get_waveform_peaks(file_id: str):
-    """Generate waveform peaks for visualization."""
+    """Equal-width waveform peaks (<= 10 ms per bin) for visualization."""
 
     session = session_store.get(file_id)
     if session is None:
@@ -1920,22 +1929,21 @@ async def get_waveform_peaks(file_id: str):
 
     file_path = session.source_audio
 
-    # Old peaks.json has only 3,000 bins per recording, losing sub-second
-    # timing on albums. Existing sessions must regenerate the detailed waveform.
+    # peaks_v2.json replaces the old peaks.json (3,000 bins per recording, which
+    # lost sub-second timing on albums); an old cache is simply ignored.
     peaks_cache_path = get_session_path(file_id, "peaks_v2.json")
     if peaks_cache_path.exists():
-        with open(peaks_cache_path, "r") as f:
-            cached_data = json.load(f)
-            return JSONResponse(content=cached_data)
+        return _cached_peaks_response(peaks_cache_path)
 
     try:
         # Prep's decode writes the peaks too: wait for it (or its cache) rather than
-        # starting a second decode, then decode here only for an older session whose
-        # envelope was cached before peaks were (or a prep that wrote no peaks).
+        # starting a second decode.  Decoding here is only the rare leftover: the envelope
+        # was cached (or loaded) but its peaks write failed.  Sessions live in memory, so
+        # no older on-disk session lacks peaks; concurrent requests in that case each decode,
+        # and a recording removed during it still gets this reply (nothing is written).
         await get_envelope(session)
         if peaks_cache_path.exists():
-            with open(peaks_cache_path, "r") as f:
-                return JSONResponse(content=json.load(f))
+            return _cached_peaks_response(peaks_cache_path)
         _, response_data = await asyncio.to_thread(_decode_and_cache, file_id, file_path)
 
         return JSONResponse(content=response_data)

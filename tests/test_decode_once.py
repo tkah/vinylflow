@@ -171,7 +171,8 @@ def test_peaks_requested_while_prep_decodes_wait_for_it(session, monkeypatch):
 
     response = asyncio.run(race())
     assert response.status_code == 200
-    assert json.loads(response.body) == json.loads(json.dumps(legacy_peaks(source)))
+    # the cached file served as is (prep's write), so read it from the response's path
+    assert json.loads(open(response.path, "rb").read()) == json.loads(json.dumps(legacy_peaks(source)))
     assert len(calls) == 1, "the peaks request started its own decode"
 
 
@@ -180,9 +181,16 @@ def test_a_decode_for_a_removed_session_writes_nothing(session):
     sid, source = session
     folder = api.get_session_path(sid)
     shutil.rmtree(folder)
-    db, peaks = api._decode_and_cache(sid, source)
+    writes = []
+    real_write = api._write_cache_atomically
+    api._write_cache_atomically = lambda *args: writes.append(args) or real_write(*args)
+    try:
+        db, peaks = api._decode_and_cache(sid, source)
+    finally:
+        api._write_cache_atomically = real_write
     assert len(db) and peaks["length"] > 1
     assert not folder.exists()
+    assert writes == [], "no write is even attempted for a removed recording"
 
 
 def test_peaks_endpoint_reports_an_ffmpeg_failure(session, monkeypatch):
@@ -195,3 +203,37 @@ def test_peaks_endpoint_reports_an_ffmpeg_failure(session, monkeypatch):
     response = TestClient(api.app).get(f"/api/waveform-peaks/{sid}")
     assert response.status_code == 500
     assert response.json()["detail"] == "FFmpeg failed: broken input"
+
+
+def test_peaks_request_for_a_recording_removed_while_waiting_is_a_404(session):
+    """Removing the recording (the real cleanup path) cancels its prep task; the waiting peaks
+    request must answer 404, not the generic 500 "Peaks generation failed"."""
+    sid, source = session
+    from fastapi import HTTPException
+
+    async def race():
+        api.start_envelope(sid, source)
+
+        async def remove_recording():
+            await asyncio.sleep(0)   # the peaks request is now waiting on the task
+            api.cleanup_session(sid)
+
+        asyncio.get_running_loop().create_task(remove_recording())
+        await api.get_waveform_peaks(sid)
+
+    with pytest.raises(HTTPException) as excinfo:
+        asyncio.run(race())
+    assert excinfo.value.status_code == 404
+
+
+def test_cached_peaks_are_served_as_the_files_own_bytes(session):
+    """A cached peaks file (~13 MB for a 4 h album) is streamed as is, not parsed and re-serialised
+    on the event loop: odd whitespace in the file survives only if it is not re-dumped."""
+    sid, _ = session
+    body = b'{ "peaks": [0.5,  1.0],\n  "length": 2, "duration": 0.02 }'
+    (api.get_session_path(sid) / "peaks_v2.json").write_bytes(body)
+    response = TestClient(api.app).get(f"/api/waveform-peaks/{sid}")
+    assert response.status_code == 200
+    assert response.content == body
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json() == {"peaks": [0.5, 1.0], "length": 2, "duration": 0.02}
