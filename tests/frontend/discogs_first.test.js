@@ -55,20 +55,18 @@ const fullRelease = (id, tracks = [track('A1', '5:00'), track('A2', '6:00')]) =>
         app.selectFile('f1');
         app.selectRelease(fullRelease(1));
         assert.strictEqual(app.analyzing, true);
-        // Fork: no showTrackCountMismatch getter; the mismatch box sits inside the track table, which
-        // only renders once tracks exist, so a warning during the first detection cannot show.
-        assert.ok(/x-show="detectedTracks\.length > 0"[^]*x-show="trackCountMismatch"/.test(html), 'the mismatch box lives inside the track table');
+        assert.strictEqual(app.showTrackCountMismatch, false, 'no warning during the first detection');
         assert.strictEqual(server.calledWith('/api/analyze-guided').length, 1, 'a pick places the tracks with guided detection');
         server.next('/api/analyze-guided').answer(500, { detail: 'boom' });
         await tick(); await tick();
         assert.strictEqual(app.analyzing, false);
-        assert.strictEqual(app.trackCountMismatch, true, 'a failed detection shows the warning and its options');
+        assert.strictEqual(app.showTrackCountMismatch, true, 'a failed detection shows the warning and its options');
 
         // ...and a real mismatch stays visible during a Smart Rescan, whose spinner lives in it
         app.detectedTracks = detected(1);
         app.resetMappingToTargets();
         app.analyzing = true;
-        assert.strictEqual(app.trackCountMismatch, true);   // Fork: the flag, not the upstream getter
+        assert.strictEqual(app.showTrackCountMismatch, true);
     }
 
     // ---- Snap to Discogs from the "release picked, nothing detected" state: the new tracks
@@ -81,7 +79,7 @@ const fullRelease = (id, tracks = [track('A1', '5:00'), track('A2', '6:00')]) =>
         server.next('/api/analyze-guided').answer(200, guided(0));
         await tick(); await tick();
         assert.strictEqual(app.detectedTracks.length, 0);
-        assert.strictEqual(app.trackCountMismatch, true);
+        assert.strictEqual(app.showTrackCountMismatch, true);
 
         const waveformCalls = [];
         app.destroyWaveform = () => waveformCalls.push('destroy');

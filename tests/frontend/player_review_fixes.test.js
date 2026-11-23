@@ -225,7 +225,8 @@ const decodeError = wave => mediaError(wave, 3);
 
     // ---- held Space: no page scroll, no second toggle ----
     app = vinylApp(); let toggles = 0;
-    app.waveform = {}; app.togglePlay = () => { toggles++; };
+    app.waveform = {}; app.playDuration = 120;   // playerReady: Space needs a loaded waveform
+    app.togglePlay = () => { toggles++; };
     const key = (repeat, tag = 'BODY') => ({ code: 'Space', key: ' ', repeat, defaultPrevented: false,
         target: { tagName: tag }, prevented: false, preventDefault() { this.prevented = true; } });
     const first = key(false); app.onGlobalKeydown(first);

@@ -106,6 +106,6 @@ assert.ok((rowMarkup.slice(0, buttonsAt).match(/'opacity-50': track\.ignored/g) 
 assert.ok(/:style="track\.ignored \? \{ backgroundColor: '#5E5E5A', color: '#FFFFFF' \} : \{\}"/.test(buttonCell), 'the Ignored button keeps a dark fill with white text');
 
 // ---- the playing row's Pause stays enabled even when that row is ignored ----
-assert.ok(html.includes(':disabled="!waveform || (track.ignored && !(isPlaying && playheadIdx === idx))"'),
+assert.ok(html.includes(':disabled="!playerReady || (track.ignored && !(isPlaying && playheadIdx === idx))"'),
     'the playing row keeps its Pause enabled even when ignored');
 console.log('track_table_markup ok');

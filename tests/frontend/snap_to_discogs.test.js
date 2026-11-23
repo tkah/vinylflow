@@ -27,6 +27,7 @@ const trk=(n,s,e,ig=false)=>({number:n,start:s,end:e,duration:e-s,editing:false,
 function mkApp(){
   const a=vinylApp();
   a.waveform=mkWS(); a.waveformRegions=mkRegions();
+  a.playDuration=600;   // a loaded waveform: Space needs playerReady
   // wire the same listeners initWaveform does
   const w=a.waveform;
   w.on('play',()=>{a.isPlaying=true;}); w.on('pause',()=>{a.isPlaying=false;a.cancelAudition();});
@@ -115,8 +116,8 @@ assert.strictEqual(w.getCurrentTime(),300);
 w.setTime(5);
 a.onRegionClicked({id:'track-1'},{button:2,clientX:600,target:{}}); assert.strictEqual(w.getCurrentTime(),5);
 a.onRegionClicked({id:'track-1'},{button:0,ctrlKey:true,clientX:600,target:{}}); assert.strictEqual(w.getCurrentTime(),5);
-a._regionDownX=300; a.onRegionClicked({id:'track-1'},{button:0,clientX:600,target:{}}); assert.strictEqual(w.getCurrentTime(),5); // drag end
-a.onRegionClicked({id:'expected-1'},{button:0,clientX:600,target:{}}); assert.strictEqual(w.getCurrentTime(),5);
+a.onRegionClicked({id:'track-1'},{button:0,clientX:600,target:{}}); assert.strictEqual(w.getCurrentTime(),300);   // every region-clicked is a plain click (the plugin swallows the click ending a drag)
+a.onRegionClicked({id:'expected-1'},{button:0,clientX:900,target:{}}); assert.strictEqual(w.getCurrentTime(),300);   // ghost markers do not seek
 a.onRegionClicked({id:'track-1'},{button:0,clientX:50,target:{}}); assert.strictEqual(w.getCurrentTime(),0);  // clamped
 
 // destroy resets

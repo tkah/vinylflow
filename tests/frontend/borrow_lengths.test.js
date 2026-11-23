@@ -318,6 +318,391 @@ const lastToast = app => app.toasts[app.toasts.length - 1];
     app.selectedRelease = { ...edited, tracks: edited.tracks.map(t => ({ ...t, duration: t.duration || '1:00' })) };
     assert.deepStrictEqual(app.visibleDonors, [], 'nothing missing, nothing to offer');
 
+    const settle = async () => { for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve)); };
+    // ---- sides are suggested again once lengths exist (8-track LP, recording holds side A) ----
+    const LP_POSITIONS = ['A1', 'A2', 'A3', 'A4', 'B1', 'B2', 'B3', 'B4'];
+    // Donor placed by position (the fork's replies carry `positions` for every index they name)
+    const placed = (over, positionList) => {
+        const made = donor(over);
+        const keys = new Set([...Object.keys(made.lengths), ...(made.compared_indexes || []), ...(made.disagree_indexes || [])].map(String));
+        return { ...made, positions: Object.fromEntries([...keys].map(key => [key, positionList[Number(key)]])) };
+    };
+    const mkLp = () => ({ id: 7, artist: 'A', title: 'T', tracks: LP_POSITIONS.map(position => T(position, '')) });
+    const lpDonor = (over = {}) => placed({
+        matched: 8, missing: 8,
+        lengths: Object.fromEntries([0, 1, 2, 3, 4, 5, 6, 7].map(index => [String(index), '4:00'])), ...over
+    }, LP_POSITIONS);
+    // Picked through the real selectRelease: no lengths -> full album ('default'), the recording is one side long
+    const pickLp = () => {
+        const picked = mk(mkLp(), []);
+        picked.currentFile = { id: 'f1', filename: 'one.wav', duration: 990, musicDuration: 960 };
+        picked.loadAlbumDescription = () => {};
+        picked.selectRelease(picked.selectedRelease);
+        return picked;
+    };
+    const lpDonors = a => { a.donors = { releaseId: 7, status: 'done', checked: 1, budget: 12, list: [lpDonor()], error: '' }; };
+    app = pickLp();
+    assert.deepStrictEqual([app.selectedSides, app.sidesSuggestionReason, app.targetTracks.length], [['A', 'B'], 'default', 8]);
+    const callsAfterPick = app.afterCalls;
+    lpDonors(app);
+    const lpBefore = app.selectedRelease;
+    app.applyDonor(lpDonor());
+    assert.deepStrictEqual(app.selectedSides, ['A'], 'the length fit now picks side A');
+    assert.strictEqual(app.sidesSuggestionReason, 'length');
+    assert.deepStrictEqual(app.suggestedSides, ['A']);
+    assert.strictEqual(app.sidesMatchedByDuration, true);
+    assert.strictEqual(app.targetTracks.length, 4, 'guided detection will ask for 4 tracks');
+    assert.strictEqual(app.afterCalls, callsAfterPick + 1, 'one re-detection, with the new sides');
+    clickUndo(app);   // sides, suggestion and reason come back, and detection re-runs once more for 8
+    assert.strictEqual(app.selectedRelease, lpBefore);
+    assert.deepStrictEqual([app.selectedSides, app.suggestedSides, app.sidesSuggestionReason], [['A', 'B'], ['A', 'B'], 'default']);
+    assert.strictEqual(app.sidesMatchedByDuration, false);
+    assert.strictEqual(app.targetTracks.length, 8);
+    assert.strictEqual(app.afterCalls, callsAfterPick + 2);
+
+    // Sides the user chose by hand are left alone, by the borrow and by its Undo
+    app = pickLp();
+    app.applyPreset(['B']);
+    lpDonors(app);
+    app.applyDonor(lpDonor());
+    assert.deepStrictEqual(app.selectedSides, ['B']);
+    assert.strictEqual(app.sidesSuggestionReason, 'default');
+    clickUndo(app);
+    assert.deepStrictEqual(app.selectedSides, ['B']);
+    // Sides changed by hand after the borrow stay changed when it is undone
+    app = pickLp();
+    lpDonors(app);
+    app.applyDonor(lpDonor());
+    app.applyPreset(['B']);
+    clickUndo(app);
+    assert.deepStrictEqual(app.selectedSides, ['B']);
+    // ... and an explicit pick equal to the borrow's own suggestion is the user's too
+    app = pickLp();
+    lpDonors(app);
+    app.applyDonor(lpDonor());
+    assert.strictEqual(app.sidesTouched, false, 'the borrow\'s own suggestion is not a user pick');
+    app.applyPreset(['A']);
+    clickUndo(app);
+    assert.deepStrictEqual([...app.selectedSides], ['A']);
+
+    // An explicit "Full album" click (equal to the default) is the user's choice: a borrow leaves it alone
+    app = pickLp();
+    assert.strictEqual(app.sidesTouched, false, 'a picked release starts untouched');
+    app.applyPreset(['A', 'B']);
+    assert.strictEqual(app.sidesTouched, true);
+    lpDonors(app);
+    app.applyDonor(lpDonor());
+    assert.deepStrictEqual([...app.selectedSides], ['A', 'B']);
+    assert.strictEqual(app.sidesSuggestionReason, 'default');
+    app = pickLp();
+    app.toggleSide('B'); app.toggleSide('B');   // back to A+B by hand
+    assert.strictEqual(app.sidesTouched, true);
+    app.selectRelease(mkLp());
+    assert.strictEqual(app.sidesTouched, false, 'selecting a release resets it');
+    app.applyPreset(['A']);
+    app.changeRelease();
+    assert.strictEqual(app.sidesTouched, false, 'dropping the release resets it');
+
+    // sidesTouched is part of the saved workspace: it survives a file switch and back, and a save
+    // written before the field existed reads as untouched
+    app = pickLp();
+    app.applyPreset(['A']);
+    assert.strictEqual(app.currentWorkspaceState().sidesTouched, true, 'captured with the workspace');
+    app.saveWorkspace();
+    app.sidesTouched = false;
+    app.restoreWorkspace('f1');
+    assert.strictEqual(app.sidesTouched, true, 'restored with the workspace');
+    app.fetchScan = () => {};
+    app.selectFile('f2');
+    assert.strictEqual(app.sidesTouched, false, 'another recording starts untouched');
+    app.selectFile('f1');
+    assert.strictEqual(app.sidesTouched, true, 'and the first one keeps it after switching back');
+    // A recording switched away from and back must not be re-suggested by a borrow after the user's pick
+    lpDonors(app);
+    app.applyDonor(lpDonor());
+    assert.deepStrictEqual([...app.selectedSides], ['A']);
+    assert.strictEqual(app.sidesSuggestionReason, 'default');
+    // Re-analysis Undo brings the flag back with the release it belonged to
+    app = pickLp();
+    app.applyPreset(['A']);
+    app.analyzeFile = async () => { app.detectedTracks = [{ number: 1, start: 0, end: 100, duration: 100 }]; };
+    app.initWaveform = async () => {};
+    app.destroyWaveform = () => {};
+    app.pauseWaveform = () => {};
+    await app.reanalyzeFile();
+    assert.strictEqual(app.sidesTouched, false, 're-analysis drops the release and the pick');
+    clickUndo(app);
+    await settle();
+    assert.strictEqual(app.sidesTouched, true, 'Undo brings the pick back with the release');
+    // A suggestion made by length is left alone by a borrow (only 'default' is re-suggested)
+    app = mk({ id: 7, tracks: [T('A1', ''), T('A2', ''), T('A3', ''), T('A4', ''),
+        T('B1', '4:00'), T('B2', '4:00'), T('B3', '4:00'), T('B4', '4:00')] }, ['A']);
+    app.suggestedSides = ['A']; app.sidesSuggestionReason = 'length';
+    app.currentFile = { id: 'f1', filename: 'one.wav', duration: 1950, musicDuration: 1920 };
+    lpDonors(app);
+    app.applyDonor(lpDonor());
+    assert.deepStrictEqual([...app.selectedSides], ['A']);
+    assert.strictEqual(app.sidesSuggestionReason, 'length');
+
+    // Undo after the user toggled a side: selection stays, but the suggestion and its reason are restored
+    app = pickLp();
+    lpDonors(app);
+    app.applyDonor(lpDonor());
+    assert.strictEqual(app.sidesSuggestionReason, 'length');
+    app.toggleSide('B');
+    clickUndo(app);
+    assert.deepStrictEqual([...app.selectedSides], ['A', 'B'], 'the user\'s sides stay');
+    assert.deepStrictEqual([...app.suggestedSides], ['A', 'B']);
+    assert.strictEqual(app.sidesSuggestionReason, 'default', 'no stale "matches recording length"');
+
+    // Undo of a re-suggested borrow brings the user's hand-edited, reversed mapping back
+    const eightTracks = () => [0, 1, 2, 3, 4, 5, 6, 7].map(n => ({ number: n + 1, start: n * 100, end: n * 100 + 99, duration: 99 }));
+    app = pickLp();
+    app.detectedTracks = eightTracks();
+    app.resetMappingToTargets();
+    app.reverseMapping();
+    assert.deepStrictEqual([...app.customMapping], [7, 6, 5, 4, 3, 2, 1, 0]);
+    const mismatchBefore = app.trackCountMismatch;
+    lpDonors(app);
+    app.applyDonor(lpDonor());
+    assert.deepStrictEqual([...app.customMapping], [0, 1, 2, 3, 3, 3, 3, 3], 'mapping follows the new sides');
+    assert.strictEqual(app.trackMappingReversed, false);
+    assert.strictEqual(app.trackCountMismatch, true, '8 detected tracks against 4 targets');
+    clickUndo(app);
+    assert.deepStrictEqual([...app.selectedSides], ['A', 'B']);
+    assert.deepStrictEqual([...app.customMapping], [7, 6, 5, 4, 3, 2, 1, 0], 'the user\'s mapping is back');
+    assert.strictEqual(app.trackMappingReversed, true);
+    assert.strictEqual(app.trackCountMismatch, mismatchBefore);
+
+    // Switching files and back installs a COPY of the release and of detectedTracks.  The fork's Undo
+    // already refuses by release identity then (RELEASE_CHANGED_NOTICE), so neither the sides nor the saved
+    // mapping are put back onto objects they were not made for
+    app = pickLp();
+    app.detectedTracks = eightTracks();
+    app.resetMappingToTargets();
+    app.reverseMapping();
+    lpDonors(app);
+    app.applyDonor(lpDonor());
+    const mappingAfterBorrow = [...app.customMapping];
+    app.saveWorkspace();
+    app.fetchScan = () => {};
+    app.selectFile('f2');
+    app.selectFile('f1');
+    assert.strictEqual(app.selectedRelease.lengthsBorrowedFrom.length, 1);
+    clickUndo(app);
+    assert.strictEqual(lastToast(app).message, 'This can no longer be undone: the release was edited or the recording was reopened since.');
+    assert.deepStrictEqual([...app.selectedSides], ['A'], 'the refused Undo changes nothing');
+    assert.deepStrictEqual([...app.customMapping], mappingAfterBorrow);
+    assert.strictEqual(app.trackMappingReversed, false, 'never the reversed mapping of the old sides');
+
+    // A partial fill that leaves the same sides keeps the mapping, before and after Undo
+    app = pickLp();
+    app.detectedTracks = eightTracks();
+    app.resetMappingToTargets();
+    app.customMapping[0] = 5;
+    app.markEdited();
+    lpDonors(app);
+    app.applyDonor(placed({ lengths: { '0': '4:00', '1': '4:00' } }, LP_POSITIONS));
+    assert.deepStrictEqual([...app.selectedSides], ['A', 'B'], 'two lengths do not change the fit');
+    assert.deepStrictEqual([...app.customMapping], [5, 1, 2, 3, 4, 5, 6, 7], 'hand-made mapping untouched');
+    app.customMapping[1] = 6;   // an edit after the borrow
+    clickUndo(app);
+    assert.deepStrictEqual([...app.customMapping], [5, 6, 2, 3, 4, 5, 6, 7], 'Undo does not discard later mapping edits');
+
+    // Undo with the REAL afterTargetsChanged / redetectForTargets: the borrow's own re-detection replaced the
+    // tracks, so the saved mapping describes tracks that no longer exist
+    const trackReply = count => ({
+        ok: true,
+        json: async () => ({
+            method: 'durations', matched: true, music_start: 0, music_end: count * 100,
+            tracks: Array.from({ length: count }, (_, n) => ({ number: n + 1, start: n * 100, end: n * 100 + 99, duration: 99 })),
+            boundaries: []
+        })
+    });
+    global.fetch = async (url, options) => trackReply(JSON.parse(options.body).expected_tracks);
+    app = mk(mkLp(), [], { realRedetect: true });
+    app.currentFile = { id: 'f1', filename: 'one.wav', duration: 990, musicDuration: 960 };
+    app.$refs = {};
+    app.loadAlbumDescription = () => {};
+    app.initWaveform = async () => {};
+    app.applyScan = () => {};
+    app.selectRelease(app.selectedRelease);
+    await settle();
+    assert.strictEqual(app.detectedTracks.length, 8);
+    app.reverseMapping();
+    assert.strictEqual(app.trackMappingReversed, true);
+    lpDonors(app);
+    app.applyDonor(lpDonor());
+    await settle();
+    assert.strictEqual(app.detectedTracks.length, 4, 'the borrow re-detected side A');
+    app.markEdited();
+    clickUndo(app);
+    await settle();   // only the ask-first banner: the 4 tracks stay
+    assert.strictEqual(app.editBanner, true);
+    assert.deepStrictEqual([...app.selectedSides], ['A', 'B']);
+    assert.deepStrictEqual([...app.customMapping], [0, 1, 2, 3], 'mapping of the 4 tracks that exist, not the old 8');
+    assert.strictEqual(app.trackMappingReversed, false);
+    assert.strictEqual(app.trackCountMismatch, true, '4 tracks against 8 targets must warn');
+
+    // ---- a donor whose lengths differ from the release's own is demoted with a note, never hidden ----
+    assert.strictEqual(app.donorDisagreeText(donor()), '', 'no note without a disagreement');
+    assert.strictEqual(app.donorDisagreeText(donor({ disagree: 0, compared: 3 })), '');
+    assert.strictEqual(app.donorDisagreeText(donor({ disagree: 2, compared: 5 })), 'Lengths differ from this release on 2 of 5 tracks');
+    assert.strictEqual(app.donorDisagreeText(donor({ disagree: 1, compared: 1 })), 'Lengths differ from this release on 1 of 1 track');
+    app = withList(mk(mkRelease(), ['A']), [
+        donor({ release_id: 1, lengths: { '0': '3:00', '2': '5:00' }, disagree: 1, compared: 1 }),   // fills 2 but disagrees
+        donor({ release_id: 2, lengths: { '0': '3:00' }, disagree: 0, compared: 1 }),                  // fills 1, agrees
+        donor({ release_id: 3, lengths: { '2': '5:00' } }),                                            // fills 1, no comparison
+    ]);
+    assert.deepStrictEqual(app.visibleDonors.map(d => d.release_id), [2, 3, 1], 'agreeing donors first, then fills, then server order');
+    assert.strictEqual(app.visibleDonors[2].disagree, 1, 'the server note data survives the recomputation');
+
+    // Disagreement is recounted for the chosen sides, from the server's per-track indexes
+    const SIDE_POSITIONS = ['A1', 'A2', 'B1', 'B2'];
+    const sideRelease = () => ({ id: 7, tracks: [T('A1', '3:00'), T('A2', ''), T('B1', '9:00'), T('B2', '')] });
+    const scoped = disagreeing => placed({
+        lengths: { '1': '4:00', '3': '2:00' }, compared: 2, disagree: disagreeing.length,
+        compared_indexes: [0, 2], disagree_indexes: disagreeing
+    }, SIDE_POSITIONS);
+    app = withList(mk(sideRelease(), ['A']), [scoped([2])]);   // the disagreement is on side B
+    assert.strictEqual(app.donorDisagreeText(app.visibleDonors[0]), '', 'side A only: One agrees, no note');
+    assert.deepStrictEqual([app.visibleDonors[0].compared, app.visibleDonors[0].disagree], [1, 0]);
+    app.selectedSides = ['A', 'B'];
+    assert.strictEqual(app.donorDisagreeText(app.visibleDonors[0]), 'Lengths differ from this release on 1 of 2 tracks');
+    // Ordering follows the recount: the donor that disagrees only on side B is not demoted on side A
+    app = withList(mk(sideRelease(), ['A']), [
+        { ...scoped([0]), release_id: 1 },
+        { ...scoped([2]), release_id: 2 },
+    ]);
+    assert.deepStrictEqual(app.visibleDonors.map(d => d.release_id), [2, 1]);
+    // A server reply without the index lists falls back to its totals
+    app = withList(mk(sideRelease(), ['A']), [placed({ lengths: { '1': '4:00' }, compared: 3, disagree: 2 }, SIDE_POSITIONS)]);
+    assert.strictEqual(app.donorDisagreeText(app.visibleDonors[0]), 'Lengths differ from this release on 2 of 3 tracks');
+
+    // The index lists are placed by Discogs position, like the lengths: a split umbrella or a custom track
+    // shifts the client's indexes, and an entry that cannot be placed is skipped, never counted on a wrong track
+    const shifted = () => ({ id: 7, tracks: [
+        { position: 'A1', title: 'Own', duration: '3:00' },
+        { position: 'A1', title: 'Added', duration: '', custom: true },   // inserted before the Discogs A2
+        { position: 'A2', title: 'Two', duration: '' },
+        { position: 'B1', title: 'Three', duration: '9:00' },
+        { position: 'B2', title: 'Four', duration: '' }] });
+    app = withList(mk(shifted(), ['A']), [scoped([2])]);   // server index 2 = B1, now client index 3
+    assert.deepStrictEqual([app.visibleDonors[0].compared, app.visibleDonors[0].disagree], [1, 0], 'B1 is on side B');
+    app.selectedSides = ['A', 'B'];
+    assert.deepStrictEqual([app.visibleDonors[0].compared, app.visibleDonors[0].disagree], [2, 1], 'placed by position, not index');
+    // Position shared with a custom track is still resolved to the one Discogs track; a split part is not countable
+    app = withList(mk(shifted(), ['A', 'B']), [placed({
+        lengths: { '1': '4:00' }, compared: 2, disagree: 1, compared_indexes: [0, 2], disagree_indexes: [2]
+    }, SIDE_POSITIONS)]);
+    app.selectedRelease = { ...app.selectedRelease, tracks: app.selectedRelease.tracks.map(track =>
+        track.position === 'B1' ? { ...track, umbrella: { position: 'B1', title: 'Suite', parts: [] } } : track) };
+    assert.deepStrictEqual([app.visibleDonors[0].compared, app.visibleDonors[0].disagree], [1, 0], 'the split part of B1 is skipped');
+    // An index with no position in the reply cannot be placed and is skipped
+    app = withList(mk(sideRelease(), ['A', 'B']), [{ ...scoped([2]), positions: { '1': 'A2', '3': 'B2' } }]);
+    assert.deepStrictEqual([app.visibleDonors[0].compared, app.visibleDonors[0].disagree], [0, 0]);
+
+    // ---- the empty message says how far the lookup got ----
+    global.fetch = async () => ({ ok: true, json: async () => ({ donors: [], checked: 12, versions: 340 }) });
+    app = mk();
+    await app.findLengthDonors();
+    assert.strictEqual(app.donorEmptyText, 'No other pressing has the missing lengths among the 12 checked (of 340).');
+    app.donors = { ...app.donors, checked: 5, versions: 5 };
+    assert.strictEqual(app.donorEmptyText, 'No other pressing has the missing lengths among the 5 checked.');
+    app.donors = { ...app.donors, checked: 1, versions: 340 };
+    assert.strictEqual(app.donorEmptyText, "The 1 other pressing checked (of 340) doesn't have the missing lengths.");
+    app.donors = { ...app.donors, checked: 0, versions: null };
+    assert.strictEqual(app.donorEmptyText, 'No other pressing has the missing lengths.');
+
+    // app.js must not use Array.prototype.at (WKWebView before Safari 15.4 lacks it)
+    assert.ok(!/\.at\(/.test(src), 'app.js contains an .at( call');
+
+    // ---- review fixes: sides the app changed itself are not an untouched default ----
+    const FOUR_POSITIONS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2', 'D1', 'D2'];
+    const mkFour = () => ({ id: 7, artist: 'A', title: 'T', tracks: FOUR_POSITIONS.map(position => T(position, '')) });
+    const fiveTracks = () => [0, 1, 2, 3, 4].map(n => ({ number: n + 1, start: n * 100, end: n * 100 + 99, duration: 99 }));
+    // Default [A,B] (another file holds C/D); a custom C9 on row 5 makes the app add side C itself
+    app = mk(mkFour(), ['A', 'B']);
+    app.suggestedSides = ['A', 'B']; app.sidesSuggestionReason = 'default';
+    app.currentFile = { id: 'f1', filename: 'one.wav', duration: 990, musicDuration: 960 };
+    app.detectedTracks = fiveTracks();
+    app.resetMappingToTargets();
+    assert.ok(!app.addCustomTrack(4, 'C9', 'Extra'));
+    assert.deepStrictEqual([...app.selectedSides], ['A', 'B', 'C']);
+    const mappingWithCustom = [...app.customMapping];
+    app.donors = { releaseId: 7, status: 'done', checked: 1, budget: 12, list: [placed({ lengths: { '0': '4:00', '1': '4:00' } }, FOUR_POSITIONS)], error: '' };
+    app.applyDonor(app.donors.list[0]);
+    assert.deepStrictEqual([...app.selectedSides], ['A', 'B', 'C'], 'the side the app added is kept: the selection no longer equals the suggestion');
+    assert.deepStrictEqual([...app.customMapping], mappingWithCustom, 'row 5 stays on the custom track');
+
+    // A workspace saved before sidesTouched existed: hand-picked sides must not read as untouched
+    const legacyState = () => {
+        const a = pickLp();
+        a.applyPreset(['A']);
+        a.suggestedSides = ['A', 'B']; a.sidesSuggestionReason = 'default';
+        a.detectedTracks = eightTracks();
+        a.resetMappingToTargets(); a.reverseMapping();
+        a.saveWorkspace();
+        const state = JSON.parse(JSON.stringify(a.workspaces.f1));
+        delete state.sidesTouched;
+        return { a, state };
+    };
+    {
+        const { a, state } = legacyState();
+        const loaded = a.upgradeWorkspaceState(state);
+        assert.strictEqual(loaded.sidesTouched, true, 'selected sides differ from the suggestion: the user picked them');
+        const untouched = { ...state, selectedSides: ['A', 'B'] };
+        assert.strictEqual(a.upgradeWorkspaceState(untouched).sidesTouched, false);
+        assert.strictEqual(a.upgradeWorkspaceState({ ...state, sidesTouched: false }).sidesTouched, false, 'a saved value is kept');
+    }
+
+    // Re-analysis Undo restores the suggestion reason and the by-length flag too
+    app = pickLp();
+    app.sidesSuggestionReason = 'length'; app.sidesMatchedByDuration = true;
+    app.analyzeFile = async () => { app.detectedTracks = [{ number: 1, start: 0, end: 100, duration: 100 }]; };
+    app.initWaveform = async () => {};
+    app.destroyWaveform = () => {};
+    app.pauseWaveform = () => {};
+    await app.reanalyzeFile();
+    app.sidesSuggestionReason = ''; app.sidesMatchedByDuration = false;
+    clickUndo(app);
+    await settle();
+    assert.deepStrictEqual([app.sidesSuggestionReason, app.sidesMatchedByDuration], ['length', true]);
+
+    // Undo must not restore the mapping onto a re-detected array of EQUAL length (identity, not just count)
+    global.fetch = async (url, options) => trackReply(JSON.parse(options.body).expected_tracks);
+    app = mk(mkLp(), [], { realRedetect: true });
+    app.currentFile = { id: 'f1', filename: 'one.wav', duration: 990, musicDuration: 960 };
+    app.$refs = {};
+    app.loadAlbumDescription = () => {};
+    app.initWaveform = async () => {};
+    app.applyScan = () => {};
+    app.selectRelease(app.selectedRelease);
+    await settle();
+    app.setDetectedTracks(eightTracks().slice(0, 4));   // 4 detected against 8 targets: mismatched
+    app.resetMappingToTargets();
+    app.reverseMapping();
+    assert.deepStrictEqual([...app.customMapping], [3, 2, 1, 0]);
+    lpDonors(app);
+    app.applyDonor(lpDonor());
+    await settle();   // re-detection for side A also gives 4 tracks, a new array
+    assert.strictEqual(app.detectedTracks.length, 4);
+    app.markEdited();   // Undo then only asks (banner) instead of re-detecting: the 4 tracks stay
+    clickUndo(app);
+    await settle();
+    assert.deepStrictEqual([...app.selectedSides], ['A', 'B']);
+    assert.deepStrictEqual([...app.customMapping], [0, 1, 2, 3], 'reset for the tracks that exist, not the old reversed mapping');
+    assert.strictEqual(app.trackMappingReversed, false);
+
+    // The borrow's Undo saves the restored sides with the workspace
+    app = pickLp();
+    lpDonors(app);
+    app.applyDonor(lpDonor());
+    app.saveWorkspace();
+    assert.deepStrictEqual([...app.workspaces.f1.selectedSides], ['A']);
+    clickUndo(app);
+    assert.deepStrictEqual([...app.workspaces.f1.selectedSides], ['A', 'B'], 'the restored sides were remembered');
+
     // ---- markup: the button, the list and the note exist, with focus styling on the buttons ----
     const html = fs.readFileSync(path.join(__dirname, '..', '..', 'backend', 'static', 'index.html'), 'utf8');
     const section = html.slice(html.indexOf('id="borrow-lengths"'), html.indexOf('<!-- Side selection'));
@@ -326,6 +711,8 @@ const lastToast = app => app.toasts[app.toasts.length - 1];
     assert.ok(section.includes('in visibleDonors'), 'the list shows the recomputed donors');
     assert.strictEqual((section.match(/focus-visible:ring-2/g) || []).length, 2, 'both buttons show a focus ring');
     assert.ok(html.includes('Lengths borrowed from'));
+    assert.ok(section.includes('donorDisagreeText(donor)') && section.includes('donorEmptyText'), 'the disagreement note and the empty message are rendered');
+    assert.ok(section.includes('text-xs text-secondary" x-text="donorDisagreeText'), 'the note uses the card\'s muted text class');
     assert.ok(!section.includes('matched`'), 'the list no longer claims "N/M matched"');
     // White on the amber #E5A100 is 2.1:1; the new button uses dark text (about 9:1)
     const useButton = section.slice(section.indexOf('<button type="button" @click="applyDonor'), section.indexOf('Use these lengths'));

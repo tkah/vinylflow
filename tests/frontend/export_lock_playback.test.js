@@ -53,7 +53,8 @@ const describe = control => `<${control.tag}${control.attrs.slice(0, 140)}…>`;
 
 // Playback only: they play, pause, seek or switch what is heard, and never change the export.
 const PLAYBACK = [/@click="toggleTrackPlay\(/, /@click="auditionCut\(/, /@click="togglePlay\(\)"/,
-    /@click="abToggle\(\)"/, /@click="abSetSide\(/, /@input="abSeek\(/, /x-model="abMatch"/, /x-model="abBoost"/];
+    /@click="abToggle\(\)"/, /@click="abSetSide\(/, /@input="abSeek\(/, /x-model="abMatch"/, /x-model="abBoost"/,
+    /@input="setPlayerVolume\(/];
 const isPlayback = control => PLAYBACK.some(pattern => pattern.test(control.attrs));
 for (const pattern of PLAYBACK) {
     assert.ok(all.some(control => pattern.test(control.attrs)), `playback control ${pattern} not found in index.html`);
