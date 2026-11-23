@@ -22,17 +22,21 @@ function mkApp(tracks) {
 }
 const ends = app => app.detectedTracks.map(t => [t.start, t.end]);
 
-// ---- plain edits still work, with the fork's neighbour semantics (gaps kept, overlaps push) ----
+// ---- plain edits still work: touching cuts move together, a real gap stays, overlaps push ----
 let app = mkApp([track(1, 10, 100), track(2, 100, 200)]);
 app.updateTrackStart(1, '104');
-assert.deepStrictEqual(ends(app), [[10, 100], [104, 200]]);
+assert.deepStrictEqual(ends(app), [[10, 104], [104, 200]], 'touching cuts move together');
 app.updateTrackStart(1, '95');
 assert.deepStrictEqual(ends(app), [[10, 95], [95, 200]], 'overlapping the previous track pushes its end back');
 app = mkApp([track(1, 10, 100), track(2, 100, 200)]);
 app.updateTrackEnd(0, '120');
 assert.deepStrictEqual(ends(app), [[10, 120], [120, 200]]);
 app.updateTrackEnd(0, '90');
-assert.deepStrictEqual(ends(app), [[10, 90], [120, 200]], 'shortening leaves a gap');
+assert.deepStrictEqual(ends(app), [[10, 90], [90, 200]], 'touching cuts move together when shortening');
+// A real gap that already existed stays a gap
+app = mkApp([track(1, 10, 100), track(2, 105, 200)]);
+app.updateTrackEnd(0, '90');
+assert.deepStrictEqual(ends(app), [[10, 90], [105, 200]], 'shortening leaves an existing gap');
 
 // ---- nonsense changes nothing and says nothing ----
 app = mkApp([track(1, 10, 100), track(2, 100, 200)]);

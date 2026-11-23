@@ -17,6 +17,25 @@ const TRACK_COLORS = [
 const IGNORED_TRACK_COLOR = 'rgba(120, 120, 120, 0.15)';
 // Shortest track a drag / inline edit may produce (seconds)
 const MIN_TRACK_LENGTH = 1;
+// Cuts closer than this are "touching": the neighbour follows when a shared cut moves (seconds)
+const TOUCHING_CUTS_S = 0.05;
+// "3.45" typed as a length: seconds by our parser, but almost always meant as m:ss
+const MINUTES_DOT_SECONDS_PATTERN = /^\d{1,2}\.\d{2}$/;
+// ... offered as m:ss only while its seconds are below this
+const SECONDS_PER_MINUTE = 60;
+// A dragged region that ends further than this from the requested edge was clamped (seconds)
+const REGION_CLAMP_TOLERANCE_S = 0.01;
+// Focused elements that use Space themselves: the global Play/Pause shortcut leaves them alone.
+// A BUTTON is not in the set: it keeps Space only when keyboard-focused (see onGlobalKeydown).
+const SPACE_OWNING_TAGS = new Set(['INPUT', 'SELECT', 'TEXTAREA', 'SUMMARY']);
+// Set once the document listeners exist (init() runs twice on the page)
+let globalListenersBound = false;
+// A failed peaks request with one of these statuses means the server refuses the source itself
+// (imported file gone / changed), so the audio URL would be refused the same way: no fallback player.
+const SOURCE_REFUSED_STATUSES = new Set([409, 410]);
+// Where the player volume (0-1) is remembered between sessions
+const PLAYER_VOLUME_STORAGE_KEY = 'vinylflow.playerVolume.v1';
+const DEFAULT_PLAYER_VOLUME = 1;
 // Dashed ghost markers on the waveform: where the Discogs lengths expect each break (not draggable).
 // Opaque #9C2418; contrast (WCAG): 7.4:1 on the card (#FAF9F6), 5.1:1 at worst on a 30 % region tint
 // over the card, and 3.3:1 at worst over a region tint on the unplayed bars (#93C5FD), so 3:1 for
@@ -47,7 +66,8 @@ const DONOR_FETCH_BUDGET = 12;
 const RELEASE_CHANGED_NOTICE = 'This can no longer be undone: the release was edited or the recording was reopened since.';
 // Additional workspace fields are optional when reading saves made before Plan 05.
 const WORKSPACE_ADDITIONS = { searchResults: [], onlyWithLengths: false, detailsSettled: false, currentZoom: 50,
-    searchedQuery: '', searchPage: 0, searchHasMore: false, prefixPartTitles: true, titleSource: null };
+    searchedQuery: '', searchPage: 0, searchHasMore: false, prefixPartTitles: true, titleSource: null,
+    sidesTouched: false };
 // The "number after /release/" help line shows for this many recordings, then only after a failed lookup.
 const RELEASE_ID_HELP_STORAGE_KEY = 'vinylflow.releaseIdHelp.v1';
 const RELEASE_ID_HELP_MAX_RECORDINGS = 5;
@@ -248,16 +268,33 @@ function newSearchCard(result) {
     return { ...result, tracks: result.tracks ?? null, detailStatus: 'pending', opening: false };
 }
 
+// The share of peaks that must fit under full height: the 99.9th percentile, so a needle-drop thump
+// or a few clicks (single loud 10 ms bins) do not make the music of a quiet side look low.
+const PEAK_SCALE_PERCENTILE = 0.999;
+// ...but never below this share of the loudest bin: a recording that is mostly digital silence has a
+// ~0 percentile, which would stretch its few real peaks into a solid block.
+const PEAK_SCALE_FLOOR_FRACTION = 1 / 8;
+
+// A failed preview that the server is still preparing is polled this often, for at most this long
+// (the encode of even a long album takes well under it), before the notice is left as it is.
+const PREVIEW_POLL_INTERVAL_MS = 3000;
+const PREVIEW_POLL_MAX_MS = 10 * 60 * 1000;
+
 /**
- * Scale waveform peaks so the recording's loudest peak is full height. Replaces WaveSurfer's
- * `normalize`, which scales each rendered canvas (one per screen width when zoomed) to its own
- * loudest bar and so stretches the surface noise of a gap to full height. A loop, not
- * Math.max(...peaks): an album has hundreds of thousands of peaks.
+ * Scale waveform peaks so the recording's 99.9th-percentile peak is full height (louder bins clip
+ * at +-1). Replaces WaveSurfer's `normalize`, which scales each rendered canvas (one per screen
+ * width when zoomed) to its own loudest bar and so stretches the surface noise of a gap to full
+ * height. The reference is found by sorting one Float64Array copy (an album has ~1.4 M peaks), not
+ * Math.max(...peaks), whose arguments would overflow the stack.
  */
 function scalePeaksToRecording(peaks) {
-    let loudest = 0;
-    for (const peak of peaks) loudest = Math.max(loudest, Math.abs(peak));
-    return loudest > 0 ? peaks.map(peak => peak / loudest) : peaks;
+    if (!peaks.length) return peaks;
+    const magnitudes = Float64Array.from(peaks, peak => Math.abs(peak));
+    magnitudes.sort();
+    const percentile = magnitudes[Math.ceil(PEAK_SCALE_PERCENTILE * magnitudes.length) - 1];
+    const reference = Math.max(percentile, magnitudes[magnitudes.length - 1] * PEAK_SCALE_FLOOR_FRACTION);
+    if (!(reference > 0)) return peaks;
+    return peaks.map(peak => Math.max(-1, Math.min(1, peak / reference)));
 }
 
 // Density strip: a thin canvas overlaid on the bottom of the waveform wrapper.
@@ -275,6 +312,18 @@ const MEDIA_ERROR_MESSAGES = {
     3: 'the audio could not be decoded',
     4: 'the audio format is not supported',
 };
+
+/** The remembered player volume, or the default when it is missing, invalid or storage is unavailable */
+function readStoredPlayerVolume() {
+    try {
+        const stored = localStorage.getItem(PLAYER_VOLUME_STORAGE_KEY);
+        if (stored === null || String(stored).trim() === '') return DEFAULT_PLAYER_VOLUME;
+        const volume = Number(stored);
+        return Number.isFinite(volume) && volume >= 0 && volume <= 1 ? volume : DEFAULT_PLAYER_VOLUME;
+    } catch (error) {
+        return DEFAULT_PLAYER_VOLUME;
+    }
+}
 
 function vinylApp() {
     return {
@@ -332,10 +381,16 @@ function vinylApp() {
         _waveScroller: null,
         _pendingSeek: null,
         _auditionStop: null,   // one-shot stop time (s) for cut-point auditions
-        _regionDownX: null,
-        _spaceToggled: false,  // space toggled playback; swallow the matching keyup
+        playerVolume: readStoredPlayerVolume(),   // 0-1, shared by the waveform and the fallback player
+        fallbackAudioUrl: '',   // plain <audio> source while the waveform could not be built
+        _spaceClaimedByPlayer: false,   // the last Space keydown toggled playback: cancel its keyup too
+        // How the focused element got its focus.  Changes on every pointerdown and is read by no
+        // template, so it lives in a markRaw holder: no reactive writes, no re-render.
+        _pointerFocus: markRaw({ pending: false, byPointer: false, lastFocusIn: null, lastFocused: null }),
         waveform: null,
         waveformLoading: false,
+        previewPollIntervalMs: PREVIEW_POLL_INTERVAL_MS,   // instance fields so tests can shorten them
+        previewPollMaxMs: PREVIEW_POLL_MAX_MS,
         waveformRegions: null,
         currentZoom: 50,
         prefixPartTitles: true,   // title split index-track parts "Work: Part" in tags/filenames and the UI
@@ -376,8 +431,9 @@ function vinylApp() {
         suggestedSides: [],       // Sides auto-picked when the release was selected
         sidesMatchedByDuration: false,
         sidesSuggestionReason: '',   // 'length' | 'default' | 'single' | '' (how suggestedSides was chosen)
+        sidesTouched: false,         // The user picked sides (chip or preset) since the release was selected
         // Borrow track lengths from another pressing (state for the selected release only)
-        donors: { releaseId: null, status: 'idle', checked: 0, budget: DONOR_FETCH_BUDGET, list: [], error: '' },
+        donors: { releaseId: null, status: 'idle', checked: 0, versions: null, budget: DONOR_FETCH_BUDGET, list: [], error: '' },
         _donorSeq: 0,             // Guards against stale length-donor responses
         _movementsSeq: 0,         // Guards against stale side-split measurements
         titleSource: null,        // movements borrowed from another release (workspace field; sent as title_source on export)
@@ -514,6 +570,24 @@ function vinylApp() {
         setupUserAgent: 'VinylFlow/1.0',
 
         /**
+         * Document-level listeners for the Space shortcut and its pointer-focus tracking.  The page
+         * calls init() twice (Alpine runs it, and index.html also has x-init="init()"), so they are
+         * bound once per page.  The handlers stay safe if they ever run twice for one event.
+         */
+        bindGlobalListeners() {
+            if (globalListenersBound) return;
+            globalListenersBound = true;
+            // Space toggles waveform play/pause
+            document.addEventListener('keydown', (e) => this.onGlobalKeydown(e));
+            document.addEventListener('keyup', (e) => this.onGlobalKeyup(e));
+            // Capture phase, so no handler that stops propagation hides how focus arrived
+            document.addEventListener('pointerdown', (e) => this.onPointerDown(e), true);
+            document.addEventListener('pointerup', () => this.onPointerUp(), true);
+            document.addEventListener('pointercancel', () => this.onPointerCancel(), true);
+            document.addEventListener('focusin', (e) => this.onFocusIn(e), true);
+        },
+
+        /**
          * Initialize the application
          */
         async init() {
@@ -525,9 +599,7 @@ function vinylApp() {
             // handler fires) is the only reliable way to stop it.
             document.addEventListener('contextmenu', e => e.preventDefault(), true);
 
-            // Space bar toggles waveform play/pause
-            document.addEventListener('keydown', (e) => this.onGlobalKeydown(e));
-            document.addEventListener('keyup', (e) => this.onGlobalKeyup(e));
+            this.bindGlobalListeners();
 
             // Files removed from the queue are deleted server-side after an
             // undo window; flush them if the page goes away first.
@@ -780,7 +852,7 @@ function vinylApp() {
                 const entries = saved?.version === WORKSPACE_VERSION && saved.workspaces
                     ? Object.entries(saved.workspaces) : [];
                 this.workspaces = Object.fromEntries(entries
-                    .map(([id, state]) => [id, { ...WORKSPACE_ADDITIONS, ...state }])
+                    .map(([id, state]) => [id, this.upgradeWorkspaceState(state)])
                     .filter(([id, state]) => liveIds.has(id) && this.validWorkspace(state)));
                 for (const file of this.uploadedFiles) {
                     const state = this.workspaces[file.id];
@@ -818,6 +890,19 @@ function vinylApp() {
             } catch (error) {
                 this.workspaceNotice = 'Could not check saved work. Reload when the server is available to recover it.';
             }
+        },
+
+        /**
+         * Fill the fields a save made before they existed lacks.  `sidesTouched` is derived: sides
+         * that differ from the suggestion were picked by the user (a borrow must not re-suggest them).
+         */
+        upgradeWorkspaceState(state) {
+            const upgraded = { ...WORKSPACE_ADDITIONS, ...state };
+            if (!('sidesTouched' in (state || {})) && Array.isArray(state?.selectedSides) && Array.isArray(state?.suggestedSides)) {
+                upgraded.sidesTouched = state.selectedSides.length !== state.suggestedSides.length
+                    || !state.selectedSides.every(side => state.suggestedSides.includes(side));
+            }
+            return upgraded;
         },
 
         /** Reject malformed state before assigning it to the Alpine editing model. */
@@ -1986,6 +2071,9 @@ function vinylApp() {
             this.saveWorkspace();
             this.abReset();
             this.releaseIdLoading = false;   // a lookup for the previous recording is dropped on arrival
+            // Before the id changes: a waveform (or fallback player) of the old recording must never
+            // be seen under the new id
+            this.destroyWaveform();
             this.currentFileId = fileId;
             this.currentFile = this.uploadedFiles.find(f => f.id === fileId);
             if (this.currentFile && !(this.currentFile.musicDuration > 0)) {
@@ -2008,6 +2096,7 @@ function vinylApp() {
             this.suggestedSides = [];
             this.sidesMatchedByDuration = false;
             this.sidesSuggestionReason = '';
+            this.sidesTouched = false;
             this.customMapping = [];
             this.trackCountMismatch = false;
             this.releaseIdNotice = '';
@@ -2019,8 +2108,6 @@ function vinylApp() {
             this.successMessage = '';
             this.processingProgress = 0;
             this.processingMessage = '';
-
-            this.destroyWaveform();
 
             const restored = this.restoreWorkspace(fileId);
             const viewed = this.currentFile;
@@ -2266,6 +2353,9 @@ function vinylApp() {
             snapshot.selectedRelease = this.selectedRelease;
             snapshot.selectedSides = [...this.selectedSides];
             snapshot.suggestedSides = [...this.suggestedSides];
+            snapshot.sidesTouched = this.sidesTouched;
+            snapshot.sidesSuggestionReason = this.sidesSuggestionReason;
+            snapshot.sidesMatchedByDuration = this.sidesMatchedByDuration;
             snapshot.status = this.currentFile?.status;
 
             this.detectedTracks = [];
@@ -2274,6 +2364,7 @@ function vinylApp() {
             this._pendingPickId = null;   // a card still loading must not bring a release back
             this.resetDonors();
             this.selectedSides = [];
+            this.sidesTouched = false;
             this.trackMappingReversed = false;
             this.customMapping = [];
 
@@ -2305,6 +2396,9 @@ function vinylApp() {
             this.resetDonors();
             this.selectedSides = snap.selectedSides;
             this.suggestedSides = snap.suggestedSides;
+            this.sidesTouched = !!snap.sidesTouched;
+            this.sidesSuggestionReason = snap.sidesSuggestionReason ?? this.sidesSuggestionReason;
+            this.sidesMatchedByDuration = snap.sidesMatchedByDuration ?? this.sidesMatchedByDuration;
             this.trackCountMismatch = !!this.selectedRelease &&
                 this.activeTrackCount !== this.targetTracks.length;
             if (this.currentFile && snap.status) this.currentFile.status = snap.status;
@@ -3057,6 +3151,7 @@ function vinylApp() {
         applyPreset(sides) {
             if (this.analyzing || this.currentLocked) return;
             this.selectedSides = this.sideChips.map(g => g.side).filter(k => sides.includes(k));
+            this.sidesTouched = true;   // even a pick equal to the default is the user's own choice
             this.rememberChoice();
             this.resetMappingToTargets();
             this.afterTargetsChanged();
@@ -3249,6 +3344,19 @@ function vinylApp() {
             this.titleSource = null;       // borrowed movements belong to the previous release
             this.closeMovementsPanel();
             this.resetDonors();
+            this.applySideSuggestion(release);
+            this.rememberChoice();
+
+            this.resetMappingToTargets();
+            this.afterTargetsChanged();
+        },
+
+        /**
+         * Pick the sides this recording most likely holds (by its length, else the sides the other
+         * files leave free) for `release` and select them.  A suggestion is not a user choice, so
+         * `sidesTouched` starts over.
+         */
+        applySideSuggestion(release) {
             const suggestion = this.suggestSides(
                 release,
                 this.currentFile?.musicDuration || this.currentFile?.duration,
@@ -3258,10 +3366,7 @@ function vinylApp() {
             this.suggestedSides = suggestion.sides;
             this.sidesMatchedByDuration = suggestion.matched;
             this.sidesSuggestionReason = suggestion.reason;
-            this.rememberChoice();
-
-            this.resetMappingToTargets();
-            this.afterTargetsChanged();
+            this.sidesTouched = false;
         },
 
         /** True when the loaded description belongs to the release now selected and is worth showing. */
@@ -3322,6 +3427,7 @@ function vinylApp() {
                 : [...this.selectedSides, side];
             // Keep release order regardless of click order
             this.selectedSides = this.sideChips.map(g => g.side).filter(s => wanted.includes(s));
+            this.sidesTouched = true;
             this.rememberChoice();
 
             this.resetMappingToTargets();
@@ -3480,7 +3586,7 @@ function vinylApp() {
         /** Forget donor search results / in-flight search (release or file changed) */
         resetDonors() {
             this._donorSeq++;
-            this.donors = { releaseId: null, status: 'idle', checked: 0, budget: DONOR_FETCH_BUDGET, list: [], error: '' };
+            this.donors = { releaseId: null, status: 'idle', checked: 0, versions: null, budget: DONOR_FETCH_BUDGET, list: [], error: '' };
         },
 
         /** Lengths coverage of the selected sides only */
@@ -3528,14 +3634,42 @@ function vinylApp() {
             const missingIndexes = new Set(this.targetTracks
                 .filter(track => this.parseTrackDuration(track.duration) === null)
                 .map(track => track.releaseIdx));
+            const chosenIndexes = new Set(this.targetTracks.map(track => track.releaseIdx));
             return this.donors.list
                 .map((donor, order) => {
                     const matched = this.donorFills(donor).filter(fill => missingIndexes.has(fill.index)).length;
-                    return { donor: { ...donor, matched, missing: missingIndexes.size }, order };
+                    return {
+                        donor: {
+                            ...donor, matched, missing: missingIndexes.size,
+                            compared: this.donorPlacedCount(donor, donor.compared_indexes, chosenIndexes, donor.compared),
+                            disagree: this.donorPlacedCount(donor, donor.disagree_indexes, chosenIndexes, donor.disagree)
+                        },
+                        order
+                    };
                 })
                 .filter(entry => entry.donor.matched > 0)
-                .sort((a, b) => b.donor.matched - a.donor.matched || a.order - b.order)
+                // Donors whose lengths agree with the release's own come first, by the `disagree` count
+                // recounted above for the chosen sides (only the server knows the lengths of tracks the
+                // release already has, so it sends which tracks it compared); then most fills
+                .sort((a, b) => (a.donor.disagree > 0) - (b.donor.disagree > 0)
+                    || b.donor.matched - a.donor.matched || a.order - b.order)
                 .map(entry => entry.donor);
+        },
+
+        /**
+         * How many of the tracks a donor's index list names (server track indexes, as the keys of
+         * `lengths`) are on the chosen sides.  Each is placed by Discogs position through
+         * `donorTrackIndex` exactly like a length; one that cannot be placed (split part, custom or
+         * borrowed-title track, unknown position) is skipped.  Without the list (an older reply),
+         * the server's own total.
+         */
+        donorPlacedCount(donor, indexes, chosenIndexes, total) {
+            if (!Array.isArray(indexes)) return total;
+            return indexes.filter(key => {
+                const position = donor.positions?.[key];
+                if (position === undefined || position === null) return false;
+                return chosenIndexes.has(this.donorTrackIndex(position, key));
+            }).length;
         },
 
         /**
@@ -3591,6 +3725,22 @@ function vinylApp() {
             return `fills ${donor.matched} of ${donor.missing} missing`;
         },
 
+        /** Muted note on a donor whose lengths differ from the ones this release already has; '' when none do */
+        donorDisagreeText(donor) {
+            if (!(donor?.disagree > 0)) return '';
+            return `Lengths differ from this release on ${donor.disagree} of ${donor.compared} track${donor.compared === 1 ? '' : 's'}`;
+        },
+
+        /** Said when no pressing fills anything: how far the lookup got, so a spent budget is visible */
+        get donorEmptyText() {
+            const checked = this.donors.checked;
+            if (!(checked > 0)) return 'No other pressing has the missing lengths.';
+            const of = this.donors.versions > checked ? ` (of ${this.donors.versions})` : '';
+            return checked === 1
+                ? `The 1 other pressing checked${of} doesn't have the missing lengths.`
+                : `No other pressing has the missing lengths among the ${checked} checked${of}.`;
+        },
+
         borrowedLabel(borrowed) {
             const parts = [borrowed?.label, borrowed?.year, borrowed?.country]
                 .filter(part => part !== undefined && part !== null && part !== '');
@@ -3616,7 +3766,7 @@ function vinylApp() {
             }
             const sequence = ++this._donorSeq;
             this.donors = {
-                releaseId: release.id, status: 'searching', checked: 0, budget: DONOR_FETCH_BUDGET, list: [], error: ''
+                releaseId: release.id, status: 'searching', checked: 0, versions: null, budget: DONOR_FETCH_BUDGET, list: [], error: ''
             };
             try {
                 const response = await fetch(`/api/release/${release.id}/length-donors`);
@@ -3626,7 +3776,10 @@ function vinylApp() {
                 if (sequence !== this._donorSeq) return;
                 if (!response.ok) throw new Error((body && body.detail) || 'Could not look for other pressings.');
                 this.donors = {
-                    ...this.donors, status: 'done', list: Array.isArray(body?.donors) ? body.donors : []
+                    ...this.donors, status: 'done', list: Array.isArray(body?.donors) ? body.donors : [],
+                    // The reply's own counts replace the live progress ones: what was examined, of how many
+                    checked: Number.isFinite(body?.checked) ? body.checked : this.donors.checked,
+                    versions: Number.isFinite(body?.versions) ? body.versions : null
                 };
             } catch (error) {
                 if (sequence !== this._donorSeq) return;
@@ -3676,10 +3829,35 @@ function vinylApp() {
             const borrowed = { release_id: donor.release_id, label: donor.label, year: donor.year, country: donor.country };
             const edited = { ...release, tracks, lengthsBorrowedFrom: [...this.lengthsBorrowedFrom, borrowed] };
             const fileId = this.currentFileId;
+            // Without lengths the sides were only defaulted (full album, or the sides other files leave
+            // free).  Now that lengths exist the length fit can pick the real side, unless the user chose
+            // sides since (even the very ones that were the default): that is theirs.  The mapping depends
+            // on the sides, so what Undo needs of it is captured too.
+            // The selection must also still equal the suggestion: the app itself adds or drops sides
+            // (a custom track on another side, a split) without the user picking any.
+            const resuggest = !this.sidesTouched && this.sidesSuggestionReason === 'default'
+                && this.sidesEqualSelection(this.suggestedSides);
+            const previous = {
+                sides: [...this.selectedSides], suggested: [...this.suggestedSides],
+                matched: this.sidesMatchedByDuration, reason: this.sidesSuggestionReason,
+                mapping: [...this.customMapping], reversed: this.trackMappingReversed,
+                mismatch: this.trackCountMismatch,
+                // The tracks that mapping describes: the borrow's own re-detection may replace them
+                tracks: this.detectedTracks, trackCount: this.detectedTracks.length
+            };
             this.selectedRelease = edited;
             const installed = this.selectedRelease;   // as read back (Alpine's proxy), like the other release undos
             this.resetDonors();
-            this.afterTargetsChanged();
+            let sidesChanged = false;
+            if (resuggest) {
+                this.applySideSuggestion(edited);
+                sidesChanged = !this.sidesEqualSelection(previous.sides);
+                // Hand-made mapping stays while the sides do
+                if (sidesChanged) this.resetMappingToTargets();
+                this.rememberChoice();
+            }
+            const resuggestedSides = [...this.selectedSides];
+            this.afterTargetsChanged();   // once, with the new sides
 
             this.notifyUndo(`Borrowed ${filled} track length${filled === 1 ? '' : 's'} from ${this.borrowedLabel(borrowed)}.`, () => {
                 // Any later change of the release (another pick, a custom or renamed track, a split, a title
@@ -3690,6 +3868,28 @@ function vinylApp() {
                 }
                 this.selectedRelease = release;
                 this.resetDonors();
+                if (resuggest) {
+                    // The suggestion belongs to the release's lengths, which are gone again
+                    this.suggestedSides = previous.suggested;
+                    this.sidesMatchedByDuration = previous.matched;
+                    this.sidesSuggestionReason = previous.reason;
+                    // The sides (and what depends on them) only if the borrow changed them and the user
+                    // has not picked sides since, even the very ones the borrow chose
+                    if (sidesChanged && !this.sidesTouched && this.sidesEqualSelection(resuggestedSides)) {
+                        this.selectedSides = previous.sides;
+                        if (this.detectedTracks === previous.tracks && this.detectedTracks.length === previous.trackCount) {
+                            this.customMapping = previous.mapping;
+                            this.trackMappingReversed = previous.reversed;
+                            this.trackCountMismatch = previous.mismatch;
+                        } else {
+                            // Re-detection, a delete, a split or a workspace restore (which installs a copy of
+                            // the tracks) replaced the array: the saved mapping describes other tracks, so it
+                            // is reset, never kept.  The length check is defence for an in-place splice.
+                            this.resetMappingToTargets();
+                        }
+                    }
+                    this.rememberChoice();
+                }
                 this.afterTargetsChanged();
             }, { fileId, type: 'success' });
         },
@@ -4130,6 +4330,7 @@ function vinylApp() {
             this.trackForm = null;
             this.resetDonors();
             this.selectedSides = [];
+            this.sidesTouched = false;
             this.trackMappingReversed = false;
             this.trackCountMismatch = false;
             this.editBanner = false;
@@ -4619,6 +4820,10 @@ function vinylApp() {
         applyTypedBounds(idx, which, value, input) {
             const track = this.detectedTracks[idx];
             if (!track) return false;
+            if (this.currentLocked) {   // the fields are disabled too, but a stale event must not edit a locked recording
+                if (input) input.value = track[which];
+                return false;
+            }
             const typed = parseFloat(value);
             let changed = false;
             if (!isNaN(typed) && typed >= 0) {
@@ -4660,23 +4865,55 @@ function vinylApp() {
 
         /**
          * Typed length (e.g. from a streaming service): keep the start, end = start + length.
-         * A next track that began exactly at the old end follows the cut, so nothing falls
-         * between them.  A length that would collapse the track or squeeze a neighbour under
-         * MIN_TRACK_LENGTH is refused (typedBoundsProblem); one past the recording's end is
-         * capped there, and the notice says so.
+         * A next track that began exactly at the old end follows the cut (applyTrackBounds), so
+         * nothing falls between them.  A length that would collapse the track or squeeze a neighbour
+         * under MIN_TRACK_LENGTH is refused (typedBoundsProblem); one past the recording's end is
+         * capped there, and the notice says so.  A plain "3.45" is refused too: it reads as 3.45 s
+         * but is usually meant as 3:45.
          */
         setTrackLength(idx, text, input = null) {
             const track = this.detectedTracks[idx];
             if (!track) return false;
-            const length = this.parseLengthInput(text);
+            if (this.currentLocked) {   // the field is disabled too, but a stale event must not edit a locked recording
+                if (input) input.value = this.formatDuration(track.duration);
+                return false;
+            }
             const showLength = () => { if (input) input.value = this.formatDuration(track.duration); };
+            const typedText = String(text ?? '').trim();
+            if (MINUTES_DOT_SECONDS_PATTERN.test(typedText)) {
+                const [minutes, seconds] = typedText.split('.');
+                showLength();
+                if (Number(seconds) < SECONDS_PER_MINUTE) {
+                    const suggestion = `${parseInt(minutes, 10)}:${seconds}`;
+                    // The toast outlives the click: by then rows may have been deleted or the recording
+                    // switched or locked, so the action finds its track again and re-checks the file
+                    const fileId = this.currentFileId;
+                    const durationAtToast = track.duration;
+                    this.notify(`Type ${suggestion} for minutes and seconds.`, {
+                        type: 'warning',
+                        timeout: 8000,
+                        action: {
+                            label: `Use ${suggestion}`,
+                            fn: () => {
+                                if (this.currentFileId !== fileId || this.currentLocked) return;
+                                if (Math.abs(track.duration - durationAtToast) > 1e-6) return;   // retyped since
+                                const currentIdx = this.detectedTracks.indexOf(track);
+                                if (currentIdx >= 0) this.setTrackLength(currentIdx, suggestion, null);
+                            },
+                        },
+                    });
+                } else {
+                    // "3.75" cannot be m:ss either: refuse without offering a "3:75" that would fail
+                    this.notify('Type a length like 3:45 (minutes:seconds).', { type: 'warning', timeout: 4000 });
+                }
+                return false;
+            }
+            const length = this.parseLengthInput(text);
             if (!(length >= MIN_TRACK_LENGTH)) {
                 showLength();
                 this.notify('Type a length like 3:45 (minutes:seconds).', { type: 'warning', timeout: 4000 });
                 return false;
             }
-            const next = this.detectedTracks[idx + 1];
-            const touching = !!next && Math.abs(next.start - track.end) < 0.05;
             const newEnd = Math.min(track.start + length, this.recordingEnd());   // never past the recording
             const problem = this.typedBoundsProblem(idx, track.start, newEnd);
             if (problem) {
@@ -4685,10 +4922,6 @@ function vinylApp() {
                 return false;
             }
             const changed = this.applyTrackBounds(idx, track.start, newEnd);
-            if (changed && touching && track.end < next.start) {
-                next.start = track.end;
-                next.duration = next.end - next.start;
-            }
             if (changed) this.syncRegionsAround(idx);
             showLength();
             if (newEnd - track.start < length - 0.05) {
@@ -4698,9 +4931,15 @@ function vinylApp() {
         },
 
         /**
-         * Move track idx to [start, end].  Neighbours are only pushed when
-         * the regions would overlap (gaps are preserved); every track keeps
-         * at least MIN_TRACK_LENGTH.  Returns true when anything changed.
+         * Move track idx to [start, end].  Cuts that touch (guided detection makes them contiguous)
+         * move together: a next track that started at the old end follows the new end, a previous
+         * track that ended at the old start follows the new start, so no stretch of audio is left
+         * in no file.  A real gap stays a gap (a leftward end move makes it bigger); neighbours are
+         * otherwise only pushed when the regions would overlap.  Every track keeps at least
+         * MIN_TRACK_LENGTH (a neighbour that is already shorter stops the edit at its cut), a
+         * whole-region move keeps its length and shifts at the recording's end or a neighbour, and
+         * an edit that cannot fit is refused.  Returns true when anything changed (and then marks
+         * the boundaries hand-edited).
          */
         applyTrackBounds(idx, start, end) {
             const tracks = this.detectedTracks;
@@ -4715,13 +4954,18 @@ function vinylApp() {
             const endMoved = Math.abs(end - track.end) > EPS;
             if (!startMoved && !endMoved) return false;
 
+            // Neighbours that share a cut with this track, judged before anything moves
+            const nextFollows = !!next && Math.abs(next.start - track.end) < TOUCHING_CUTS_S;
+            const prevFollows = !!prev && Math.abs(prev.end - track.start) < TOUCHING_CUTS_S;
+
             // Never past the end of the recording (typed Start/End, Length and region updates all land here).
             // Where a neighbour is already shorter than MIN the edit stops at its cut (a neighbour
             // that short is left alone, not used to jump the edit backwards).
             const limit = this.recordingEnd();
             const endBound = next ? Math.max(next.start, next.end - MIN) : Infinity;
             const startBound = prev ? Math.min(prev.end, prev.start + MIN) : 0;
-            start = Math.max(0, start);
+            const requestedStart = start;
+            const requestedEnd = end;
             if (startMoved && endMoved) {
                 // Whole-region drag: keep the length, stop at the recording's end and the neighbours
                 const len = end - start;
@@ -4730,11 +4974,16 @@ function vinylApp() {
                 if (start < startBound) { start = startBound; end = start + len; }
                 if (start < 0) { end -= start; start = 0; }
             } else if (endMoved) {
-                end = Math.min(end, limit, endBound);
+                const lastEnd = Math.min(limit, endBound);
+                end = Math.min(end, lastEnd);
                 end = Math.max(end, start + MIN);
+                // The MIN floor must fit before the recording's end and the next cut, and a track that
+                // was already too short must not move against the drag to reach it
+                if (end > lastEnd + EPS || ((requestedEnd < track.end) !== (end < track.end) && end !== track.end)) return false;
             } else {
                 start = Math.max(start, startBound);
                 start = Math.min(start, end - MIN);
+                if (start < startBound - EPS || ((requestedStart > track.start) !== (start > track.start) && start !== track.start)) return false;
             }
 
             const valid = end - start >= MIN - EPS &&
@@ -4742,17 +4991,18 @@ function vinylApp() {
                 (!prev || start >= prev.end || start - prev.start >= MIN - EPS);
             if (!valid) return false;
 
-            const changed = Math.abs(start - track.start) > EPS || Math.abs(end - track.end) > EPS;
-            if (!changed) return false;
+            const endChanged = Math.abs(end - track.end) > EPS;
+            const startChanged = Math.abs(start - track.start) > EPS;
+            if (!endChanged && !startChanged) return false;
 
             track.start = start;
             track.end = end;
             track.duration = end - start;
-            if (next && end > next.start) {
+            if (next && ((nextFollows && endChanged) || end > next.start)) {
                 next.start = end;
                 next.duration = next.end - next.start;
             }
-            if (prev && start < prev.end) {
+            if (prev && ((prevFollows && startChanged) || start < prev.end)) {
                 prev.end = start;
                 prev.duration = prev.end - prev.start;
             }
@@ -4783,6 +5033,11 @@ function vinylApp() {
 
             this.waveformLoading = true;
             const fileId = this.currentFileId;
+            this.clearFallback();
+            // The waveform this build created.  Every await below can outlive the build (file switch,
+            // re-analysis, a newer build of the same file), and a stale one must touch nothing.
+            let built = null;
+            const isCurrentBuild = () => this.waveform === built && this.currentFileId === fileId;
 
             try {
                 if (typeof WaveSurfer === 'undefined') {
@@ -4795,6 +5050,14 @@ function vinylApp() {
 
                 if (this.waveform) {
                     this.waveform.destroy();
+                }
+
+                // After a failed build the container was hidden (the fallback player replaced it); WaveSurfer
+                // measures it when it is created, so wait for it to be shown again
+                const waveformContainer = typeof document !== 'undefined' ? document.getElementById?.('waveform') : null;
+                if (waveformContainer && waveformContainer.offsetParent === null && this.$nextTick) {
+                    await this.$nextTick();
+                    if (this.currentFileId !== fileId || this.waveform) return;   // switched away, or a newer build
                 }
 
                 // Default MediaElement backend: renders instantly from the
@@ -4818,6 +5081,7 @@ function vinylApp() {
                 }));
 
                 const waveform = this.waveform;
+                built = waveform;
                 let uiBound = false;
 
                 // With MediaElement + provided peaks, load() resolves without
@@ -4833,7 +5097,10 @@ function vinylApp() {
                     // A fallback in flight absorbs the twin of its own failure, whatever the code now says
                     if ((code === 3 || code === 4 || this.fallbackInFlight(waveform)) && this.fallBackToPreview(waveform, fileId)) return;
                     this.waveformLoading = false;
-                    this.showPlayerNotice('Audio playback error: ' + ((err && err.message) || err || MEDIA_ERROR_MESSAGES[code] || 'unknown'));
+                    const message = (err && err.message) || err || MEDIA_ERROR_MESSAGES[code] || 'unknown';
+                    // On the preview already: the server may be why (source gone, preview not ready)
+                    if (this._audioSource?.waveform === waveform && !this._audioSource.precise) this.explainPreviewFailure(waveform, fileId, message);
+                    else this.showPlayerNotice('Audio playback error: ' + message);
                 });
 
                 // Transport state follows the real player events
@@ -4851,10 +5118,13 @@ function vinylApp() {
                     this.seekTo(time);
                 });
                 const media = this.waveform.getMediaElement();
+                media.volume = this.playerVolume;
                 media.preload = 'metadata';   // stream on demand; 'auto' would buffer hundreds of MB of the original WAV on every rebuild
                 const mediaListeners = {
-                    // DECODE (3) / SRC_NOT_SUPPORTED (4) on the original WAV: retry once with the MP3 preview
+                    // A failed load never finishes buffering; DECODE (3) / SRC_NOT_SUPPORTED (4) on the
+                    // original WAV: retry once with the MP3 preview
                     error: () => {
+                        this.playerBuffering = false;
                         const code = media.error?.code;
                         if (code === 3 || code === 4) this.fallBackToPreview(waveform, fileId);
                     },
@@ -4876,15 +5146,17 @@ function vinylApp() {
                 this.guardRegionDragRelease(this.waveformRegions);
                 this.bindWaveScrollbar(waveform);
 
-                const peaksResponse = await fetch(`/api/waveform-peaks/${this.currentFileId}`);
-                if (waveform !== this.waveform) return;
+                const peaksResponse = await fetch(`/api/waveform-peaks/${fileId}`);
+                if (!isCurrentBuild()) return;
                 if (!peaksResponse.ok) {
                     // e.g. 409/410: an imported file changed or vanished; say which and what to do
                     const data = await peaksResponse.json().catch(() => ({}));
-                    throw new Error(data.detail || 'Failed to load waveform peaks');
+                    const failure = new Error(data.detail || 'Failed to load waveform peaks');
+                    failure.status = peaksResponse.status;
+                    throw failure;
                 }
                 const peaksData = await peaksResponse.json();
-                if (fileId !== this.currentFileId || waveform !== this.waveform) return;
+                if (!isCurrentBuild()) return;
 
                 this.waveform.on('ready', () => {
                     console.log('Waveform ready');
@@ -4934,7 +5206,8 @@ function vinylApp() {
                     }
 
                     setTimeout(() => {
-                        if (waveform !== this.waveform) return;
+                        // A re-detect or Undo within these 100 ms replaced this waveform
+                        if (!isCurrentBuild()) return;
                         this.addTrackRegions();
                         this.waveformLoading = false;
                     }, 100);
@@ -4986,7 +5259,6 @@ function vinylApp() {
                             }
                         };
 
-                        regionElement.addEventListener('mousedown', (e) => { this._regionDownX = e.clientX; });
                         regionElement.addEventListener('contextmenu', openRegionContextMenu);
                         regionElement.addEventListener('mousedown', openRegionContextMenu);
                     }
@@ -5010,8 +5282,19 @@ function vinylApp() {
                 // A fallback reload already took over this load's failure.
                 if (this._audioSource?.fellBack) return;
                 console.error('Waveform initialization failed:', error);
+                // A failure of a build that was replaced (another file, a newer waveform) concerns
+                // nothing on screen: no toast, no teardown, no fallback
+                if (!isCurrentBuild()) return;
                 this.notifyError('Failed to load waveform', error);
+                // A half-built waveform (created before the peaks request) would still answer Play and
+                // zoom, and could play beside the fallback: tear it down first.  destroyWaveform also
+                // clears fallbackAudioUrl and resets loading, so the fallback is set after it.
+                this.destroyWaveform();
                 this.waveformLoading = false;
+                if (SOURCE_REFUSED_STATUSES.has(error?.status)) return;   // the toast above carries the server's reason
+                // So the recording can still be heard: the preview URL, which every browser plays
+                this.fallbackAudioUrl = this.audioUrl(fileId, false);
+                this.$nextTick?.(() => this.applyPlayerVolume());
             }
         },
 
@@ -5182,10 +5465,19 @@ function vinylApp() {
             // The media element and WaveSurfer both report the same failure: absorb the twin while reloading.
             if (source.fellBack && !source.settled) return true;
             if (!source.precise) return false;
+            this.reloadPreview(waveform, fileId, source);
+            return true;
+        },
+
+        /**
+         * Load the MP3 preview into the waveform, keeping peaks, zoom, playhead and paused/playing
+         * state. Shared by the fallback from the WAV and the single retry once the server has the preview.
+         */
+        reloadPreview(waveform, fileId, source) {
             source.precise = false;
             source.fellBack = true;
             source.settled = false;
-            source.generation++;   // a play() started on the WAV is now stale
+            source.generation++;   // a play() started on the earlier source is now stale
             const resume = this.isPlaying;
             this.isPlaying = false;
             this.playerInfo = PREVIEW_AUDIO_NOTICE;
@@ -5195,15 +5487,65 @@ function vinylApp() {
             const stale = () => waveform !== this.waveform || fileId !== this.currentFileId;
             Promise.resolve(waveform.load(this.audioUrl(fileId, false), source.peaks, source.duration)).then(() => {
                 source.settled = true;
-                if (!stale() && resume) this.startPlayback();
+                if (stale()) return;
+                this.playerNotice = '';   // a retry after a failure: the preview plays now
+                if (resume) this.startPlayback();
             }, (err) => {
                 source.settled = true;
                 if (stale()) return;
                 console.error('Preview fallback failed:', err);
                 this.waveformLoading = false;
-                this.showPlayerNotice('Audio playback error: ' + ((err && err.message) || err || 'unknown'));
+                this.explainPreviewFailure(waveform, fileId, (err && err.message) || err || 'unknown');
             });
-            return true;
+        },
+
+        /**
+         * The preview could not be played either. Show the player's own message at once, then ask the
+         * server why with a ranged GET of the non-waiting probe form of the preview URL (`wait=0`, which
+         * never waits; it starts the encode only if none ran yet, and never re-runs a failed one):
+         *  - not ok: its `detail` replaces the message (410 source gone, 409 changed, 503 preview not
+         *    ready or not made). A 503 with Retry-After means "still being prepared": poll every
+         *    `previewPollIntervalMs`, up to `previewPollMaxMs`;
+         *  - ok: the preview is there now (the encode finished meanwhile): reload it, once per waveform,
+         *    so this never loops;
+         *  - the probe itself failing keeps the player's message.
+         * Stops silently when the file is switched, the waveform rebuilt or destroyed.
+         */
+        async explainPreviewFailure(waveform, fileId, fallbackMessage) {
+            const source = this._audioSource;
+            const stale = () => waveform !== this.waveform || fileId !== this.currentFileId || this._audioSource !== source;
+            if (!source || stale() || source.probing) return;
+            const show = (message) => { if (!stale()) this.showPlayerNotice('Audio playback error: ' + message); };
+            show(fallbackMessage);
+            source.probing = true;   // the error and its WaveSurfer twin must start one probe loop, not two
+            try {
+                const deadline = Date.now() + this.previewPollMaxMs;
+                for (;;) {
+                    let response;
+                    try {
+                        response = await fetch(this.audioUrl(fileId, false) + '?wait=0', { headers: { Range: 'bytes=0-1' } });
+                    } catch (err) {
+                        return;
+                    }
+                    if (stale()) return;
+                    if (response.ok) {
+                        if (source.settled && !source.previewRetried) {
+                            source.previewRetried = true;
+                            this.reloadPreview(waveform, fileId, source);
+                        }
+                        return;
+                    }
+                    const data = await response.json().catch(() => ({}));
+                    if (stale()) return;
+                    show(data.detail || `the server answered HTTP ${response.status}`);
+                    const stillPreparing = response.status === 503 && response.headers?.get?.('Retry-After');
+                    if (!stillPreparing || Date.now() >= deadline) return;
+                    await new Promise(resolve => setTimeout(resolve, this.previewPollIntervalMs));
+                    if (stale()) return;
+                }
+            } finally {
+                source.probing = false;
+            }
         },
 
         /**
@@ -5312,6 +5654,15 @@ function vinylApp() {
             }
         },
 
+        /** Why a right-click split found no track to cut: a gap or the outside, or exactly a boundary */
+        notifySplitRefused(time) {
+            const touchesTrack = this.detectedTracks.some(t => time >= t.start && time <= t.end);
+            this.notify(touchesTrack
+                ? 'Cannot split here: the position must be inside a track, not on a boundary.'
+                : 'This spot is between tracks; right-click inside a track to split it.',
+                { type: 'warning', timeout: 6000 });
+        },
+
         /**
          * Split track at context menu position
          */
@@ -5326,7 +5677,7 @@ function vinylApp() {
             );
 
             if (trackIndex === -1) {
-                this.notify('Cannot split here: the position must be inside a track, not on a boundary.', { type: 'warning', timeout: 6000 });
+                this.notifySplitRefused(time);
                 return;
             }
 
@@ -5388,7 +5739,7 @@ function vinylApp() {
             );
 
             if (trackIndex === -1) {
-                this.notify('Cannot split here: the position must be inside a track, not on a boundary.', { type: 'warning', timeout: 6000 });
+                this.notifySplitRefused(time);
                 return;
             }
 
@@ -5466,6 +5817,15 @@ function vinylApp() {
         /**
          * Get count of non-ignored tracks
          */
+        /**
+         * The count warning, except while the first detection runs: a pick starts it, and
+         * "0 detected" is no finding yet (its Snap to Discogs button would race it too).
+         * With tracks present it stays up during a Smart Rescan, whose spinner lives in it.
+         */
+        get showTrackCountMismatch() {
+            return this.trackCountMismatch && (this.detectedTracks.length > 0 || !this.analyzing);
+        },
+
         get activeTrackCount() {
             return this.detectedTracks.filter(t => !t.ignored).length;
         },
@@ -5522,7 +5882,25 @@ function vinylApp() {
             const idx = this.detectedTracks.findIndex(t => t.number === trackNumber);
             if (idx < 0) return;
 
-            this.applyTrackBounds(idx, region.start, region.end);
+            const startBefore = this.detectedTracks[idx].start;
+            const endBefore = this.detectedTracks[idx].end;
+            const requestedStart = region.start;
+            const requestedEnd = region.end;
+            this.applyTrackBounds(idx, requestedStart, requestedEnd);
+            // region-updated fires once per drag end and the region holds what the user asked for;
+            // when the track ended up elsewhere the region is about to snap back or shrink: say why
+            const track = this.detectedTracks[idx];
+            if (Math.abs(track.start - requestedStart) > REGION_CLAMP_TOLERANCE_S
+                || Math.abs(track.end - requestedEnd) > REGION_CLAMP_TOLERANCE_S) {
+                const moved = (track.start !== startBefore || track.end !== endBefore);
+                const pastRecording = requestedEnd > this.recordingEnd() + REGION_CLAMP_TOLERANCE_S;
+                this.notify(pastRecording
+                    ? (moved ? `Track ${track.number} stops at the end of the recording.` : `Track ${track.number} can't move past the end of the recording.`)
+                    : moved
+                        ? `Track ${track.number} stops here: every track keeps at least ${MIN_TRACK_LENGTH} s.`
+                        : `Track ${track.number} can't move there: every track keeps at least ${MIN_TRACK_LENGTH} s.`,
+                    { type: 'info', timeout: 4000 });
+            }
             // Push any clamping / neighbour changes back onto the regions
             this.syncRegionsAround(idx);
         },
@@ -6087,6 +6465,7 @@ function vinylApp() {
             if (!el || !this.abResult) return;
             if (!el.paused) { el.pause(); return; }
             this.pauseWaveform();
+            this.pauseFallback();
             if (this.abSide === 'removed') this.abEnsureBoost();
             try {
                 const p = el.play();
@@ -6127,6 +6506,7 @@ function vinylApp() {
             if (which !== this.abSide) return;
             this.abPlaying = true;
             this.pauseWaveform();
+            this.pauseFallback();
         },
         abOnPause(which) { if (which === this.abSide) this.abPlaying = false; },
         abOnTime(which) {
@@ -6140,6 +6520,49 @@ function vinylApp() {
             if (el && Number.isFinite(el.duration)) this.abDur = el.duration;
         },
         abOnEnded(which) { if (which === this.abSide) this.abPlaying = false; },
+
+        /** Remove the fallback player: stop it first (dropping the src would not stop a playing element) */
+        clearFallback() {
+            this.$refs?.fallbackAudio?.pause?.();
+            this.fallbackAudioUrl = '';
+        },
+
+        /** The fallback <audio> stops when another player starts (it is not the waveform's media element) */
+        pauseFallback() {
+            this.$refs?.fallbackAudio?.pause?.();
+        },
+
+        /** The fallback player started: the A/B player must not play on top of it */
+        onFallbackPlay() {
+            this.abPause();
+        },
+
+        /** A built waveform that has loaded its duration: header Play, zoom, Space and the row buttons need it */
+        get playerReady() {
+            return !!this.waveform && !this.waveformLoading && this.playDuration > 0;
+        },
+
+        /** Put the chosen volume on the waveform's media element and on the fallback player */
+        applyPlayerVolume() {
+            const media = this.waveform?.getMediaElement?.();
+            if (media) media.volume = this.playerVolume;
+            const fallbackElement = this.$refs?.fallbackAudio;
+            if (fallbackElement) fallbackElement.volume = this.playerVolume;
+        },
+
+        /** Volume slider: 0-1, applied at once and remembered; anything else is ignored */
+        setPlayerVolume(value) {
+            const volume = Number(value);
+            if (value === '' || value === null || !Number.isFinite(volume)) return;
+            this.playerVolume = Math.min(1, Math.max(0, volume));
+            this.applyPlayerVolume();
+            try { localStorage.setItem(PLAYER_VOLUME_STORAGE_KEY, String(this.playerVolume)); } catch (error) { /* storage unavailable: the choice lasts for this session */ }
+        },
+
+        /** The fallback player's own volume control moved: keep the slider and storage in step */
+        onFallbackVolumeChange(audioElement) {
+            if (audioElement && audioElement.volume !== this.playerVolume) this.setPlayerVolume(audioElement.volume);
+        },
 
         /**
          * Single play/pause toggle bound to the real player state
@@ -6198,36 +6621,117 @@ function vinylApp() {
         },
 
         /**
-         * Space bar toggles playback unless the user is typing or a modal is open
+         * Pointer-focus tracking for Space (see onGlobalKeydown).  A focusin that arrives between a
+         * pointerdown and the following pointerup/task was caused by the mouse; any other focusin
+         * (Tab, script) was not.  Clicking the element that already has focus fires no focusin, so
+         * pointerdown marks it pointer-focused directly.
+         */
+        onPointerDown(e) {
+            this._pointerFocus.pending = true;
+            const active = document.activeElement;
+            if (active && active !== document.body && active.contains(e.target)) this._pointerFocus.byPointer = true;
+        },
+
+        /** A cancelled pointer (touch scroll, pen) never reaches pointerup: it must not stay "pending" */
+        onPointerCancel() {
+            this._pointerFocus.pending = false;
+        },
+
+        onPointerUp() {
+            // After the click's own focus change, which comes before pointerup's task ends
+            setTimeout(() => {
+                this._pointerFocus.pending = false;
+                // A press that landed on something taking no focus (a scrollbar) leaves the focused element
+                // and its claim alone; the claim ends only once focus has really moved off it
+                if (document.activeElement !== this._pointerFocus.lastFocused) this._pointerFocus.lastFocused = null;
+            }, 0);
+        },
+
+        onFocusIn(e) {
+            // init() runs twice (Alpine calls it, and so does x-init), so every document listener is
+            // registered twice in principle (bindGlobalListeners guards that): a second call for the
+            // same event must not undo the first.
+            if (e && this._pointerFocus.lastFocusIn === e) return;
+            this._pointerFocus.lastFocusIn = e || null;
+            const focused = e && e.target ? e.target : null;
+            // Browsers re-dispatch focusin on the focused element when the window regains focus: with no
+            // pointer press pending that is no new focus, so the origin of the focus is unchanged
+            const windowReactivation = focused !== null && focused === this._pointerFocus.lastFocused && !this._pointerFocus.pending;
+            if (!windowReactivation) this._pointerFocus.byPointer = this._pointerFocus.pending;
+            this._pointerFocus.lastFocused = focused;
+            this._pointerFocus.pending = false;
+        },
+
+        /**
+         * Space toggles playback, except while typing, in a dialog or a right-click menu, or on a
+         * control that uses Space itself.  Fields, selects and sliders always keep it.  A button keeps
+         * it only when it was focused from the keyboard: Chromium, Firefox and WebView2 also focus a
+         * button that was merely clicked (WKWebView does not), and Space would then press it again
+         * (flip Reverse, un-ignore, delete the next track).  :focus-visible cannot tell them apart:
+         * Chromium's heuristic turns it on at any keypress, so the focus origin is tracked from the
+         * pointer events instead.  For a pointer-focused button Space plays/pauses, and preventDefault
+         * on keydown stops the button's own activation (a button is clicked by the keyup of Space, and
+         * only after an un-cancelled keydown); Firefox is also told to ignore the keyup (onGlobalKeyup).
+         * While an A/B render plays, Space pauses it instead of starting the waveform.
          */
         onGlobalKeydown(e) {
+            // Any key ends a pointer press's claim on the next focus: Tab's keydown precedes its focusin
+            this._pointerFocus.pending = false;
+            // Tabbing out of the document and back onto the same element is keyboard focus, not the
+            // window re-activation that onFocusIn tells apart by "same element, nothing pending"
+            // (plain or Shift+Tab only: Ctrl/Alt/Meta+Tab may reach a tabless WebView without moving focus)
+            if (e.key === 'Tab' && !e.ctrlKey && !e.altKey && !e.metaKey) this._pointerFocus.lastFocused = null;
             if (e.code !== 'Space' && e.key !== ' ') return;
-            if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+            // Safe if a handler ever sees an event twice: the first already handled it
+            if (e.defaultPrevented) return;
+            // A claimed Space whose keyup never came (window switch) must not cancel a later keyup
+            this._spaceClaimedByPlayer = false;
+            const target = e.target;
+            const tag = target && target.tagName ? String(target.tagName).toUpperCase() : '';
+            // The volume slider has no use for Space, so it never owns it (the A/B scrubber still does)
+            const isRangeInput = tag === 'INPUT' && String(target.type).toLowerCase() === 'range'
+                && !!target.classList?.contains('volume-slider');
+            if ((SPACE_OWNING_TAGS.has(tag) && !isRangeInput) || (target && target.isContentEditable)) return;
+            // A keyboard-focused button keeps Space; a pointer-focused one must never be pressed by it,
+            // whatever the modifiers and whether or not the player can play right now
+            if (tag === 'BUTTON' && !this._pointerFocus.byPointer) return;
+            const pointerFocusedButton = tag === 'BUTTON';
+            const modifierHeld = e.ctrlKey || e.metaKey || e.altKey;
+            if (pointerFocusedButton) {
+                // With a modifier only the keyup is cancelled: preventDefault on the keydown could swallow a
+                // system shortcut (Alt+Space opens the Windows window menu), and cancelling the keyup alone
+                // stops the button's activation (measured with real input in Chromium, WebKit and Firefox)
+                if (modifierHeld) this._spaceClaimedByPlayer = true;
+                else this._claimSpace(e);
+            }
+            if (modifierHeld) return;
             if (this.showSettings || this.setupRequired) return;
-            const el = e.target;
-            const tag = el && el.tagName ? String(el.tagName).toUpperCase() : '';
-            if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || (el && el.isContentEditable)) return;
+            if (this.contextMenu.show || this.regionContextMenu.show) return;
             const abPlaying = this.abAnyPlaying();
-            if (!abPlaying && !this.waveform) return;
-            e.preventDefault();
+            // No waveform control while the waveform is not built, still loading, or replaced by the fallback player
+            if (!abPlaying && (!this.playerReady || this.fallbackAudioUrl)) return;
+            if (!pointerFocusedButton) this._claimSpace(e);
             // A held key repeats keydown: keep the page from scrolling, but toggle only once
             if (e.repeat) return;
-            // A focused button (e.g. ▶️ just clicked) would also "click" on
-            // keyup and toggle straight back — swallow that keyup.
-            this._spaceToggled = true;
             // Pause whatever is playing: Space during the A/B test used to start the
             // waveform instead (from its playhead, often in the lead-in's surface noise).
             if (abPlaying) this.abPause();
             else this.togglePlay();
         },
 
+        /** Take this Space: no page scroll, no button press; its keyup is cancelled as well */
+        _claimSpace(e) {
+            e.preventDefault();
+            this._spaceClaimedByPlayer = true;
+        },
+
         /**
-         * Pairs with onGlobalKeydown: cancel the focused button's keyup activation
+         * Pairs with onGlobalKeydown: cancel the keyup of a Space the player took, so a mouse-focused
+         * button is never clicked by it
          */
         onGlobalKeyup(e) {
-            if (e.code !== 'Space' && e.key !== ' ') return;
-            if (!this._spaceToggled) return;
-            this._spaceToggled = false;
+            if (!this._spaceClaimedByPlayer || (e.code !== 'Space' && e.key !== ' ')) return;
+            this._spaceClaimedByPlayer = false;
             e.preventDefault();
         },
 
@@ -6306,7 +6810,9 @@ function vinylApp() {
         },
 
         /**
-         * Region click: seek to the click position (primary, undragged clicks only)
+         * Region click: seek to the click position.  A drag never arrives here: the regions plugin
+         * cancels the primary-button pointerdown on a region and swallows the click that ends a real
+         * drag (capture-phase click listener), so every 'region-clicked' is a plain click.
          */
         onRegionClicked(region, e) {
             if (!this.waveform || !e) return;
@@ -6314,9 +6820,6 @@ function vinylApp() {
             if (e.ctrlKey || e.metaKey) return;
             if (String(region.id).startsWith('expected-')) return;
             if (e.target && e.target.closest?.('[part~=region-handle]')) return;
-            const down = this._regionDownX;
-            this._regionDownX = null;
-            if (down !== null && Math.abs(e.clientX - down) > 3) return;  // drag end, not a click
             const rect = this.waveform.getWrapper().getBoundingClientRect();
             const relativeX = Math.max(0, Math.min((e.clientX - rect.left) / rect.width, 1));
             this.cancelAudition();
@@ -6339,6 +6842,7 @@ function vinylApp() {
 
         destroyWaveform() {
             this.waveformLoading = false;   // an in-flight initWaveform returns silently once stale
+            this.clearFallback();
             this.removeClickStrip();
             if (this.waveform) {
                 this.waveform.destroy();
@@ -6685,9 +7189,10 @@ function vinylApp() {
         resetForNextFile() {
             if (this.currentLocked) return;
             this.saveWorkspace();
+            // A playing waveform or fallback <audio> would go on with nothing to control it
+            this.destroyWaveform();
             this.currentFileId = null;
             this.currentFile = null;
-            this.destroyWaveform();
             // Another recording's export may be running: leave its polling and flag alone.
             this.abReset();
             this.successMessage = '';

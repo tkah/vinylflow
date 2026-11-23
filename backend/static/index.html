@@ -209,6 +209,10 @@
             }
         }
 
+        /* Volume slider: dark blue accent (>= 3:1 on the card) and a visible keyboard focus ring */
+        .volume-slider { accent-color: #1d4ed8; }
+        .volume-slider:focus-visible { outline: 3px solid #1E1E1E; outline-offset: 2px; }
+
         /* Merged track table */
         .track-table-scroll { overflow-x: auto; }
         /* Header and rows sit in identical wrappers that reserve the same transparent left border, so
@@ -1164,13 +1168,14 @@
                         <span class="spinner"></span> <span x-text="donorProgressText"></span>
                     </p>
                     <p x-show="donors.status === 'error'" x-cloak class="mt-2 text-sm" style="color: #B3261E;" role="alert" x-text="donors.error"></p>
-                    <p x-show="donors.status === 'done' && visibleDonors.length === 0" x-cloak class="mt-2 text-sm text-secondary" role="status">No other pressing with matching track lengths found.</p>
+                    <p x-show="donors.status === 'done' && visibleDonors.length === 0" x-cloak class="mt-2 text-sm text-secondary" role="status" x-text="donorEmptyText"></p>
                     <div x-show="donors.status === 'done' && visibleDonors.length > 0" x-cloak class="mt-2 space-y-2">
                         <template x-for="donor in visibleDonors" :key="donor.release_id">
                             <div class="flex flex-wrap items-center justify-between gap-2 p-2 rounded-lg bg-card">
                                 <div class="text-sm">
                                     <span x-text="donorTitle(donor)"></span>
                                     <span class="ml-2 text-xs text-muted" x-text="donorFillText(donor)"></span>
+                                    <span x-show="donorDisagreeText(donor)" x-cloak class="block text-xs text-secondary" x-text="donorDisagreeText(donor)"></span>
                                 </div>
                                 <button type="button" @click="applyDonor(donor)" :disabled="analyzing || currentLocked"
                                         class="px-3 py-1.5 btn-primary rounded-lg text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-1 focus-visible:ring-[#1E1E1E]"
@@ -1236,15 +1241,21 @@
                     <h3 class="text-2xl font-bold text-primary">Waveform Editor</h3>
                     <div class="flex flex-wrap gap-2">
                         <span x-show="playerBuffering" role="status" class="self-center text-sm text-secondary">Seeking / buffering…</span>
-                        <span x-show="waveform" class="self-center text-sm text-secondary font-mono mr-2" x-text="`${formatClock(playTime)} / ${formatClock(playDuration)}`"></span>
-                        <button @click="togglePlay()" :disabled="!waveform" class="px-4 py-2 btn-primary rounded-lg" :title="isPlaying ? 'Pause (Space)' : 'Play (Space)'" x-text="isPlaying ? '⏸ Pause' : '▶️ Play'"></button>
-                        <button @click="zoomIn()" :disabled="!waveform" class="px-4 py-2 text-white rounded-lg" style="background-color: #3D3D3D;">🔍 +</button>
-                        <button @click="zoomOut()" :disabled="!waveform" class="px-4 py-2 text-white rounded-lg" style="background-color: #3D3D3D;">🔍 -</button>
+                        <span x-show="waveform && !fallbackAudioUrl" class="self-center text-sm text-secondary font-mono mr-2" x-text="`${formatClock(playTime)} / ${formatClock(playDuration)}`"></span>
+                        <label x-show="waveform || fallbackAudioUrl" x-cloak class="self-center flex items-center gap-2 text-sm text-secondary">
+                            <span aria-hidden="true">🔊</span>
+                            <span>Volume</span>
+                            <input type="range" min="0" max="1" step="0.05" :value="playerVolume" @input="setPlayerVolume($event.target.value)"
+                                   aria-label="Volume" :aria-valuetext="`${Math.round(playerVolume * 100)}%`" class="volume-slider" style="width: 6rem;">
+                        </label>
+                        <button @click="togglePlay()" :disabled="!playerReady" class="px-4 py-2 btn-primary rounded-lg" :title="isPlaying ? 'Pause (Space)' : 'Play (Space)'" x-text="isPlaying ? '⏸ Pause' : '▶️ Play'"></button>
+                        <button @click="zoomIn()" :disabled="!playerReady" class="px-4 py-2 text-white rounded-lg" style="background-color: #3D3D3D;">🔍 +</button>
+                        <button @click="zoomOut()" :disabled="!playerReady" class="px-4 py-2 text-white rounded-lg" style="background-color: #3D3D3D;">🔍 -</button>
                     </div>
                 </div>
             </div>
             <!-- The loading overlay sits over the (fixed-height) waveform area, not below it -->
-            <div class="relative">
+            <div class="relative" x-show="!fallbackAudioUrl">
                 <div id="waveform" class="w-full"></div>
                 <div x-show="waveformLoading" x-cloak role="status" data-testid="waveform-loading"
                      class="absolute inset-0 z-10 flex items-center justify-center gap-3 text-lg text-secondary"
@@ -1261,10 +1272,15 @@
             </div>
             <div class="mb-6"></div>
             <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-                <div x-show="!waveform && !waveformLoading" class="text-center text-muted py-8">Waveform will appear after analysis completes</div>
+                <div x-show="!waveform && !waveformLoading && !fallbackAudioUrl" class="text-center text-muted py-8">Waveform will appear after analysis completes</div>
+                <!-- The waveform could not be built: the recording is still playable here (the preview URL) -->
+                <div x-show="fallbackAudioUrl" x-cloak class="mb-2">
+                    <p class="text-sm text-secondary mb-1">The waveform couldn't load; you can still listen here.</p>
+                    <audio x-ref="fallbackAudio" controls preload="metadata" :src="fallbackAudioUrl || false" @play="onFallbackPlay()" @volumechange="onFallbackVolumeChange($event.target)" class="w-full"></audio>
+                </div>
                 <p x-show="playerNotice" x-cloak class="mb-2 text-sm text-primary" x-text="playerNotice"></p>
                 <p x-show="playerInfo" x-cloak class="mb-2 text-xs text-muted" x-text="playerInfo"></p>
-                <p class="text-sm text-muted">💡 Tip: Drag the colored regions to adjust track boundaries, or right-click to add splits. Zoom with ⌘ + scroll wheel (Ctrl on Windows) or by pinching on a trackpad.</p>
+                <p x-show="!fallbackAudioUrl" class="text-sm text-muted">💡 Tip: Drag the colored regions to adjust track boundaries, or right-click to add splits. Zoom with ⌘ + scroll wheel (Ctrl on Windows) or by pinching on a trackpad.</p>
                 <p x-show="clickLegendVisible()" x-cloak class="mt-1 text-xs text-muted flex items-center gap-2" data-testid="click-legend">
                     <span class="inline-block w-3 h-1.5" style="background-color: rgba(217, 64, 50, 0.9);"></span>
                     <span x-text="clickLegendText()"></span>
@@ -1284,9 +1300,10 @@
         <div class="max-w-7xl mx-auto px-4 py-6 sm:px-6 lg:px-8">
             <div class="space-y-6">
                     <!-- Merged track table: detection + Discogs mapping -->
-                    <div x-show="detectedTracks.length > 0" x-cloak class="bg-card rounded-lg shadow p-6">
+                    <!-- Also shown with no tracks when the count warning is up: after a failed or empty detection its Smart rescan is the way forward -->
+                    <div x-show="detectedTracks.length > 0 || showTrackCountMismatch" x-cloak class="bg-card rounded-lg shadow p-6">
                         <fieldset :disabled="currentLocked" class="contents">
-                        <div class="flex flex-wrap justify-between items-center gap-2 mb-4">
+                        <div x-show="detectedTracks.length > 0" class="flex flex-wrap justify-between items-center gap-2 mb-4">
                             <h3 class="text-lg font-semibold text-primary">
                                 Tracks (<span x-text="activeTrackCount"></span> of <span x-text="detectedTracks.length"></span> active)
                             </h3>
@@ -1312,7 +1329,7 @@
                         </div>
 
                         <!-- Track Count Mismatch Warning -->
-                        <div x-show="trackCountMismatch" class="mb-4 p-4 rounded-lg border-2" style="background-color: rgba(217, 64, 50, 0.1); border-color: #D94032;">
+                        <div x-show="showTrackCountMismatch" class="mb-4 p-4 rounded-lg border-2" style="background-color: rgba(217, 64, 50, 0.1); border-color: #D94032;">
                             <div class="flex items-start gap-3">
                                 <span class="text-2xl">⚠️</span>
                                 <div class="flex-1">
@@ -1321,7 +1338,7 @@
                                         Detected <span class="font-semibold" x-text="detectedTracks.filter(t => !t.ignored).length"></span> tracks,
                                         but the selected side(s) of this release have <span class="font-semibold" x-text="targetTracks.length"></span> tracks.
                                     </p>
-                                    <p class="text-xs text-muted mb-2">
+                                    <p x-show="detectedTracks.length > 0" class="text-xs text-muted mb-2">
                                         💡 Right-click the waveform to add splits, or right-click a track region to ignore it.
                                     </p>
                                     <div class="flex flex-wrap gap-2">
@@ -1345,7 +1362,7 @@
                         </div>
                         </fieldset>
 
-                        <div class="track-table-scroll">
+                        <div x-show="detectedTracks.length > 0" class="track-table-scroll">
                             <div class="track-head pb-2">
                             <div class="track-grid text-xs font-semibold text-secondary">
                                 <div></div>
@@ -1389,7 +1406,7 @@
                                         <div class="text-secondary" :class="{ 'opacity-50': track.ignored }"><span x-text="formatTime(track.start)"></span> – <span x-text="formatTime(track.end)"></span></div>
                                         <div class="text-right" :class="{ 'opacity-50': track.ignored }">
                                             <fieldset :disabled="currentLocked" class="contents">
-                                            <input type="text" inputmode="decimal" :value="formatDuration(track.duration)" aria-label="Track length"
+                                            <input type="text" :value="formatDuration(track.duration)" aria-label="Track length"
                                                    title="Type a length (m:ss) to move the end to start + length"
                                                    @change="setTrackLength(idx, $event.target.value, $event.target)" @keydown.enter="$event.target.blur()"
                                                    class="w-full px-1 py-0.5 border rounded text-right text-sm text-secondary focus-primary" style="border-color: #D6D3CC;">
@@ -1410,9 +1427,9 @@
                                             </fieldset>
                                         </div>
                                         <div class="flex gap-1.5 justify-end">
-                                            <button @click="auditionCut(idx, 'start')" :disabled="!waveform" class="px-2 py-1 rounded text-xs text-primary" style="background-color: #F0EFEB;" title="Hear the start cut">⇤</button>
-                                            <button @click="auditionCut(idx, 'end')" :disabled="!waveform" class="px-2 py-1 rounded text-xs text-primary" style="background-color: #F0EFEB;" title="Hear the end cut">⇥</button>
-                                            <button @click="toggleTrackPlay(idx)" :disabled="!waveform || (track.ignored && !(isPlaying && playheadIdx === idx))" class="px-2 py-1 btn-primary rounded text-xs" :class="{'opacity-50 cursor-not-allowed': track.ignored && !(isPlaying && playheadIdx === idx)}" :title="(isPlaying && playheadIdx === idx) ? 'Pause' : 'Play this track in the waveform'" x-text="(isPlaying && playheadIdx === idx) ? '⏸' : '▶️'"></button>
+                                            <button @click="auditionCut(idx, 'start')" :disabled="!playerReady" class="px-2 py-1 rounded text-xs text-primary" style="background-color: #F0EFEB;" title="Hear the start cut">⇤</button>
+                                            <button @click="auditionCut(idx, 'end')" :disabled="!playerReady" class="px-2 py-1 rounded text-xs text-primary" style="background-color: #F0EFEB;" title="Hear the end cut">⇥</button>
+                                            <button @click="toggleTrackPlay(idx)" :disabled="!playerReady || (track.ignored && !(isPlaying && playheadIdx === idx))" class="px-2 py-1 btn-primary rounded text-xs" :class="{'opacity-50 cursor-not-allowed': track.ignored && !(isPlaying && playheadIdx === idx)}" :title="(isPlaying && playheadIdx === idx) ? 'Pause' : 'Play this track in the waveform'" x-text="(isPlaying && playheadIdx === idx) ? '⏸' : '▶️'"></button>
                                             <button @click="track.editing = !track.editing" :disabled="currentLocked || track.ignored" class="px-2 py-1 rounded text-xs text-primary" style="background-color: #F0EFEB;" :class="{'opacity-50 cursor-not-allowed': currentLocked || track.ignored}">
                                                 <span x-show="!track.editing">✏️ Adjust</span>
                                                 <span x-show="track.editing">✓ Done</span>
